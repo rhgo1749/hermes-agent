@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from agent.kanban_stop import (
@@ -134,6 +136,101 @@ def test_no_nudge_after_handoff_tool(clear_kanban_env, tool_name, who):
     ]
     assert session_called_kanban_terminal(messages) is True, who
     assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_stop_gate_forces_exactly_one_followup_tool_call(clear_kanban_env, monkeypatch):
+    """A narrated worker stop arms and consumes one Chat Completions tool requirement."""
+    from agent import chat_completion_helpers as helpers
+    from agent.turn_stop_gates import apply_stop_gates
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_force_once")
+    agent = SimpleNamespace(
+        api_mode="chat_completions",
+        tools=[{"type": "function", "function": {"name": "kanban_complete"}}],
+        _kanban_stop_nudges=0,
+        _turn_file_mutation_paths=set(),
+        _verification_stop_nudges=0,
+        _pre_verify_nudges=0,
+        _interim_content_was_streamed=lambda _text: False,
+        _emit_diagnostic_status=lambda _text: None,
+    )
+    messages = [{"role": "user", "content": "work kanban task t_force_once"}]
+    verdict = apply_stop_gates(
+        agent,
+        {"role": "assistant", "content": "I am done.", "tool_calls": []},
+        final_response="I am done.",
+        messages=messages,
+        conversation_history=None,
+        pending_verification_response=None,
+        pending_verification_response_previewed=False,
+    )
+    assert verdict.continue_turn is True
+    assert agent._ephemeral_tool_choice == "required"
+
+    monkeypatch.setattr(helpers, "_reasoning_config_for_wire", lambda _agent: None)
+    monkeypatch.setattr(helpers, "effective_request_overrides", lambda _agent: {})
+    monkeypatch.setattr(helpers, "_prompt_cache_scope_for_agent", lambda _agent: "scope")
+    seen = []
+
+    def build(_agent, _messages, _tools, _reasoning, overrides, _scope):
+        seen.append(dict(overrides))
+        return dict(overrides)
+
+    monkeypatch.setattr(helpers, "_build_chat_completions_kwargs", build)
+    forced = helpers._build_api_kwargs_for_mode(agent, messages, agent.tools)
+    ordinary = helpers._build_api_kwargs_for_mode(agent, messages, agent.tools)
+
+    assert forced["tool_choice"] == "required"
+    assert "tool_choice" not in ordinary
+    assert seen == [{"tool_choice": "required"}, {}]
+    assert agent._ephemeral_tool_choice is None
+    assert agent._kanban_stop_required_inflight is True
+
+
+def test_required_followup_tool_call_replenishes_stop_nudge_budget(monkeypatch):
+    """A successful required-tool recovery allows a later independent stop recovery."""
+    from agent import turn_response_intake as intake
+
+    agent = SimpleNamespace(
+        _kanban_stop_required_inflight=True,
+        _kanban_stop_nudges=2,
+        quiet_mode=True,
+        verbose_logging=False,
+        tool_progress_callback=None,
+        api_mode="chat_completions",
+        _incomplete_scratchpad_retries=0,
+        session_id="s",
+        platform="",
+        model="test",
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    message = SimpleNamespace(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[SimpleNamespace(function=SimpleNamespace(name="terminal"))],
+    )
+    monkeypatch.setattr(intake, "normalize_response_for_agent", lambda _agent, _resp: message)
+    monkeypatch.setattr(intake, "splice_provider_projection", lambda *_a, **_k: None)
+    monkeypatch.setattr(intake, "_fire_post_api_request_hook", lambda *_a, **_k: None)
+
+    verdict = intake.normalize_model_response(
+        agent,
+        response=object(),
+        messages=[],
+        api_messages=[],
+        conversation_history=None,
+        api_call_count=1,
+        api_duration=0.1,
+        api_start_time=0.0,
+        api_request_id="r",
+        effective_task_id="t",
+        turn_id="turn",
+    )
+
+    assert verdict.action == "fallthrough"
+    assert agent._kanban_stop_nudges == 0
+    assert agent._kanban_stop_required_inflight is False
 
 
 def test_nudge_still_fires_for_non_terminal_kanban_tool(clear_kanban_env):

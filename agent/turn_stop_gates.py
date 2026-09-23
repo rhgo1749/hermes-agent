@@ -154,6 +154,13 @@ def apply_stop_gates(
     _kanban_nudge = _kanban_stop_nudge(agent, messages)
     if _kanban_nudge:
         agent._kanban_stop_nudges = getattr(agent, "_kanban_stop_nudges", 0) + 1
+        # Prompt-only steering is not enough for every OpenAI-compatible model.
+        # Force some native tool call on exactly the next chat-completions
+        # request; the model still chooses whether to continue, complete, review,
+        # or block. The request builder consumes this one-shot override.
+        if getattr(agent, "api_mode", None) == "chat_completions":
+            agent._ephemeral_tool_choice = "required"
+            logger.info("kanban stop-loop armed one-shot tool_choice=required")
         final_msg["finish_reason"] = "kanban_terminal_required"
         final_msg["_kanban_stop_synthetic"] = True
         append_message(messages, final_msg)

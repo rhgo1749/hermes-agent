@@ -145,6 +145,15 @@ def normalize_model_response(
         api_request_id=api_request_id, effective_task_id=effective_task_id, turn_id=turn_id,
     )
 
+    # A Kanban recovery request was sent with ``tool_choice=required``. A real
+    # native tool call proves recovery, so replenish the bounded stop-nudge
+    # budget; a provider that still returned plain text does not earn a reset.
+    if getattr(agent, "_kanban_stop_required_inflight", False):
+        if getattr(assistant_message, "tool_calls", None):
+            agent._kanban_stop_nudges = 0
+            logger.info("kanban stop-loop recovered via native tool call; reset nudge budget")
+        agent._kanban_stop_required_inflight = False
+
     content = assistant_message.content
     if content and not agent.quiet_mode:
         if agent.verbose_logging:
