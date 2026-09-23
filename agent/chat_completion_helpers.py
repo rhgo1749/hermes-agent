@@ -1561,6 +1561,20 @@ def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | 
     # The one place request_overrides are consumed: static /fast values are already pinned
     # in agent.request_overrides; auto/cold windows layer the fast override per request.
     request_overrides = effective_request_overrides(agent)
+    # Kanban stop-guard recovery: after a dispatcher-owned worker narrates a
+    # stop without a terminal board tool, require one native tool call on the
+    # next Chat Completions request only. Other API modes keep their native
+    # continuation semantics.
+    if (
+        agent.api_mode == "chat_completions"
+        and tools_for_api
+        and getattr(agent, "_ephemeral_tool_choice", None)
+    ):
+        request_overrides = dict(request_overrides)
+        request_overrides["tool_choice"] = agent._ephemeral_tool_choice
+        logger.info("kanban stop-loop consuming one-shot tool_choice=%s", agent._ephemeral_tool_choice)
+        agent._ephemeral_tool_choice = None
+        agent._kanban_stop_required_inflight = True
     if agent.api_mode == "anthropic_messages":
         return _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides)
     if agent.api_mode == "bedrock_converse":
