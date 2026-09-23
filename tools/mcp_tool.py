@@ -287,7 +287,15 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str,
             else:
                 result = await list_method(cursor=cursor)
         if cache_meta_out is not None and not items:
+            # Pydantic-backed MCP result models expose protocol defaults through
+            # getattr even when the server omitted the field. Treat only
+            # explicitly-present fields as SEP-2549 cache hints.
+            fields_set = getattr(result, "model_fields_set", None)
+            if fields_set is None:
+                fields_set = getattr(result, "__fields_set__", None)
             for key, snake, camel in (("ttl_ms", "ttl_ms", "ttlMs"), ("cache_scope", "cache_scope", "cacheScope")):
+                if isinstance(fields_set, (set, frozenset)) and snake not in fields_set and camel not in fields_set:
+                    continue
                 hint = mcp_field(result, snake, camel)
                 if hint is not None:
                     cache_meta_out[key] = hint
