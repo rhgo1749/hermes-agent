@@ -1254,11 +1254,58 @@ def get_task_log(task_id: str, tail: Optional[int] = Query(None, ge=1, le=2_000_
         "size_bytes": size, "content": content or "", "truncated": bool(tail and size > tail)}
 
 
+def _optional_positive_int(value: Any) -> Optional[int]:
+    """Parse an optional positive integer cap; invalid values are ignored."""
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 1 else None
+
+
+def _dashboard_dispatch_caps(requested_max: Optional[int]) -> tuple[Optional[int], Optional[int], Optional[int]]:
+    """Apply the same operator caps to a dashboard nudge as the gateway dispatcher."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(kanban_cfg, dict):
+            kanban_cfg = {}
+    except Exception:
+        kanban_cfg = {}
+
+    requested = None if requested_max is None else max(0, int(requested_max))
+    configured_spawn = _optional_positive_int(kanban_cfg.get("max_spawn"))
+    if configured_spawn is None:
+        max_spawn = requested
+    elif requested is None:
+        max_spawn = configured_spawn
+    else:
+        max_spawn = min(configured_spawn, requested)
+
+    max_in_progress = kbd.resolve_max_in_progress(
+        _optional_positive_int(kanban_cfg.get("max_in_progress"))
+    )
+    per_profile = _optional_positive_int(kanban_cfg.get("max_in_progress_per_profile"))
+    return max_spawn, max_in_progress, per_profile
+
+
 @router.post("/dispatch")
 def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), board: Optional[str] = Query(None)):
     """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick."""
+    max_spawn, max_in_progress, max_in_progress_per_profile = _dashboard_dispatch_caps(max_n)
     with _board_conn(board) as (board, conn):
-        result = kbd.dispatch_once(conn, dry_run=dry_run, max_spawn=max_n, board=board)
+        result = kbd.dispatch_once(
+            conn,
+            dry_run=dry_run,
+            max_spawn=max_spawn,
+            max_in_progress=max_in_progress,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+            board=board,
+        )
         try:
             return asdict(result)  # DispatchResult is a dataclass
         except TypeError:

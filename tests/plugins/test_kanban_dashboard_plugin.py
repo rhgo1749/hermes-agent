@@ -479,6 +479,38 @@ def test_dispatch_dry_run(client):
     # DispatchResult is serialized as a dataclass dict.
     assert isinstance(body, dict)
 
+
+def test_dispatch_nudge_honors_runtime_concurrency_caps(client, monkeypatch):
+    """The dashboard nudge must not weaken configured global/profile caps."""
+    from hermes_cli import config as config_module
+    from hermes_cli import kanban_db_dispatch as dispatch_module
+
+    monkeypatch.setattr(
+        config_module,
+        "load_config_readonly",
+        lambda: {
+            "kanban": {
+                "max_spawn": 3,
+                "max_in_progress": 4,
+                "max_in_progress_per_profile": 2,
+            }
+        },
+    )
+    seen = {}
+
+    def fake_dispatch(conn, **kwargs):
+        seen.update(kwargs)
+        return dispatch_module.DispatchResult()
+
+    monkeypatch.setattr(dispatch_module, "dispatch_once", fake_dispatch)
+    response = client.post("/api/plugins/kanban/dispatch?dry_run=true&max=8")
+
+    assert response.status_code == 200, response.text
+    assert seen["max_spawn"] == 3
+    assert seen["max_in_progress"] == 4
+    assert seen["max_in_progress_per_profile"] == 2
+
+
 # ---------------------------------------------------------------------------
 # Triage column (new v1 status)
 # ---------------------------------------------------------------------------
