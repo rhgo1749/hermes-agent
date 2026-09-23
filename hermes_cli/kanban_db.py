@@ -3294,6 +3294,18 @@ def block_task(
             params = (*params, int(expected_run_id))
         if conn.execute(sql, params).rowcount != 1:
             return False
+        if kind == "dependency" and cur_row["status"] == "running":
+            # A live worker handing off to an unfinished dependency is a
+            # successful superseding attempt, not another retry failure. Clear
+            # stale quota/auth evidence before the task can auto-promote back
+            # to ready. Controller-side ready -> dependency transitions keep
+            # prior failure evidence because no newer worker attempt proved it
+            # stale.
+            conn.execute(
+                "UPDATE tasks SET consecutive_failures = 0, "
+                "last_failure_error = NULL WHERE id = ?",
+                (task_id,),
+            )
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
         )

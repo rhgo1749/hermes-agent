@@ -469,6 +469,56 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kbd.check_respawn_guard(conn, tid) is None
 
 
+def test_running_dependency_handoff_clears_superseded_failure_evidence(kanban_home):
+    """A newer live-worker dependency handoff supersedes an older retry failure."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", assignee="a")
+        claimed = kb.claim_task(conn, child, claimer="worker")
+        assert claimed is not None
+        # The dependency is discovered/created by the live worker after claim.
+        kb._link(conn, parent, child)
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures=1, last_failure_error=? WHERE id=?",
+            ("provider authentication failed", child),
+        )
+        conn.commit()
+
+        assert kb.block_task(
+            conn,
+            child,
+            kind="dependency",
+            reason="waiting for parent",
+            expected_run_id=claimed.current_run_id,
+        ) is True
+        waiting = kb.get_task(conn, child)
+        assert waiting.status == "todo"
+        assert waiting.consecutive_failures == 0
+        assert waiting.last_failure_error is None
+
+
+def test_ready_dependency_transition_preserves_prior_failure_evidence(kanban_home):
+    """Controller-side dependency gating is not proof that a retry succeeded."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", assignee="a")
+        kb._link(conn, parent, child)
+        prior_error = "provider authentication failed"
+        conn.execute(
+            "UPDATE tasks SET status='ready', consecutive_failures=1, last_failure_error=? WHERE id=?",
+            (prior_error, child),
+        )
+        conn.commit()
+
+        assert kb.block_task(
+            conn, child, kind="dependency", reason="waiting for parent",
+        ) is True
+        waiting = kb.get_task(conn, child)
+        assert waiting.status == "todo"
+        assert waiting.consecutive_failures == 1
+        assert waiting.last_failure_error == prior_error
+
+
 @pytest.mark.parametrize(
     "error_text, expected",
     [
