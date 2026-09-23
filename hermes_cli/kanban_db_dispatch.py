@@ -79,6 +79,21 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# A retry after one of these outcomes is the SAME logical worker attempt: the
+# previous process stopped before it could hand off a terminal result, or it
+# deliberately yielded awaiting operator/runtime recovery. Reuse its durable
+# Hermes conversation instead of making the replacement worker rediscover the
+# task from scratch. Completed/review/changes-requested runs intentionally stay
+# fresh because they represent a new lifecycle phase.
+_RESUMABLE_WORKER_OUTCOMES = frozenset({
+    "blocked",
+    "crashed",
+    "rate_limited",
+    "reclaimed",
+    "stale",
+    "timed_out",
+})
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -2670,7 +2685,104 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _kb._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
-def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
+def _previous_resumable_worker_attempt(
+    task: Task, board: Optional[str],
+) -> Optional[tuple[int, int, str]]:
+    """Return ``(started_at, ended_at, outcome)`` for the resumable prior run."""
+    if task.current_run_id is None:
+        return None
+    try:
+        with contextlib.closing(_kbc.connect(board=board)) as conn:
+            row = conn.execute(
+                """
+                SELECT started_at, ended_at, outcome
+                FROM task_runs
+                WHERE task_id = ?
+                  AND id != ?
+                  AND ended_at IS NOT NULL
+                ORDER BY started_at DESC, id DESC
+                LIMIT 1
+                """,
+                (task.id, int(task.current_run_id)),
+            ).fetchone()
+        if not row or row["outcome"] not in _RESUMABLE_WORKER_OUTCOMES:
+            return None
+        return int(row["started_at"]), int(row["ended_at"]), str(row["outcome"])
+    except Exception as exc:
+        _kb._log.debug("kanban worker: could not inspect prior run for %s (%s)", task.id, exc)
+        return None
+
+
+def _resume_session_for_worker(
+    task: Task,
+    profile_home: Optional[str],
+    *,
+    board: Optional[str],
+) -> Optional[str]:
+    """Resolve the durable Hermes conversation for a resumable worker retry."""
+    if not profile_home:
+        return None
+    prior = _previous_resumable_worker_attempt(task, board)
+    if prior is None:
+        return None
+    prior_started_at, prior_ended_at, _prior_outcome = prior
+    expected_prompt = f"work kanban task {task.id}"
+    try:
+        from hermes_state_registry import acquire, release_or_close
+
+        db = acquire(Path(profile_home) / "state.db")
+        try:
+            rows = db.search_sessions(source="kanban", limit=64)
+            seen_roots: set[str] = set()
+            for row in rows:
+                sid = str(row.get("id") or "")
+                if not sid:
+                    continue
+                root = db.get_conversation_root(sid) or sid
+                if root in seen_roots:
+                    continue
+                seen_roots.add(root)
+                root_meta = db.get_session(root) or {}
+                try:
+                    session_started_at = float(root_meta.get("started_at") or 0)
+                except (TypeError, ValueError):
+                    session_started_at = 0
+                if not (
+                    prior_started_at - 120
+                    <= session_started_at
+                    <= prior_ended_at + 120
+                ):
+                    continue
+                messages = db.get_messages(root, include_inactive=True, limit=8)
+                first_user = next((m for m in messages if m.get("role") == "user"), None)
+                if not first_user or str(first_user.get("content") or "").strip() != expected_prompt:
+                    continue
+                resolved = db.resolve_resume_session_id(root) or root
+                try:
+                    db.assert_resume_safe(resolved, tip_only=True)
+                except Exception as exc:
+                    _kb._log.warning(
+                        "kanban worker: prior session %s for %s is not safe to resume (%s); starting fresh",
+                        resolved, task.id, exc,
+                    )
+                    return None
+                return resolved
+        finally:
+            release_or_close(db)
+    except Exception as exc:
+        _kb._log.debug(
+            "kanban worker: could not resolve prior session for task %s in profile home %r (%s)",
+            task.id, profile_home, exc,
+        )
+    return None
+
+
+def _worker_argv(
+    task: Task,
+    profile_arg: str,
+    hermes_home: Optional[str],
+    resume_session_id: Optional[str] = None,
+) -> list[str]:
     """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
     cmd = [
         *_resolve_hermes_argv(),
@@ -2701,6 +2813,10 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    if resume_session_id:
+        # The task's current workspace is authoritative. A resumed session may
+        # have recorded an older cwd, so never restore it over TERMINAL_CWD.
+        cmd.extend(["--resume", resume_session_id, "--no-restore-cwd"])
     cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
     # goal_mode rides the same `-q` path: cli.py runs the judge loop there too, so the
     # worker log keeps its live tool feed (forcing -Q blanked it).
@@ -2867,7 +2983,17 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    resume_session_id = _resume_session_for_worker(
+        task, env.get("HERMES_HOME"), board=board,
+    )
+    if resume_session_id:
+        _kb._log.info(
+            "kanban worker: resuming session %s for task %s run %s",
+            resume_session_id, task.id, task.current_run_id,
+        )
+    cmd = _worker_argv(
+        task, profile_arg, env.get("HERMES_HOME"), resume_session_id=resume_session_id,
+    )
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
