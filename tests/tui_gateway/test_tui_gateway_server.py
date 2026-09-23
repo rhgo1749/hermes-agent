@@ -8203,6 +8203,24 @@ def test_config_set_yolo_toggles_session_scope():
         server._sessions.clear()
 
 
+def test_config_set_yolo_stale_session_id_is_refused_not_process_scoped(monkeypatch):
+    """A runtime id the backend no longer holds must answer 4001 so the client resumes, not flip
+    the process HERMES_YOLO_MODE that every child spawned afterwards inherits."""
+    monkeypatch.setenv("HERMES_YOLO_MODE", "0")  # setenv, not delenv: undo must also drop a leaked "1"
+
+    with patch.dict(server._sessions, {}, clear=True):
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "config.set",
+                "params": {"session_id": "reaped-sid", "key": "yolo", "value": "1"},
+            }
+        )
+
+    assert resp.get("error", {}).get("code") == 4001, resp
+    assert os.environ["HERMES_YOLO_MODE"] == "0"
+
+
 def test_config_set_yolo_global_scope_writes_approvals_mode(tmp_path, monkeypatch):
     """Shift+click the desktop zap -> scope="global" flips persistent approvals.mode."""
     import yaml
@@ -16404,6 +16422,60 @@ def test_model_save_key_reconciles_the_launch_profiles_stale_setup_record(monkey
 # ---------------------------------------------------------------------------
 
 
+
+
+def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_path):
+    """The post-turn heap trim must run after the turn's pre-turn history snapshots are dropped:
+    malloc_trim cannot return pages still referenced, so a retained snapshot of a large tool
+    result pins them for the life of the process. Observed through a weak reference to the old
+    message, not by reading the finisher's local variable names."""
+    import contextlib
+    import gc
+    import weakref
+
+    class _Msg(dict):
+        """dict itself is not weakref-able."""
+
+    observed = {}
+    order = []
+
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kw):
+            return {"final_response": "reply", "messages": [{"role": "assistant", "content": "reply"}]}
+
+    def _trim(**_kwargs):
+        order.append("trim")
+        gc.collect()
+        observed["alive_at_trim"] = old_ref() is not None
+
+    old = _Msg(role="tool", tool_call_id="old", content="x" * 20_000)
+    old_ref = weakref.ref(old)
+    session = _session(agent=_Agent())
+    profile_home = tmp_path / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    session["profile_home"] = str(profile_home)
+    session["history"] = [old]
+    del old
+    server._sessions["sid_trim"] = session
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "set_hermes_home_override", lambda _home: object())
+        monkeypatch.setattr(server, "reset_hermes_home_override", lambda _token: order.append("reset_home"))
+        monkeypatch.setattr(server, "_session_profile_runtime_scope", lambda _session: contextlib.nullcontext())
+        monkeypatch.setattr("hermes_cli.mem_trim.trim_memory", _trim)
+
+        resp = server.handle_request(
+            {"id": "1", "method": "prompt.submit", "params": {"session_id": "sid_trim", "text": "hi"}})
+
+        assert resp is not None and resp.get("result")
+        assert order == ["trim", "reset_home"]
+        assert observed["alive_at_trim"] is False, "a pre-turn history snapshot survived to the heap trim"
+    finally:
+        server._sessions.pop("sid_trim", None)
 
 
 class _ImmediateThread:

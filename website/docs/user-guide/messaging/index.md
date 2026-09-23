@@ -281,13 +281,15 @@ Final agent responses are recorded in a durable **delivery ledger**
 (`state.db`) around each platform send. If the gateway crashes or restarts
 between producing a response and the platform confirming receipt, the next
 boot redelivers the stored response instead of losing it — or re-running the
-whole turn.
+whole turn. The ledger lives in the home the gateway was started from; a
+multiplexed gateway keeps every served profile's replies there too.
 
 Semantics are honest at-least-once:
 
 - A response whose send **never started** is redelivered as-is.
 - A response that was **mid-send** when the gateway died (the platform may or
-  may not have received it) is redelivered with a visible
+  may not have received it), including a redelivery an earlier boot was
+  still sending, is redelivered with a visible
   "♻️ Recovered reply — … may be a duplicate" prefix. Ambiguity is labeled,
   never silently resent.
 - A final send refused by **flood control** (such as Telegram rate limits) is retried automatically
@@ -665,6 +667,10 @@ The generated plist lives at `~/Library/LaunchAgents/ai.hermes.gateway.plist`. I
 
 :::tip PATH changes after install
 launchd plists are static — if you install new tools (e.g. a new Node.js version via nvm, or ffmpeg via Homebrew) after setting up the gateway, run `hermes gateway install` again to capture the updated PATH. The gateway will detect the stale plist and reload automatically.
+:::
+
+:::info Installing without starting
+The plist sets `RunAtLoad`, so loading it starts the gateway. `hermes gateway install --no-start-now`, like answering No to "Start the gateway now?" in `hermes gateway setup`, writes the plist without loading it: the gateway starts at your next login, or when you run `hermes gateway start`. A gateway that launchd is already running is reloaded onto the new plist, not stopped.
 :::
 
 :::info Local Network access (LAN devices fail with "No route to host")

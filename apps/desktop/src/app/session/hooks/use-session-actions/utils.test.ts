@@ -619,6 +619,24 @@ describe('reconcileResumeMessages', () => {
 })
 
 describe('preserveLocalPendingTurnMessages', () => {
+  it('does not re-append a durably completed reply that compaction re-inserted under a new row id', () => {
+    const previous = [
+      msg('u1', 'user', 'q1', { rowId: 11340 }),
+      msg('a1', 'assistant', 'r1', { rowId: 11345, durableComplete: true }),
+      msg('user-9-x', 'user', 'q2', { rowId: 11350 }),
+      msg('assistant-stream-9-0', 'assistant', 'r2', { pending: false, rowId: 11359, durableComplete: true })
+    ]
+
+    const next = [
+      msg('s-u1', 'user', 'q1', { rowId: 11440 }),
+      msg('s-a1', 'assistant', 'r1', { rowId: 11444 }),
+      msg('s-u2', 'user', 'q2', { rowId: 11450 }),
+      msg('s-a2', 'assistant', 'r2', { rowId: 11459 })
+    ]
+
+    expect(preserveLocalPendingTurnMessages(next, previous)).toEqual(next)
+  })
+
   it('does not append acknowledged local history after a shifted newest page', () => {
     const previous = [
       msg('user-first', 'user', 'Original request', { timestamp: 1 }),
@@ -1730,6 +1748,86 @@ describe('overlayConcurrentMessageChanges', () => {
       { type: 'text', text: 'partial A' },
       { type: 'text', text: ' + delta B' }
     ])
+  })
+
+  // Switch back to a chat mid-reply: session.activate snapshots the first
+  // chunk, message.complete settles the live row, THEN the gated REST page
+  // resolves with the committed reply. Warm-activation composition order.
+  it('keeps one reply when message.complete lands while the switch-back hydrate is in flight', () => {
+    const snapshot = {
+      session_id: 'runtime-b',
+      turn_started_at: 100,
+      inflight: { user: 'prompt b', assistant: 'A2 ', streaming: true }
+    }
+
+    const baseline = [
+      msg('user-optimistic', 'user', 'prompt b'),
+      msg('assistant-stream-1-2', 'assistant', 'A2 ', { pending: true })
+    ]
+
+    const current = [
+      baseline[0],
+      msg('assistant-stream-1-2', 'assistant', 'A2 finished while away', { pending: false })
+    ]
+
+    const persisted = [
+      msg('3-user', 'user', 'prompt b', { rowId: 3 }),
+      msg('4-assistant', 'assistant', 'A2 finished while away', { rowId: 4, timestamp: 105 })
+    ]
+
+    const hydrated = appendLiveSessionProjection(persisted, snapshot)
+    const overlaid = overlayConcurrentMessageChanges(hydrated, baseline, current)
+
+    expect(overlaid.map(message => [message.id, chatMessageText(message)])).toEqual([
+      ['3-user', 'prompt b'],
+      ['4-assistant', 'A2 finished while away']
+    ])
+
+    // Before the commit the same snapshot still projects the running reply.
+    const running = overlayConcurrentMessageChanges(
+      appendLiveSessionProjection(persisted.slice(0, 1), snapshot),
+      baseline,
+      [baseline[0], msg('assistant-stream-1-2', 'assistant', 'A2 finished', { pending: true })]
+    )
+
+    expect(running.map(message => [message.id, chatMessageText(message)])).toEqual([
+      ['3-user', 'prompt b'],
+      ['assistant-stream-1-2', 'A2 finished']
+    ])
+  })
+
+  // The same prompt sent again (from another client, so the cache lacks its
+  // row) streams the same opening as the previous answer. The cached-transcript
+  // path must keep that NEXT turn's stream, and an errored settled row keeps
+  // its failure instead of folding into identical committed text.
+  it('keeps the next turn of a resent prompt and an errored settled row', () => {
+    const cached = [
+      msg('3-user', 'user', 'prompt b', { rowId: 3 }),
+      msg('4-assistant', 'assistant', 'Same answer', { rowId: 4, timestamp: 105 })
+    ]
+
+    const snapshot = {
+      session_id: 'runtime-b',
+      turn_started_at: 200,
+      inflight: { user: 'prompt b', assistant: 'Same ', streaming: true }
+    }
+
+    const hydrated = appendLiveSessionProjection(cached, snapshot)
+
+    expect(hydrated.map(message => [message.id, chatMessageText(message)])).toEqual([
+      ['3-user', 'prompt b'],
+      ['4-assistant', 'Same answer'],
+      ['assistant-stream-runtime-b', 'Same ']
+    ])
+
+    const settledNextTurn = msg('assistant-stream-1-3', 'assistant', 'Same answer', { pending: false })
+
+    expect(overlayConcurrentMessageChanges(cached, cached, [...cached, settledNextTurn]).at(-1)).toBe(settledNextTurn)
+
+    const errored = msg('assistant-stream-1-2', 'assistant', 'A2 done', { pending: false, error: 'stream lost' })
+    const page = [msg('3-user', 'user', 'prompt b'), msg('4-assistant', 'assistant', 'A2 done')]
+
+    expect(overlayConcurrentMessageChanges(page, [page[0]], [page[0], errored]).at(-1)).toBe(errored)
   })
 })
 
