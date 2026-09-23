@@ -31,6 +31,38 @@ class TestPaginateFullList:
         assert [t.name for t in items] == ["a", "b"]
         list_method.assert_called_once_with()
 
+    def test_cache_meta_ignores_model_defaults_omitted_by_server(self):
+        """Pydantic defaults are not cache hints unless the response set them."""
+        result = SimpleNamespace(
+            tools=[_tool("a")],
+            ttl_ms=0,
+            cache_scope="private",
+            model_fields_set={"tools"},
+        )
+        cache_meta = {}
+        items = asyncio.run(
+            _paginate_full_list(
+                AsyncMock(return_value=result), "tools", "srv", cache_meta_out=cache_meta,
+            )
+        )
+        assert [tool.name for tool in items] == ["a"]
+        assert cache_meta == {}
+
+    def test_cache_meta_preserves_explicit_zero_ttl(self):
+        """An explicit zero TTL remains an immediate-expiry server hint."""
+        result = SimpleNamespace(
+            tools=[_tool("a")],
+            ttl_ms=0,
+            cache_scope="private",
+            model_fields_set={"tools", "ttl_ms", "cache_scope"},
+        )
+        cache_meta = {}
+        asyncio.run(
+            _paginate_full_list(
+                AsyncMock(return_value=result), "tools", "srv", cache_meta_out=cache_meta,
+            )
+        )
+        assert cache_meta == {"ttl_ms": 0, "cache_scope": "private"}
 
     def test_runaway_cursor_capped(self):
         """A server that returns a cursor forever is bounded by the page cap."""
