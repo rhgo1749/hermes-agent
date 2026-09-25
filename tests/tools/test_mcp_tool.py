@@ -456,6 +456,33 @@ class TestLifecycleConfig:
             is None
         )
 
+    def test_lazy_stdio_defaults_to_local_idle_recycle(self):
+        from tools.mcp_tool_common import _resolve_stdio_idle_timeout_seconds
+
+        assert _resolve_stdio_idle_timeout_seconds({"lazy": True}) == 900.0
+        assert _resolve_stdio_idle_timeout_seconds({"lazy": False}) is None
+        assert _resolve_stdio_idle_timeout_seconds({}) is None
+
+    def test_lazy_stdio_explicit_idle_timeout_wins_including_zero(self):
+        from tools.mcp_tool_common import _resolve_stdio_idle_timeout_seconds
+
+        assert _resolve_stdio_idle_timeout_seconds(
+            {"lazy": True, "idle_timeout_seconds": 75}
+        ) == 75.0
+        assert _resolve_stdio_idle_timeout_seconds(
+            {"lazy": True, "idle_timeout_seconds": 0}
+        ) is None
+        assert _resolve_stdio_idle_timeout_seconds(
+            {"lazy": True, "lifecycle": {"idle_timeout_seconds": 120}}
+        ) == 120.0
+
+    def test_lazy_stdio_invalid_explicit_idle_timeout_does_not_fall_back(self):
+        from tools.mcp_tool_common import _resolve_stdio_idle_timeout_seconds
+
+        assert _resolve_stdio_idle_timeout_seconds(
+            {"lazy": True, "idle_timeout_seconds": "soon"}
+        ) is None
+
 
 # ---------------------------------------------------------------------------
 # Schema conversion

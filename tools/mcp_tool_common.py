@@ -161,3 +161,34 @@ def _get_lifecycle_seconds(config: dict, key: str) -> Optional[float]:
         logger.warning("MCP config %s must be positive; ignoring %r", key, raw)
         return None
     return seconds or None
+
+
+_LOCAL_LAZY_STDIO_IDLE_TIMEOUT_SECONDS = 900.0
+
+
+def _has_lifecycle_setting(config: dict, key: str) -> bool:
+    """Whether *key* was explicitly configured at top-level or under ``lifecycle``.
+
+    This distinction matters because ``0`` is an intentional disable value, while an absent
+    idle timeout gets the local lazy-stdio scale-to-zero default below.
+    """
+    if key in config:
+        return True
+    lifecycle = config.get("lifecycle")
+    return isinstance(lifecycle, dict) and key in lifecycle
+
+
+def _resolve_stdio_idle_timeout_seconds(config: dict) -> Optional[float]:
+    """Resolve stdio idle recycling, defaulting lazy local servers to 15 minutes.
+
+    Upstream lifecycle semantics remain intact for explicit values: ``0`` still disables
+    recycling, custom positive values win, and invalid explicit values stay invalid instead of
+    silently acquiring a default. Only a missing setting on ``lazy: true`` receives the local
+    900-second scale-to-zero policy.
+    """
+    configured = _get_lifecycle_seconds(config, "idle_timeout_seconds")
+    if _has_lifecycle_setting(config, "idle_timeout_seconds"):
+        return configured
+    if _parse_boolish(config.get("lazy", False), default=False):
+        return _LOCAL_LAZY_STDIO_IDLE_TIMEOUT_SECONDS
+    return None
