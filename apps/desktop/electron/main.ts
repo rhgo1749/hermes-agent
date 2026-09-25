@@ -383,6 +383,10 @@ import { createPortalSession } from './portal-session'
 import { createKeepAwake } from './power-save'
 import { readPreUpdateBackupEnabled } from './pre-update-backup-config'
 import { capturePreviewContents } from './preview-capture'
+import {
+  onPreviewWatchOwnerDestroyed,
+  sendPreviewFileChangedToOwner
+} from './preview-file-watch'
 import { PreviewReachRegistry } from './preview-reach'
 import {
   createPrimaryRemoteConnection,
@@ -390,7 +394,7 @@ import {
   runPrimaryBackendStartup
 } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
-import { PrimaryProfilePin } from './primary-profile-pin'
+import { PrimaryProfilePin, resolveLaunchProfile } from './primary-profile-pin'
 import { applyDesktopIdentity, PRODUCT_IDENTITY } from './product-identity'
 import {
   assertLocalProfileCanStart,
@@ -536,7 +540,7 @@ import {
 import { registerWindowControlIpc, windowControlState } from './window-controls'
 import { createWindowOpenHandler } from './window-open-policy'
 import { installWindowRendererLifecycle } from './window-renderer-lifecycle'
-import { createWindowRevealController } from './window-reveal'
+import { wireWindowReveal } from './window-reveal'
 import {
   bindGeometryPersistence,
   computeWindowOptions,
@@ -5788,26 +5792,19 @@ async function filePathFromPreviewUrl(rawUrl) {
   return resolvedPath
 }
 
-function sendPreviewFileChanged(payload) {
-  if (!mainWindow || mainWindow.isDestroyed()) {
-    return
-  }
-
-  const { webContents } = mainWindow
-
-  if (!webContents || webContents.isDestroyed()) {
-    return
-  }
-
-  webContents.send('hermes:preview-file-changed', payload)
-}
-
-async function watchPreviewFile(rawUrl) {
+async function watchPreviewFile(owner, rawUrl) {
   const filePath = await filePathFromPreviewUrl(rawUrl)
   const watchDir = path.dirname(filePath)
   const targetName = path.basename(filePath)
   const id = crypto.randomBytes(12).toString('base64url')
   let timer = null
+
+  // Proactive teardown: the watch must not outlive the window that asked for
+  // it by whole quit-cycles waiting on a change event that never comes.
+  const offOwnerDestroyed = onPreviewWatchOwnerDestroyed(
+    owner,
+    () => stopPreviewFileWatch(id)
+  )
 
   const watcher = fs.watch(watchDir, (_eventType, filename) => {
     const changedName = filename ? path.basename(String(filename)) : ''
@@ -5827,12 +5824,18 @@ async function watchPreviewFile(rawUrl) {
         return
       }
 
-      sendPreviewFileChanged({ id, path: filePath, url: pathToFileURL(filePath).toString() })
+      sendPreviewFileChangedToOwner(
+        owner,
+        { id, path: filePath, url: pathToFileURL(filePath).toString() },
+        () => stopPreviewFileWatch(id)
+      )
     }, PREVIEW_WATCH_DEBOUNCE_MS)
   })
 
   previewWatchers.set(id, {
+    owner,
     close: () => {
+      offOwnerDestroyed()
       if (timer) {
         clearTimeout(timer)
       }
@@ -5878,7 +5881,7 @@ function requestOptionsWithHeaders(options: any = {}, headers = {}) {
  *  readdir poll. Same registry + change channel as the preview file watchers
  *  (the renderer reconciles on any tick; per-file edits stay on their own
  *  watches), so stopPreviewFileWatch/closePreviewWatchers manage these too. */
-function watchDirectory(rawDir) {
+function watchDirectory(owner, rawDir) {
   const watchDir = path.resolve(String(rawDir || ''))
 
   if (!fs.existsSync(watchDir) || !fs.statSync(watchDir).isDirectory()) {
@@ -5888,6 +5891,13 @@ function watchDirectory(rawDir) {
   const id = crypto.randomBytes(12).toString('base64url')
   let timer = null
 
+  // Same proactive teardown as a file watch: a closed window's directory
+  // watch must not keep polling the disk-plugin door until quit.
+  const offOwnerDestroyed = onPreviewWatchOwnerDestroyed(
+    owner,
+    () => stopPreviewFileWatch(id)
+  )
+
   const watcher = fs.watch(watchDir, () => {
     if (timer) {
       clearTimeout(timer)
@@ -5895,12 +5905,18 @@ function watchDirectory(rawDir) {
 
     timer = setTimeout(() => {
       timer = null
-      sendPreviewFileChanged({ id, path: watchDir, url: pathToFileURL(watchDir).toString() })
+      sendPreviewFileChangedToOwner(
+        owner,
+        { id, path: watchDir, url: pathToFileURL(watchDir).toString() },
+        () => stopPreviewFileWatch(id)
+      )
     }, PREVIEW_WATCH_DEBOUNCE_MS)
   })
 
   previewWatchers.set(id, {
+    owner,
     close: () => {
+      offOwnerDestroyed()
       if (timer) {
         clearTimeout(timer)
       }
@@ -12210,6 +12226,12 @@ function startHermes({ supervisorRecovery = false }: { supervisorRecovery?: bool
   return start
 }
 
+// A quit or update handoff kills renderers while their windows can still report
+// live; the renderer lifecycle must treat that as teardown, not a crash to reload.
+function rendererTeardownInProgress(): boolean {
+  return isQuittingForHandoff || backendShutdown.hasStarted()
+}
+
 function primaryRecoveryState() {
   return {
     hasCurrentOwner: backendConnectionState.getProcess() !== null || backendConnectionState.getPromise() !== null,
@@ -12362,7 +12384,15 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
   migrateActiveProfileIfMissing()
 
   const connectionAttempt = backendConnectionState.startAttempt()
-  const primaryProfile = primaryProfileKey()
+  // ONE launch-profile decision for this attempt (#108417): routing pin,
+  // --profile argv, and the child env all derive from the same read, so a
+  // hermes:profile:remember landing mid-startup becomes the NEXT boot's
+  // preference instead of splitting routing identity from the launch
+  // argument. (The pin below still honors a live primary — but a primary
+  // being live means startHermes never got here.)
+  const { argvProfile: activeProfile, routingProfile: primaryProfile } = resolveLaunchProfile(
+    readActiveDesktopProfile
+  )
   // Pin the routing table to the profile this primary actually boots as; a
   // later hermes:profile:remember must not retarget requests mid-life.
   primaryProfilePin.pin(primaryProfile)
@@ -12427,9 +12457,8 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
     // deterministic (it wins over the sticky ~/.hermes/active_profile file) and
     // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI. An
     // unset preference keeps the legacy launch so existing installs are
-    // unaffected.
-    const activeProfile = readActiveDesktopProfile()
-
+    // unaffected. `activeProfile` is the SAME decision that pinned routing
+    // above — never re-read here (#108417).
     if (activeProfile) {
       backendArgs.unshift('--profile', activeProfile)
     }
@@ -12518,7 +12547,7 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
     rememberLog(`Starting Hermes backend via ${backend.label}`)
 
-    const profile = primaryProfileKey()
+    const profile = primaryProfile
     const parentStartMarker = await desktopParentStartMarker()
     const backendNonce = crypto.randomBytes(16).toString('hex')
     const parentIdentityEnv = parentWatchdogEnv(process.pid, parentStartMarker, backendNonce)
@@ -12627,6 +12656,11 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
         return
       }
 
+      // The CURRENT owner failed to start: its routing identity must not
+      // outlive it. A newer attempt already re-pins on its own decision
+      // (#108417), and the stale branch above never reaches this clear.
+      primaryProfilePin.clear()
+
       rememberLog(`Hermes backend failed to start: ${error.message}`)
       updateBootProgress(
         {
@@ -12656,6 +12690,13 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
       }
 
       rememberLog(formatBackendExitLine('Hermes backend exited', code, signal, primaryOutputTail))
+
+      // The current primary child is gone; release its routing pin so the
+      // next startHermes() re-reads active-profile.json instead of re-pinning
+      // the dead child's profile (#108417). Supervisor respawns go through
+      // startHermes, which makes a fresh decision — a respawn cannot inherit
+      // a pin from a process that no longer exists.
+      primaryProfilePin.clear()
 
       if (!scheduleUnexpectedPrimaryRecovery({ code, signal, ready: backendReady })) {
         sendBackendExit({ code, signal })
@@ -12765,6 +12806,12 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
     if (!backendConnectionState.clearPromiseForAttempt(connectionAttempt)) {
       throw error
     }
+
+    // The startup attempt this pin belongs to is being torn down: release its
+    // routing identity so a later start re-reads the preference. The
+    // attempt guard above means a superseded attempt's failure never clears
+    // a newer attempt's pin (#108417).
+    primaryProfilePin.clear()
 
     await backendConnectionState.stopProcess(localBackendLifecycle.stop)
 
@@ -12937,23 +12984,8 @@ function installPreviewGuestPreload() {
 // though the renderer finished loading. Keep the themed path as the preferred
 // reveal, then fall back a few seconds after the renderer loads. `show` and
 // `onRevealed` carry the caller's reveal action and post-visible work; whichever
-// path wins runs them exactly once.
-function wireWindowReveal(win, { show, onRevealed }: { show?: () => void; onRevealed?: () => void } = {}) {
-  const controller = createWindowRevealController(
-    {
-      isDestroyed: () => win.isDestroyed(),
-      isVisible: () => win.isVisible(),
-      show: show ?? (() => win.show())
-    },
-    { onRevealed }
-  )
-
-  win.once('ready-to-show', controller.reveal)
-  win.webContents.once('did-finish-load', controller.scheduleFallback)
-  win.on('closed', controller.dispose)
-
-  return controller
-}
+// path wins runs them exactly once. Callers that pass `onRevealFailed` also get
+// the pre-paint failure branch (see window-reveal.ts).
 
 // Secondary "session windows" — one extra OS window per chat so a user can
 // work with multiple chats side by side. The registry guarantees one window
@@ -13050,6 +13082,7 @@ function spawnSecondaryWindow({
         win.webContents.reload()
       }
     },
+    isIntentionalTeardown: rendererTeardownInProgress,
     reloadWindowMs: RENDERER_RELOAD_WINDOW_MS,
     reloadMax: RENDERER_RELOAD_MAX,
     recentReloadTimesRef: rendererReloadTimesRef
@@ -13131,6 +13164,7 @@ function spawnBrowserWindow(tabId) {
         win.webContents.reload()
       }
     },
+    isIntentionalTeardown: rendererTeardownInProgress,
     reloadWindowMs: RENDERER_RELOAD_WINDOW_MS,
     reloadMax: RENDERER_RELOAD_MAX,
     recentReloadTimesRef: rendererReloadTimesRef
@@ -13239,6 +13273,7 @@ function createInstanceWindow(
         win.webContents.reload()
       }
     },
+    isIntentionalTeardown: rendererTeardownInProgress,
     reloadWindowMs: RENDERER_RELOAD_WINDOW_MS,
     reloadMax: RENDERER_RELOAD_MAX,
     recentReloadTimesRef: rendererReloadTimesRef
@@ -13914,6 +13949,17 @@ function spawnHudWindow(sessionId, profile) {
       // Compositor overlay adapters (Hyprland float+pin today). Electron
       // alwaysOnTop is already set; this is the dialect some WMs actually hear.
       void promoteHudOverlay({ title: HUD_WINDOW_TITLE })
+    },
+    // #108230: the HUD is born `show: false` + transparent, and its renderer
+    // lifecycle is deliberately log-only (#81290 — a dead renderer should be
+    // diagnosable, not resurrected). But a load failure or renderer crash
+    // BEFORE first paint leaves a hidden window every toggle claims is open.
+    // Tear it down instead: requestHudClose is bounded, and the 'closed'
+    // handler below owns the one teardown path (snap shortcut, main-window
+    // restore, broadcastHudState(false)) so the toggles converge to closed.
+    onRevealFailed: reason => {
+      rememberLog(`[renderer:hud] window never revealed; tearing it down (${reason})`)
+      destroyHudWindow(win)
     }
   })
 
@@ -14391,7 +14437,7 @@ function createWindow() {
   wireCommonWindowHandlers(mainWindow, zoomWiringForWindowKind('chat'))
 
   // Per-window renderer lifecycle diagnostics + recovery (#81290). The reload
-  // policy (crashed/oom → bounded reload via the shared rolling budget, then
+  // policy (crashed/oom/killed → bounded reload via the shared rolling budget, then
   // the #38216 Windows sandbox relaunch check on suppression) is the same
   // policy this window used before it moved into the shared helper, so a
   // crashed peer renderer now logs and recovers exactly like the primary one.
@@ -14457,10 +14503,10 @@ function createWindow() {
           reloadUrl: DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString()
         })
       },
-      // #116472: the OS/Chromium can SIGKILL a renderer while the window is live (memory
-      // reclaim, an external kill). Hermes never does this itself and never reloads it
-      // (a killed-after-close window must not pop back up), so without this the window sat
-      // silent with only a desktop.log line. Surface the reason + a recovery button instead.
+      // #116472: the OS/Chromium can kill a renderer while the window is live (memory
+      // reclaim, an external SIGTERM/SIGKILL). The lifecycle reloads that under the shared
+      // budget (#85048); once the budget is spent, or for an unrecoverable reason, surface
+      // the reason + a recovery button instead of a silent dead window.
       onRendererTerminated: details => {
         // An intentional quit/handoff also tears the renderer down; never pop a
         // recovery page for it (its window may still be alive when this fires).
@@ -14480,6 +14526,7 @@ function createWindow() {
         })
       }
     },
+    isIntentionalTeardown: rendererTeardownInProgress,
     reloadWindowMs: RENDERER_RELOAD_WINDOW_MS,
     reloadMax: RENDERER_RELOAD_MAX,
     recentReloadTimesRef: rendererReloadTimesRef,
@@ -15009,6 +15056,13 @@ ipcMain.handle('hermes:bootstrap:cancel', async () => {
 })
 ipcMain.handle('hermes:boot-progress:get', async () => bootProgressState)
 ipcMain.handle('hermes:bootstrap:get', async () => getBootstrapState())
+ipcMain.handle('hermes:local-backend:probe', async () => {
+  // Resolution only. ensureRuntime/runBootstrap must not start from a hover
+  // or a click that has not confirmed the install.
+  const backend = await resolveHermesBackend([])
+
+  return { bootstrapNeeded: backend?.kind === 'bootstrap-needed' }
+})
 ipcMain.handle('hermes:connection-config:get', async (_event, profile) =>
   sanitizeDesktopConnectionConfig(readDesktopConnectionConfig(), profile)
 )
@@ -16839,9 +16893,13 @@ ipcMain.handle('hermes:normalizePreviewTarget', (_event, target, baseDir) =>
   normalizePreviewTarget(String(target || ''), baseDir ? String(baseDir) : '')
 )
 
-ipcMain.handle('hermes:watchPreviewFile', (_event, url) => watchPreviewFile(String(url || '')))
+ipcMain.handle('hermes:watchPreviewFile', (event, url) =>
+  watchPreviewFile(event.sender, String(url || ''))
+)
 
-ipcMain.handle('hermes:watchDirectory', (_event, dir) => watchDirectory(String(dir || '')))
+ipcMain.handle('hermes:watchDirectory', (event, dir) =>
+  watchDirectory(event.sender, String(dir || ''))
+)
 
 ipcMain.handle('hermes:stopPreviewFileWatch', (_event, id) => stopPreviewFileWatch(String(id || '')))
 

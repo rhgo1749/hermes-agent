@@ -2903,7 +2903,15 @@ export const zh = defineLocale({
       gatewayUnreachable: gateway => `${gateway} · 无法连接`,
       onGateway: (name, gateway) => `${name} · ${gateway}`,
       switchTo: (name, gateway) => `切换到 ${gateway} 上的 ${name}`,
-      deleteOn: gateway => `（位于 ${gateway}）`
+      deleteOn: gateway => `（位于 ${gateway}）`,
+      localDevice: '此设备（本地后端——若未安装 Hermes 则会安装，否则打开一个新会话）',
+      switchDeviceTitle: '切换到此设备？',
+      switchDeviceDesc: '这会在这台电脑上打开一个新会话。当前对话仍留在另一个网关上。',
+      switchDeviceConfirm: '切换',
+      installDeviceTitle: '切换到此设备？',
+      installDeviceDesc: '这将在本地安装 Hermes，然后在这台电脑上打开一个新会话。确认之前不会开始安装。',
+      installDeviceConfirm: '本地安装',
+      connectExistingInstead: '改为连接现有环境'
     },
     remoteOverride: {
       menuItem: '连接到远程主机…',
@@ -4342,7 +4350,8 @@ export const zh = defineLocale({
         title: '上下文用量',
         tokenSummary: (used, max) => `${used} / ${max} Tokens`
       },
-      session: '会话',
+      focusedSince: '聚焦以来',
+      focusedSinceTitle: '自本次聚焦该对话以来的时间，不是回合运行时长',
       yoloOn: 'YOLO 已开启 — 自动批准危险命令。Shift+点击可全局切换。',
       yoloOff: 'YOLO 已关闭。Shift+点击可全局切换。',
       modelNone: '无',

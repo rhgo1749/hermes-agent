@@ -2269,6 +2269,17 @@ export const ru = defineLocale({
     switchConnectionFailed: name => `Не удалось подключиться к ${name}`,
     manageProfiles: 'Управлять профилями…',
     connectGateway: 'Управлять шлюзами…',
+    fleet: {
+      localDevice: 'Это устройство (локальный бэкенд — установит Hermes, если его нет, иначе откроет новую сессию)',
+      switchDeviceTitle: 'Переключиться на это устройство?',
+      switchDeviceDesc: 'Откроется новая сессия на этом компьютере. Текущий разговор останется на другом шлюзе.',
+      switchDeviceConfirm: 'Переключить',
+      installDeviceTitle: 'Переключиться на это устройство?',
+      installDeviceDesc:
+        'Hermes будет установлен локально, затем откроется новая сессия на этом компьютере. Установка не начнётся, пока вы не подтвердите.',
+      installDeviceConfirm: 'Установить локально',
+      connectExistingInstead: 'Вместо этого подключить существующий'
+    },
     actions: 'Действия',
     color: 'Цвет…',
     colorFor: 'Цвет',
@@ -3588,7 +3599,8 @@ export const ru = defineLocale({
         title: 'Использование контекста',
         tokenSummary: (used, max) => `${used} / ${max} токенов`
       },
-      session: 'Сеанс',
+      focusedSince: 'В фокусе с',
+      focusedSinceTitle: 'Время с момента фокуса этого чата — не длительность хода',
       yoloOn: 'YOLO включён — автоматическое подтверждение опасных команд. Shift-клик переключает глобально.',
       yoloOff: 'YOLO выключен. Shift-клик переключает глобально.',
       modelNone: 'нет',

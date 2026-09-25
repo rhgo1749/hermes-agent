@@ -3529,7 +3529,18 @@ export const deOverrides = {
       gatewayUnreachable: gateway => `${gateway} · nicht erreichbar`,
       onGateway: (name, gateway) => `${name} · ${gateway}`,
       switchTo: (name, gateway) => `Zu ${name} auf ${gateway} wechseln`,
-      deleteOn: gateway => ` auf ${gateway}`
+      deleteOn: gateway => ` auf ${gateway}`,
+      localDevice:
+        'Dieses Gerät (lokales Backend — installiert Hermes, falls es fehlt, sonst öffnet es eine neue Sitzung)',
+      switchDeviceTitle: 'Zu diesem Gerät wechseln?',
+      switchDeviceDesc:
+        'Das öffnet eine neue Sitzung auf diesem Computer. Das aktuelle Gespräch bleibt auf dem anderen Gateway.',
+      switchDeviceConfirm: 'Wechseln',
+      installDeviceTitle: 'Zu diesem Gerät wechseln?',
+      installDeviceDesc:
+        'Hermes wird lokal installiert und danach eine neue Sitzung auf diesem Computer geöffnet. Ohne Bestätigung startet keine Installation.',
+      installDeviceConfirm: 'Lokal installieren',
+      connectExistingInstead: 'Stattdessen vorhandenes verbinden'
     },
     status: {
       unread: (count: number) => (count === 1 ? '1 ungelesene Sitzung' : `${count} ungelesene Sitzungen`),
@@ -5069,7 +5080,8 @@ export const deOverrides = {
         title: 'Kontext-Verbrauch',
         tokenSummary: (used, max) => `${used} / ${max} Tokens`
       },
-      session: 'Session',
+      focusedSince: 'Fokussiert seit',
+      focusedSinceTitle: 'Zeit seit dem Fokussieren dieses Chats — nicht die Laufzeit eines Turns',
       yoloOn: 'YOLO an — gefährliche Befehle werden automatisch genehmigt. Shift+Klick schaltet global um.',
       yoloOff: 'YOLO aus. Shift+Klick schaltet global um.',
       modelNone: 'keines',

@@ -1700,6 +1700,16 @@ export const ar = defineLocale({
     switchToConnection: name => `التبديل إلى ${name}`,
     switchConnectionFailed: name => `تعذّر الاتصال بـ ${name}`,
     manageProfiles: 'إدارة الملفات الشخصية',
+    fleet: {
+      localDevice: 'هذا الجهاز (خلفية محلية — تثبّت Hermes إن كان مفقودًا، وإلا تفتح جلسة جديدة)',
+      switchDeviceTitle: 'التبديل إلى هذا الجهاز؟',
+      switchDeviceDesc: 'يفتح هذا جلسة جديدة على هذا الحاسوب. تبقى المحادثة الحالية على البوابة الأخرى.',
+      switchDeviceConfirm: 'تبديل',
+      installDeviceTitle: 'التبديل إلى هذا الجهاز؟',
+      installDeviceDesc: 'سيُثبَّت Hermes محليًا ثم تُفتح جلسة جديدة على هذا الحاسوب. لا يبدأ التثبيت قبل التأكيد.',
+      installDeviceConfirm: 'تثبيت محليًا',
+      connectExistingInstead: 'الاتصال بموجود بدلًا من ذلك'
+    },
     remoteOverride: {
       menuItem: 'الاتصال بمضيف بعيد…',
       badge: (host: string) => `يعمل على ${host}`,
@@ -2864,7 +2874,8 @@ export const ar = defineLocale({
       openCron: 'فتح المهام المجدولة',
       turnRunning: 'الدور يعمل',
       contextUsage: 'استخدام السياق',
-      session: 'الجلسة',
+      focusedSince: 'منذ التركيز',
+      focusedSinceTitle: 'الوقت منذ تركيز هذه المحادثة — وليس مدة الدور',
       yoloOn: 'YOLO مفعل',
       yoloOff: 'YOLO معطل',
       modelNone: 'لا نموذج',

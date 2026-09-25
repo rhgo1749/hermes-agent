@@ -3536,7 +3536,17 @@ export const frOverrides = {
       gatewayUnreachable: gateway => `${gateway} · inaccessible`,
       onGateway: (name, gateway) => `${name} · ${gateway}`,
       switchTo: (name, gateway) => `Basculer vers ${name} sur ${gateway}`,
-      deleteOn: gateway => ` sur ${gateway}`
+      deleteOn: gateway => ` sur ${gateway}`,
+      localDevice: 'Cet appareil (backend local — installe Hermes s’il manque, sinon ouvre une nouvelle session)',
+      switchDeviceTitle: 'Basculer vers cet appareil ?',
+      switchDeviceDesc:
+        'Cela ouvre une nouvelle session sur cet ordinateur. La conversation en cours reste sur l’autre gateway.',
+      switchDeviceConfirm: 'Basculer',
+      installDeviceTitle: 'Basculer vers cet appareil ?',
+      installDeviceDesc:
+        'Hermes sera installé localement, puis une nouvelle session s’ouvrira sur cet ordinateur. Rien n’est installé tant que vous ne confirmez pas.',
+      installDeviceConfirm: 'Installer localement',
+      connectExistingInstead: 'Connecter un existant à la place'
     },
     status: {
       unread: (count: number) => (count === 1 ? '1 session non lue' : `${count} sessions non lues`),
@@ -5081,7 +5091,8 @@ export const frOverrides = {
         title: 'Utilisation du contexte',
         tokenSummary: (used, max) => `${used} / ${max} jetons`
       },
-      session: 'Session',
+      focusedSince: 'Focalisé depuis',
+      focusedSinceTitle: 'Temps depuis que cette conversation est au premier plan — pas la durée d’un tour',
       yoloOn: 'YOLO activé — approbation automatique des commandes dangereuses. Shift+clic pour basculer globalement.',
       yoloOff: 'YOLO désactivé. Shift+clic pour basculer globalement.',
       modelNone: 'aucun',
