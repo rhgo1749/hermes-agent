@@ -83,10 +83,12 @@ import { createBackendServeSupportResolver } from './backend-serve-support'
 import {
   isHostKeyChangedBootFailure,
   isRetryableRemoteBootFailure,
+  isSshAuthFailedBootFailure,
   shouldHoldBootProgressForReauth,
   shouldLatchBackendStartFailure,
   shouldLatchHostKeyChangedFailure,
-  shouldLatchRemoteReauthFailure
+  shouldLatchRemoteReauthFailure,
+  shouldLatchSshAuthFailure
 } from './backend-start-failure'
 import { describeBootstrapFailure } from './bootstrap-failure-copy'
 import {
@@ -109,6 +111,7 @@ import { detectBundleSkew } from './bundle-skew'
 import { detectBundleSwap, readBundleSwapStamp } from './bundle-swap'
 import { registerChatOnboardingWindow } from './chat-onboarding-window'
 import { provisionCliLinks } from './cli-provision'
+import { closeStopFailureMessage, finishWindowsCloseStop, type RuntimeLock } from './close-stop-kill'
 import { shouldAttemptCloudBootCascade } from './cloud-boot-cascade'
 import { discoverWithTeamFallback } from './cloud-discovery'
 import { installCommandScreenshot } from './command-screenshot'
@@ -198,7 +201,7 @@ import {
   resolveDesktopConnectionRequest,
   resolveDesktopWindowLaunch
 } from './desktop-profile'
-import { resolveDesktopRemoteRoute, v1SshTerminalPoolKey } from './desktop-remote-route'
+import { registryPrimaryBootRoute, resolveDesktopRemoteRoute, v1SshTerminalPoolKey } from './desktop-remote-route'
 import {
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
@@ -212,6 +215,7 @@ import {
   type UninstallSummaryDetails
 } from './desktop-uninstall'
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
+import { preReadyDockLaunchSteps } from './dock-launch-order'
 import { installEmbedReferer } from './embed-referer'
 import { createAmbientClaimArbiter } from './event-dedupe'
 import { openExternalUrl as externalOpen, type ExternalOpenDeps } from './external-open'
@@ -342,6 +346,7 @@ import {
 } from './native-oauth'
 import { runNativeLogin } from './native-oauth-login'
 import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
+import { planNoConsoleGitSpawn, setNoConsoleGitRoots, windowsGitHost } from './no-console-git'
 import { registerNativeNotifications } from './notification-ipc'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { LEGACY_OAUTH_PARTITION, resolveOauthPartition } from './oauth-partition'
@@ -572,6 +577,18 @@ import {
   shouldRelaunchForRendererSandboxCrashLoop,
   writeSandboxMarker
 } from './windows-sandbox-fallback'
+import {
+  alreadyHasDisableGpu,
+  buildDisableGpuRelaunchArgs,
+  decideWindowsGpuStackCookieLaunch,
+  gpuStackCookieFallbackMarker,
+  isHermesDesktopGpuOverrideOff,
+  markerAfterSuccessfulGpuStackCookieBoot,
+  readGpuStackCookieMarker,
+  shouldRelaunchForRendererStackCookieCrashLoop,
+  shouldSurfaceErrorForRendererStackCookieCrashLoop,
+  writeGpuStackCookieMarker
+} from './windows-stack-cookie-fallback'
 import { installWindowsSystemCaTrust } from './windows-system-ca'
 import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
@@ -632,6 +649,42 @@ if (REMOTE_DISPLAY_REASON) {
   console.log(
     `[hermes] remote display detected (${REMOTE_DISPLAY_REASON}); disabling GPU hardware acceleration to prevent flicker`
   )
+}
+
+// #108047: a local Windows renderer crash loop with STATUS_STACK_BUFFER_OVERRUN
+// (0xC0000409) is recovered by disabling GPU — NOT by dropping the sandbox
+// (that path stays owned by STATUS_BREAKPOINT / #38216). Must run before app
+// `ready`. Skip applying switches when the remote-display block above already
+// did; still honor a sticky per-version marker so Start Menu launches recover.
+let windowsGpuStackCookieFallbackActive = false
+let windowsGpuStackCookieFallbackSticky = false
+let windowsGpuStackCookieRelaunchAttempted = false
+
+if (IS_WINDOWS) {
+  const windowsGpuUserData = app.getPath('userData')
+  const gpuStackCookieDecision = decideWindowsGpuStackCookieLaunch({
+    argv: process.argv,
+    marker: readGpuStackCookieMarker(windowsGpuUserData),
+    env: process.env,
+    appVersion: app.getVersion()
+  })
+
+  windowsGpuStackCookieFallbackActive = gpuStackCookieDecision.enable
+  windowsGpuStackCookieFallbackSticky = gpuStackCookieDecision.nextMarker.state === 'fallback'
+
+  try {
+    writeGpuStackCookieMarker(windowsGpuUserData, gpuStackCookieDecision.nextMarker)
+  } catch {
+    void 0
+  }
+
+  if (gpuStackCookieDecision.enable && !REMOTE_DISPLAY_REASON) {
+    app.disableHardwareAcceleration()
+    app.commandLine.appendSwitch('disable-gpu-compositing')
+    console.log(
+      `[hermes] Windows GPU stack-cookie fallback enabled (${gpuStackCookieDecision.reason}); disabling GPU hardware acceleration (0xC0000409 / #108047)`
+    )
+  }
 }
 
 // Renderer debugging port. On for dev-server runs (`hgui` / `npm run dev`) so
@@ -866,6 +919,7 @@ const HERMES_HOME: string = resolveDesktopHermesHome({
 // install.ps1 / install.sh use, so a desktop-only user and a CLI-only user end
 // up with identical layouts and can share one install.
 const ACTIVE_HERMES_ROOT = path.join(HERMES_HOME, 'hermes-agent')
+setNoConsoleGitRoots([!IS_PACKAGED ? SOURCE_REPO_ROOT : null, ACTIVE_HERMES_ROOT])
 // VENV_ROOT — venv lives inside the repo, exactly like install.ps1 does it.
 const VENV_ROOT = path.join(ACTIVE_HERMES_ROOT, 'venv')
 // BOOTSTRAP_COMPLETE_MARKER — written by the first-launch bootstrap runner
@@ -3102,14 +3156,25 @@ function resolveUpdateRoot() {
 function runGit(args, options: any = {}): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const gitBinary = resolveGitBinary()
+    const gitArgs = IS_WINDOWS ? ['-c', 'windows.appendAtomically=false', ...args] : args
+    const host = IS_WINDOWS ? windowsGitHost(true) : null
+
+    const plan = planNoConsoleGitSpawn({
+      gitBin: gitBinary,
+      args: gitArgs,
+      isWindows: IS_WINDOWS,
+      pythonBin: host?.pythonBin ?? null,
+      scriptPath: host?.scriptPath ?? null,
+      env: { ...process.env, ...((options.env || {}) as any), GIT_TERMINAL_PROMPT: '0' }
+    })
 
     const child = spawn(
-      gitBinary,
-      IS_WINDOWS ? ['-c', 'windows.appendAtomically=false', ...args] : args,
+      plan.command,
+      plan.args,
       hiddenWindowsChildOptions({
         cwd: options.cwd,
-        env: { ...process.env, ...((options.env || {}) as any), GIT_TERMINAL_PROMPT: '0' },
-        stdio: ['ignore', 'pipe', 'pipe']
+        env: plan.env,
+        stdio: plan.stdio
       })
     )
 
@@ -3590,7 +3655,14 @@ function killHermesOwnedVenvDaemons(updateRoot) {
 
     if (Number.isInteger(pid) && pid > 0) {
       rememberLog(`[updates] stopping Hermes-owned venv daemon (hindsight) PID ${pid} before hand-off`)
-      forceKillProcessTree(pid)
+
+      try {
+        forceKillProcessTree(pid)
+      } catch (error) {
+        // Update hand-off only. Close/stop must not swallow this; see
+        // windowsCloseStopOwnedBackends.
+        rememberLog(`[updates] taskkill PID ${pid} failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
     }
   }
 }
@@ -3599,9 +3671,11 @@ function killHermesOwnedVenvDaemons(updateRoot) {
 // only signals the direct child, so on Windows a backend `hermes.exe` that
 // spawned its own grandchildren (a `hermes` REPL, a pty terminal session, the
 // gateway) would survive and keep the venv shim locked. taskkill /T /F reaps
-// the whole tree synchronously. Windows-only: this is called solely from the
-// Windows shim-unlock path, and the backend is NOT spawned detached (so it's
-// not a process-group leader — a POSIX negative-pgid kill would be meaningless
+// the whole tree synchronously. The command is not widened: one owned PID,
+// /T /F, nothing else. Failures propagate — close/stop must not discard them.
+// Windows-only: this is called solely from the Windows shim-unlock and
+// close/stop paths, and the backend is NOT spawned detached (so it's not a
+// process-group leader — a POSIX negative-pgid kill would be meaningless
 // here anyway). POSIX teardown stays with the existing before-quit SIGTERM.
 function forceKillProcessTree(pid) {
   if (!IS_WINDOWS) {
@@ -3612,11 +3686,118 @@ function forceKillProcessTree(pid) {
     return
   }
 
+  execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], hiddenWindowsChildOptions({ stdio: 'ignore' }))
+}
+
+function holderPidsFromLockFile(lockPath: string): Pick<RuntimeLock, 'holderPids' | 'held'> {
   try {
-    execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], hiddenWindowsChildOptions({ stdio: 'ignore' }))
+    const raw = fs.readFileSync(lockPath, 'utf8').trim()
+
+    if (!raw) {
+      return { holderPids: [] }
+    }
+
+    let pid = Number(raw)
+
+    if (!Number.isInteger(pid)) {
+      const parsed = JSON.parse(raw) as { pid?: unknown }
+      pid = Number(typeof parsed === 'object' && parsed ? parsed.pid : parsed)
+    }
+
+    return Number.isInteger(pid) && pid > 0 ? { holderPids: [pid] } : { holderPids: [] }
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code
+
+    // Can't read the file: a live holder may be why. Do not clear it.
+    if (code === 'EBUSY' || code === 'EPERM' || code === 'EACCES') {
+      return { holderPids: [], held: true }
+    }
+
+    return { holderPids: [] }
+  }
+}
+
+function collectCloseStopLocks(): RuntimeLock[] {
+  const roots = [HERMES_HOME]
+  const profilesRoot = path.join(HERMES_HOME, 'profiles')
+
+  try {
+    for (const name of fs.readdirSync(profilesRoot)) {
+      roots.push(path.join(profilesRoot, name))
+    }
   } catch {
-    // Already gone, or no permission — best effort; the unlock wait below is
-    // the real gate.
+    // No profiles directory — the default home lock is enough.
+  }
+
+  const locks: RuntimeLock[] = []
+
+  for (const root of roots) {
+    const lockPath = path.join(root, 'gateway.lock')
+
+    try {
+      if (!fs.statSync(lockPath).isFile()) {
+        continue
+      }
+    } catch {
+      continue
+    }
+
+    locks.push({ path: lockPath, ...holderPidsFromLockFile(lockPath) })
+  }
+
+  return locks
+}
+
+// Captured before teardown drops the handles. Node keeps each process handle
+// open until exit is observed, so a PID read from a still-running child here
+// cannot have been reused by an unrelated process.
+function collectOwnedBackendChildren(): ChildProcess[] {
+  const children = [backendConnectionState.getProcess(), ...[...backendPool.values()].map(entry => entry?.process)]
+
+  return children.filter(
+    (child): child is ChildProcess => Boolean(child) && Number.isInteger(child.pid) && child.pid > 0
+  )
+}
+
+// Close/stop, after the graceful teardown, pool stop and straggler reap: the
+// same tree-kill for any owned child that is still running, an inventory of
+// those PIDs, and a clear of only the locks no live holder owns. Never throws;
+// returns the failure for the caller to surface once cleanup is done.
+function windowsCloseStopOwnedBackends(children: ChildProcess[]): Error | null {
+  if (!IS_WINDOWS) {
+    return null
+  }
+
+  try {
+    const running = children.filter(child => child.exitCode === null && child.signalCode === null)
+
+    const result = finishWindowsCloseStop(
+      running.map(child => child.pid as number),
+      collectCloseStopLocks(),
+      {
+        killTree: forceKillProcessTree,
+        isPidAlive: isPidAliveWindows,
+        clearLock: lockPath => {
+          fs.rmSync(lockPath, { force: true })
+        }
+      }
+    )
+
+    for (const failure of result.taskkillFailures) {
+      rememberLog(`[close-stop] taskkill PID ${failure.pid} failed: ${failure.error}`)
+    }
+
+    for (const failure of result.lockErrors) {
+      rememberLog(`[close-stop] could not clear unheld lock ${failure.path}: ${failure.error}`)
+    }
+
+    if (result.clearedLocks.length) {
+      rememberLog(`[close-stop] cleared unheld lock(s): ${result.clearedLocks.join(', ')}`)
+    }
+
+    return result.liveFailure ? new Error(closeStopFailureMessage(result)) : null
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error))
   }
 }
 
@@ -3726,7 +3907,18 @@ async function stopOwnedBackend(identity) {
   }
 
   if (IS_WINDOWS) {
-    forceKillProcessTree(identity.pid)
+    try {
+      forceKillProcessTree(identity.pid)
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      const stillThere = await processIdentityMatches(identity, REAP_PROBE_TIMEOUT_MS)
+
+      if (stillThere !== false) {
+        throw new Error(`taskkill failed for backend PID ${identity.pid}: ${detail}`)
+      }
+
+      rememberLog(`taskkill reported failure for already-gone backend PID ${identity.pid}: ${detail}`)
+    }
   } else {
     try {
       process.kill(-identity.pid, 'SIGTERM')
@@ -3971,7 +4163,13 @@ async function releaseBackendLock(updateRoot: string, tag: string): Promise<{ un
 
         return stragglers
       },
-      killProcessTree: forceKillProcessTree,
+      killProcessTree: pid => {
+        try {
+          forceKillProcessTree(pid)
+        } catch (error) {
+          rememberLog(`[${tag}] taskkill PID ${pid} failed: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      },
       sleep: (ms: number) => new Promise(r => setTimeout(r, ms)),
       now: () => Date.now(),
       log: rememberLog
@@ -9885,7 +10083,7 @@ function persistSshConnectionToken(profile, source, token, registryConnectionId 
 //   3. global remote (connection.json `mode: 'remote'`)
 // A null/empty profile resolves the env/global remote, so legacy callers and
 // the connection test (which pass no profile) are unchanged.
-async function resolveRemoteBackend(profile, options: { poolKey?: string; primary?: boolean } = {}) {
+async function resolveRemoteBackend(profile, options: { forceRegistryPrimary?: boolean; poolKey?: string; primary?: boolean } = {}) {
   const profileKey = String(profile || '').trim() || 'default'
 
   const managedPrimary = options.primary
@@ -9937,16 +10135,19 @@ async function resolveRemoteBackend(profile, options: { poolKey?: string; primar
   }
 
   const config = readDesktopConnectionConfig()
+  const registry = readDesktopConnectionsRegistry()
 
-  const route = resolveDesktopRemoteRoute({
-    config,
-    env: {
-      token: process.env.HERMES_DESKTOP_REMOTE_TOKEN,
-      url: process.env.HERMES_DESKTOP_REMOTE_URL
-    },
-    profile,
-    registry: readDesktopConnectionsRegistry()
-  })
+  const route = options.forceRegistryPrimary
+    ? registryPrimaryBootRoute(registry)
+    : resolveDesktopRemoteRoute({
+        config,
+        env: {
+          token: process.env.HERMES_DESKTOP_REMOTE_TOKEN,
+          url: process.env.HERMES_DESKTOP_REMOTE_URL
+        },
+        profile,
+        registry
+      })
 
   if (!route) {
     return null
@@ -11959,6 +12160,7 @@ function reapInstallRootedStragglers(excludePids: number[]): void {
 }
 
 const backendShutdown = createBackendShutdownCoordinator(async (): Promise<void> => {
+  const ownedChildren = IS_WINDOWS ? collectOwnedBackendChildren() : []
   const localShutdown = localBackendLifecycle.shutdown()
   const primary = backendConnectionState.getProcess()
   const primaryStop = teardownPrimaryBackendAndWait()
@@ -11972,6 +12174,15 @@ const backendShutdown = createBackendShutdownCoordinator(async (): Promise<void>
   await waitForTeardown([localShutdown, primaryStop, pooledStops], 7_000)
 
   reapInstallRootedStragglers(Number.isInteger(primary?.pid) ? [primary.pid] : [])
+
+  // Verify last, so a surviving child cannot skip the teardown above.
+  const closeStopFailure = windowsCloseStopOwnedBackends(ownedChildren)
+
+  if (closeStopFailure) {
+    rememberLog(`[close-stop] ${closeStopFailure.message}`)
+
+    throw closeStopFailure
+  }
 })
 
 const quitTeardown = createQuitTeardownCoordinator(() => app.quit())
@@ -11997,7 +12208,12 @@ async function teardownSshForQuit(): Promise<void> {
 }
 
 async function exitAfterBackendShutdown(code) {
-  await backendShutdown.run()
+  try {
+    await backendShutdown.run()
+  } catch {
+    // Already logged by backendShutdown; the exit must still happen.
+  }
+
   app.exit(code)
 }
 
@@ -12203,12 +12419,15 @@ function releaseHostSpawnReservation() {
   hostSpawnReservation = null
 }
 
-function startHermes({ supervisorRecovery = false }: { supervisorRecovery?: boolean } = {}): Promise<Awaited<ReturnType<typeof backendConnectionState.getPromise>>> {
+function startHermes({ supervisorRecovery = false }: { supervisorRecovery?: boolean } = {}): Promise<
+  Awaited<ReturnType<typeof backendConnectionState.getPromise>>
+> {
   primaryRecoverySuppressed = false
   primaryStartsInFlight += 1
 
-  const start: Promise<Awaited<ReturnType<typeof backendConnectionState.getPromise>>> =
-    localBackendLifecycle.start(() => runHermesStart({ supervisorRecovery }))
+  const start: Promise<Awaited<ReturnType<typeof backendConnectionState.getPromise>>> = localBackendLifecycle.start(
+    () => runHermesStart({ supervisorRecovery })
+  )
 
   const releaseStart = (): void => {
     primaryStartsInFlight -= 1
@@ -12324,7 +12543,9 @@ function latchedBootFailure(): Error | null {
   return bootstrapFailure ?? backendStartFailure ?? remoteReauthFailure ?? null
 }
 
-async function runHermesStart({ supervisorRecovery = false }: { supervisorRecovery?: boolean } = {}): Promise<Awaited<ReturnType<typeof backendConnectionState.getPromise>>> {
+async function runHermesStart({ supervisorRecovery = false }: { supervisorRecovery?: boolean } = {}): Promise<
+  Awaited<ReturnType<typeof backendConnectionState.getPromise>>
+> {
   // Only the single-instance lock holder may reap/spawn/claim the desktop
   // backend. A lock-losing instance must stay inert even if some path reaches
   // here (e.g. the deferred-quit window before `ready`): its reapOrphans()
@@ -12481,6 +12702,16 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
         attemptedRemote = managedPrimaryRestoreOwners.size > 0 || primaryBackendIsRemote()
 
         return resolveRemoteBackend(primaryProfile, { primary: true })
+      },
+      selectRegistryPrimary: async () => {
+        // The pre-update resolve can miss a registry primary (stale cache, v1
+        // mode=local winning the first read). Re-read after the update gate
+        // and select launchMode=primary before any local attach or spawn.
+        connectionRegistryCache = null
+        connectionRegistryCacheMtime = null
+        attemptedRemote = true
+
+        return resolveRemoteBackend(primaryProfile, { primary: true, forceRegistryPrimary: true })
       },
       waitForDecision: waitForFirstRunSetupChoice,
       // Mutual exclusion with an in-app update (#50238). Remote connections
@@ -12821,6 +13052,7 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
 
     const message = error instanceof Error ? error.message : String(error)
     const hostKeyChanged = isHostKeyChangedBootFailure(error)
+    const sshAuthFailed = isSshAuthFailedBootFailure(error)
 
     // Carry structured Cloud-down metadata through the boot-progress / IPC
     // boundary when present, so the renderer overlay can key on it rather than
@@ -12854,6 +13086,14 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
       backendStartFailure = error instanceof Error ? error : new Error(message)
     }
 
+    // Rejected SSH credentials are just as terminal (#72698): BatchMode ssh
+    // keeps failing until the user loads the key or edits the connection, and
+    // an unlatched failure lets every api call re-drive boot and hide the
+    // overlay out from under its Gateway settings button.
+    if (shouldLatchSshAuthFailure({ attemptedRemote, isReauth: false, isSshAuthFailed: sshAuthFailed })) {
+      backendStartFailure = error instanceof Error ? error : new Error(message)
+    }
+
     // A confirmed reauth rejection latches separately: it can't self-heal, and
     // leaving it unlatched hides the overlay's "Sign in" button on every retry.
     if (shouldLatchRemoteReauthFailure({ attemptedRemote, isReauth: isReauthRequiredError(error) })) {
@@ -12869,13 +13109,14 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
         // Renderer contract for the self-heal loop (#82679): a transient
         // REMOTE failure (dropped SSH/HTTP registered connection, mint
         // timeout) is retryable — the renderer re-attempts the boot with
-        // bounded backoff. Local failures, confirmed reauth rejections, and
-        // host-key changes are not: those end in the recovery overlay /
-        // sign-in affordance.
+        // bounded backoff. Local failures, confirmed reauth rejections,
+        // host-key changes, and rejected SSH credentials are not: those end in
+        // the recovery overlay / sign-in affordance.
         retryable: isRetryableRemoteBootFailure({
           attemptedRemote,
           isReauth: isReauthRequiredError(error),
-          isHostKeyChanged: hostKeyChanged
+          isHostKeyChanged: hostKeyChanged,
+          isSshAuthFailed: sshAuthFailed
         }),
         running: false,
         statusCode: Number.isInteger(statusCode) ? statusCode : undefined
@@ -14154,7 +14395,14 @@ function spawnQuickEntryWindow() {
     // of the taskbar/alt-tab list; on macOS use an NSPanel so the frameless
     // capture window never becomes the app's cmd-tab anchor.
     skipTaskbar: !IS_MAC,
-    hasShadow: true,
+    // macOS derives a transparent window's native shadow from its alpha
+    // content, but the boot HTML paints an OPAQUE background before the
+    // renderer forces transparency (quick-entry-root.tsx) — the OS then
+    // caches a full-frame shadow that renders as a stray detached blur blob
+    // behind the card (#99172). The card draws its own CSS box-shadow, so the
+    // native one only double-paints; the other transparent overlays (pet,
+    // HUD) already run shadowless. Other platforms keep it.
+    hasShadow: !IS_MAC,
     alwaysOnTop: true,
     type: IS_MAC ? 'panel' : undefined,
     hiddenInMissionControl: IS_MAC,
@@ -14400,6 +14648,18 @@ function createWindow() {
         } catch (error) {
           rememberLog(`[sandbox] marker update after main-window reveal failed: ${error?.message || error}`)
         }
+
+        try {
+          writeGpuStackCookieMarker(
+            app.getPath('userData'),
+            markerAfterSuccessfulGpuStackCookieBoot({
+              fallbackActive: windowsGpuStackCookieFallbackSticky,
+              appVersion: app.getVersion()
+            })
+          )
+        } catch (error) {
+          rememberLog(`[gpu] stack-cookie marker update after main-window reveal failed: ${error?.message || error}`)
+        }
       }
     }
   })
@@ -14449,6 +14709,64 @@ function createWindow() {
         mainWindow.webContents.reload()
       },
       onCrashLoopSuppressed: details => {
+        // #108047: STATUS_STACK_BUFFER_OVERRUN crash loops get a one-shot GPU
+        // disable relaunch. Checked BEFORE the sandbox path so 0xC0000409 never
+        // piggybacks --no-sandbox. If GPU fallback cannot run, surface the
+        // visible error page instead of leaving a blank window.
+        const stackCookieCrashLoop = {
+          reason: details?.reason,
+          exitCode: details?.exitCode,
+          alreadyGpuDisabled:
+            Boolean(REMOTE_DISPLAY_REASON) ||
+            windowsGpuStackCookieFallbackActive ||
+            alreadyHasDisableGpu(process.argv, process.env),
+          relaunchAttempted: windowsGpuStackCookieRelaunchAttempted,
+          gpuOverrideOff: isHermesDesktopGpuOverrideOff(process.env)
+        }
+
+        if (shouldRelaunchForRendererStackCookieCrashLoop(stackCookieCrashLoop)) {
+          windowsGpuStackCookieRelaunchAttempted = true
+          windowsGpuStackCookieFallbackActive = true
+          windowsGpuStackCookieFallbackSticky = true
+
+          try {
+            writeGpuStackCookieMarker(
+              app.getPath('userData'),
+              gpuStackCookieFallbackMarker('renderer-crash-loop', app.getVersion())
+            )
+          } catch {
+            void 0
+          }
+
+          rememberLog(
+            '[renderer] Windows stack-cookie crash loop (0xC0000409); relaunching once with GPU disabled (#108047)'
+          )
+
+          try {
+            app.relaunch({ args: buildDisableGpuRelaunchArgs(process.argv.slice(1)) })
+            void exitAfterBackendShutdown(0)
+          } catch (err) {
+            rememberLog(`[renderer] GPU-disable relaunch failed: ${err?.message || err}`)
+          }
+
+          return
+        }
+
+        if (shouldSurfaceErrorForRendererStackCookieCrashLoop(stackCookieCrashLoop)) {
+          rememberLog(
+            '[renderer] Windows stack-cookie crash loop (0xC0000409) with GPU fallback unavailable; surfacing error page (#108047)'
+          )
+          void loadRendererLoadErrorPage(mainWindow, {
+            errorCode: details?.exitCode,
+            errorDescription:
+              'The desktop renderer crashed repeatedly (Windows STATUS_STACK_BUFFER_OVERRUN / 0xC0000409). GPU fallback could not recover the window.',
+            repairHint: 'hermes desktop --force-build',
+            reloadUrl: DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString()
+          })
+
+          return
+        }
+
         // #38216 renderer flavor (same recovery as #56726, credit @Sahil-SS9):
         // a deterministic Windows renderer crash loop with the sandbox
         // breakpoint signature gets one --no-sandbox relaunch instead of a
@@ -17960,6 +18278,16 @@ function registerDeepLinkProtocol() {
   }
 }
 
+// macOS: register the deep link before the lock. Launch Services relaunches
+// the app when the default protocol client changes; if the lock is already
+// held, that relaunch flashes a second Dock icon and then app.exit(0)s.
+// Win/Linux have no Dock and still register on ready.
+const preReadyDockSteps = preReadyDockLaunchSteps(process.platform)
+
+if (preReadyDockSteps.includes('register-deep-link')) {
+  registerDeepLinkProtocol()
+}
+
 // Single-instance lock: deep links on a running app (Win/Linux) arrive as a
 // second-instance argv. Without the lock a second `hermes://` launch spawns a
 // whole new app instead of routing into the running one.
@@ -18048,7 +18376,11 @@ app.whenReady().then(() => {
   registerMediaProtocol()
   installEmbedReferer()
   installRemoteHeaderRules()
-  registerDeepLinkProtocol()
+
+  if (!preReadyDockSteps.includes('register-deep-link')) {
+    registerDeepLinkProtocol()
+  }
+
   installPreviewGuestPreload()
 
   ensureWslWindowsFonts()
