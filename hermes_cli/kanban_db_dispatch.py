@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -2698,7 +2699,7 @@ def _previous_resumable_worker_attempt(
         with contextlib.closing(_kbc.connect(board=board)) as conn:
             row = conn.execute(
                 """
-                SELECT started_at, ended_at, outcome
+                SELECT started_at, ended_at, outcome, metadata
                 FROM task_runs
                 WHERE task_id = ?
                   AND id != ?
@@ -2709,6 +2710,12 @@ def _previous_resumable_worker_attempt(
                 (task.id, int(task.current_run_id)),
             ).fetchone()
         if not row or row["outcome"] not in _RESUMABLE_WORKER_OUTCOMES:
+            return None
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metadata = {}
+        if isinstance(metadata, dict) and metadata.get("protocol_violation") is True:
             return None
         return int(row["started_at"]), int(row["ended_at"]), str(row["outcome"])
     except Exception as exc:
