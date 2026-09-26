@@ -201,3 +201,45 @@ def test_copilot_prompt_still_carries_the_contract_and_the_tools():
     assert '"name": "memory"' in prompt
     assert '"name": "read_file"' in prompt  # copilot forwards everything
     assert "hi" in prompt
+
+
+def test_copilot_prompt_preserves_tool_call_result_pairing():
+    """A continuation prompt must preserve who requested a tool result.
+
+    ACP receives the OpenAI conversation flattened into text. Dropping the
+    assistant tool-call row leaves an orphan Tool row and makes stateless ACP
+    agents repeat the same tool indefinitely.
+    """
+    from agent.copilot_acp_client import _format_messages_as_prompt
+
+    prompt = _format_messages_as_prompt(
+        [
+            {"role": "user", "content": "work kanban task t_root"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_show_1",
+                        "type": "function",
+                        "function": {"name": "kanban_show", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_show_1",
+                "content": '{"task":{"id":"t_root","status":"running"}}',
+            },
+        ],
+        tools=_TOOLS,
+    )
+
+    assistant = prompt.index("Assistant:")
+    tool = prompt.index("Tool:", assistant)
+    assert assistant < tool
+    assert '"id": "call_show_1"' in prompt[assistant:tool]
+    assert '"name": "kanban_show"' in prompt[assistant:tool]
+    assert '"arguments": "{}"' in prompt[assistant:tool]
+    assert '"tool_call_id": "call_show_1"' in prompt[tool:]
+    assert '"status": "running"' in prompt[tool:]
