@@ -1320,8 +1320,12 @@ def create_task(
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
-    # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
-    # race may insert twice, the next lookup stabilises on the newest.
+    # Idempotency fast path BEFORE the write txn (no lock held). It is an
+    # optimisation only: the authority-side re-check under BEGIN IMMEDIATE
+    # below is what makes same-key creation atomic across concurrent processes.
+    # H4V3 compatibility seam (hermes-github-kanban #6; upstream owner
+    # NousResearch/hermes-agent#107718 K14): deletable once upstream moves the
+    # check into the write txn.
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
@@ -1347,6 +1351,23 @@ def create_task(
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
+                # H4V3 compatibility seam (hermes-github-kanban #6; upstream
+                # owner NousResearch/hermes-agent#107718 K14): authority-side
+                # idempotency re-check INSIDE BEGIN IMMEDIATE. Two processes
+                # that both missed the fast path above serialise on the write
+                # lock, so the loser re-reads the winner's committed row and
+                # returns it instead of inserting a duplicate. No new state
+                # store, no plugin-owned lock: the existing write transaction
+                # IS the CAS boundary. Deleting this block restores upstream's
+                # check-then-insert behaviour.
+                if idempotency_key:
+                    existing = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
+                    ).fetchone()
+                    if existing:
+                        return existing["id"]
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
@@ -3363,8 +3384,9 @@ def redact_review_value(value: Any) -> Any:
 
 def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
-    metadata: Optional[dict] = None, reviewer: Optional[str] = None,
+    metadata: Optional[dict[str, Any]] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
+    park: bool = False, expected_status: Optional[str] = None,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
 
@@ -3373,6 +3395,19 @@ def request_review(
     re-review defaults to the latest ``changes_requested`` provenance. A live
     claim is only cleared with proof of ownership (``expected_run_id``) or
     ``force=True``. Returns ``bool``, or ``(ok, reason)`` with ``with_reason``.
+
+    ``park=True`` is the H4V3 compatibility seam for hermes-github-kanban #6
+    (upstream owner NousResearch/hermes-agent#107718): an atomic
+    parked-review handoff that lands the card in ``review`` with the live
+    claim cleared AND the assignee nulled, so no reviewer/assignee is
+    spawnable by the dispatcher's review lane until a trusted rework
+    (:func:`reopen_review_task`) or an explicit operator assignment.
+    Implementer provenance still rides the ``review_requested`` event;
+    ``reviewer`` must not be named together with ``park``. Parked handoffs
+    must provide ``expected_status`` (``ready`` or ``running``); running
+    handoffs additionally require ``expected_run_id``. Those preconditions
+    are included in the same UPDATE CAS that clears the claim and assignee.
+    Deletable once upstream ships an equivalent parked-review primitive.
 
     ``metadata["artifacts"]`` names the handoff's deliverable
     files; a review handoff is the last implementer transition, and the
@@ -3387,6 +3422,17 @@ def request_review(
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
+    if park and reviewer is not None:
+        return _ret(False, "parked review cannot name a reviewer profile")
+    if park:
+        if expected_status not in {"ready", "running"}:
+            return _ret(False, "parked review requires expected_status='ready' or 'running'")
+        if expected_status == "running" and expected_run_id is None:
+            return _ret(False, "parking a running task requires expected_run_id")
+        if expected_status == "ready" and expected_run_id is not None:
+            return _ret(False, "parking a ready task must not include expected_run_id")
+    elif expected_status is not None:
+        return _ret(False, "expected_status is supported only for parked review")
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
     # Declared (metadata["artifacts"]) and prose-referenced files
@@ -3416,14 +3462,20 @@ def request_review(
                     "(worker ownership) or force=True (explicit operator "
                     "override) instead of clearing the live run's claim",
                 )
-            if reviewer is None:
-                reviewer = _prior_reviewer(conn, task_id)
-                if reviewer is False:
+            # Parked review deliberately does NOT adopt prior-reviewer
+            # provenance as an assignee: naming any profile here would make
+            # the row spawnable by the review lane, which is exactly what the
+            # H4V3 #6 parked review state forbids. The dispatcher skips unassigned
+            # review rows (kanban_db_dispatch review lane -> skipped_unassigned).
+            if reviewer is None and not park:
+                prior_reviewer = _prior_reviewer(conn, task_id)
+                if prior_reviewer is False:
                     return _ret(
                         False, "re-review has no durable reviewer provenance (the "
                         "latest changes_requested event is missing or "
                         "malformed); pass reviewer= explicitly",
                     )
+                reviewer = prior_reviewer
             reviewer = _canonical_assignee(reviewer)
             # The actor is the run that did the work. ``assignee`` is the actor
             # only while a worker holds the card; on a never-claimed card it is
@@ -3442,12 +3494,30 @@ def request_review(
                 implementer = arow["profile"] if arow else None
             if implementer is None and trow["assignee"] != reviewer:
                 implementer = trow["assignee"]
-            assignee_sql = ", assignee = ?" if reviewer is not None else ""
+            # H4V3 #6 parked review: clear the assignee in the SAME CAS UPDATE
+            # as the status flip (claim fields are already cleared there), so
+            # the parked row is never observable as "review with a spawnable
+            # assignee". Legacy callers (reviewer named) keep the reassign
+            # semantics exactly as before.
             run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
-            params: tuple[Any, ...] = (
-                *(() if reviewer is None else (reviewer,)), task_id,
-                *(() if expected_run_id is None else (int(expected_run_id),)),
+            status_guard = (
+                " AND status = ?" if expected_status is not None
+                else " AND status IN ('running', 'ready')"
             )
+            if park:
+                assignee_sql = ", assignee = NULL"
+                params: tuple[Any, ...] = (
+                    task_id,
+                    *((expected_status,) if expected_status is not None else ()),
+                    *(() if expected_run_id is None else (int(expected_run_id),)),
+                )
+            else:
+                assignee_sql = ", assignee = ?" if reviewer is not None else ""
+                params = (
+                    *(() if reviewer is None else (reviewer,)), task_id,
+                    *((expected_status,) if expected_status is not None else ()),
+                    *(() if expected_run_id is None else (int(expected_run_id),)),
+                )
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -3457,8 +3527,7 @@ def request_review(
                        worker_pid    = NULL
                 """ + assignee_sql + """
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """ + run_guard,
+                """ + status_guard + run_guard,
                 params,
             )
             if cur.rowcount != 1:
@@ -3474,11 +3543,16 @@ def request_review(
                 summary=summary, metadata=metadata, synthesize=bool(summary or metadata),
                 profile=implementer,
             )
-            payload: dict = {
+            payload: dict[str, Any] = {
                 "summary": _first_line(summary, 400) or None,
                 "implementer": implementer,
                 "reviewer": reviewer,
             }
+            if park:
+                # Durable marker so a fresh public read-back (kanban_show /
+                # CLI) can distinguish an H4V3 #6 parked review from a legacy
+                # reviewer-assigned review; reopen restores the implementer.
+                payload["parked"] = True
             staged = _cleaned_artifact_paths(metadata)
             if staged:
                 payload["artifacts"] = staged
@@ -3703,11 +3777,20 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
-def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def reopen_review_task(
+    conn: sqlite3.Connection, task_id: str, *,
+    reason: Optional[str] = None, author: Optional[str] = None,
+) -> bool:
     """``review`` -> ``ready``/``todo`` so the implementer re-runs on the new
     comments; restores the implementer from the ``review_requested`` event.
     Preserves ``consecutive_failures`` and the block loop counter (review is
-    not a block; only :func:`complete_task` clears them)."""
+    not a block; only :func:`complete_task` clears them). When a rework reason
+    is supplied, its CHANGES REQUESTED comment commits with the reopen so a
+    dispatcher cannot start the implementer before the handoff is visible."""
+    reason = str(redact_review_value(reason or "")).strip()
+    author = str(redact_review_value(author or "")).strip()
+    if reason and not author:
+        return False
     now = int(time.time())
     with write_txn(conn):
         _reclaim_dangling_run(
@@ -3736,6 +3819,8 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         _append_event(
             conn, task_id, "review_reopened", payload if payload != {"status": "ready"} else None,
         )
+        if reason:
+            add_comment(conn, task_id, author, f"CHANGES REQUESTED: {reason}")
         return True
 
 

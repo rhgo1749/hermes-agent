@@ -23,7 +23,8 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
-    KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
+    KANBAN_LIST_SCHEMA, KANBAN_PARK_REVIEW_SCHEMA, KANBAN_REOPEN_REVIEW_SCHEMA,
+    KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
 
 logger = logging.getLogger(__name__)
@@ -841,6 +842,38 @@ def _handle_request_review(args: dict, **kw) -> str:
         return _ok_landed(kb, conn, tid, "review")
 
 
+@_kanban_handler("kanban_park_review")
+def _handle_park_review(args: dict[str, Any], **kw) -> str:
+    """Park unresolved external work without assigning a runnable reviewer."""
+    _reject_delegated_child_mutation("kanban_park_review")
+    _require_orchestrator_tool("kanban_park_review")
+    tid = args.get("task_id")
+    _check(tid, "task_id is required")
+    tid = str(tid)
+    _enforce_worker_task_ownership(tid)
+    summary = _redact(_require_text(args, "summary", "summary is required"))
+    expected_status = args.get("expected_status")
+    _check(expected_status in {"ready", "running"},
+           "parked review requires expected_status='ready' or 'running'")
+    expected_run_id = _opt_int(args.get("expected_run_id"))
+    _check(
+        (expected_status == "running" and expected_run_id is not None)
+        or (expected_status == "ready" and expected_run_id is None),
+        "expected_run_id is required only when expected_status='running'",
+    )
+    with _board(args.get("board")) as (kb, conn):
+        try:
+            ok, fail_reason = kb.request_review(
+                conn, tid, summary=summary, expected_run_id=expected_run_id,
+                with_reason=True, park=True, expected_status=expected_status)
+        except kb.ArtifactPreservationError as artifact_err:
+            return tool_error(
+                f"kanban_park_review could not preserve the declared artifacts: {artifact_err}. "
+                "The task is unchanged; fix the artifact path or storage error and retry.")
+        _check(ok, f"could not park {tid} for review: {fail_reason or 'task state changed'}")
+        return _ok_landed(kb, conn, tid, "review")
+
+
 @_kanban_handler("kanban_request_changes")
 def _handle_request_changes(args: dict, **kw) -> str:
     """Return a reviewer-owned running task to its implementer."""
@@ -1161,6 +1194,33 @@ def _handle_unblock(args: dict, **kw) -> str:
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
 
 
+# H4V3 compatibility seam (hermes-github-kanban #6): public, guarded exposure
+# of the existing core reopen_review_task primitive — orchestrator-routed like
+# kanban_unblock, so a trusted reconciler plugin drives parked-review rework
+# through the public tool surface (no private DB import, no CLI shell-out).
+# Reuses the existing FSM; deletable when upstream ships a public reopen.
+@_kanban_handler("kanban_reopen_review")
+def _handle_reopen_review(args: dict[str, Any], **kw) -> str:
+    """Reopen a review-parked task to ready/todo for trusted rework."""
+    _reject_delegated_child_mutation("kanban_reopen_review")
+    _require_orchestrator_tool("kanban_reopen_review")
+    tid = args.get("task_id")
+    _check(tid, "task_id is required")
+    tid = str(tid)
+    _enforce_worker_task_ownership(tid)
+    reason = args.get("reason")
+    reason = str(_redact(reason).strip()) if reason else None
+    author = _persisted_identity() if reason else None
+    with _board(args.get("board")) as (kb, conn):
+        # Guarded reopen: the core CAS refuses anything not in 'review',
+        # failing closed on stale/duplicate rework wakes. The reason comment
+        # commits inside the same authority transaction as the ready/todo flip
+        # so the next worker cannot start before its rework instructions land.
+        _check(kb.reopen_review_task(conn, tid, reason=reason, author=author),
+               f"could not reopen {tid} for rework (not in review?)")
+        return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status", "assignee")))
+
+
 @_kanban_handler("kanban_link")
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact (cycles/self-links/running
@@ -1180,8 +1240,11 @@ def _handle_link(args: dict, **kw) -> str:
 
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
-# kanban_list / kanban_unblock route the board and are hidden from task workers.
-_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})
+# Board-routing / external-reconciliation tools are hidden from task workers.
+# kanban_park_review and kanban_reopen_review are H4V3 #6 compat seams.
+_ORCHESTRATOR_TOOLS = frozenset({
+    "kanban_list", "kanban_unblock", "kanban_park_review", "kanban_reopen_review",
+})
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
@@ -1196,6 +1259,8 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
+    ("kanban_park_review", KANBAN_PARK_REVIEW_SCHEMA, _handle_park_review, "⏸"),
+    ("kanban_reopen_review", KANBAN_REOPEN_REVIEW_SCHEMA, _handle_reopen_review, "↪"),
     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
