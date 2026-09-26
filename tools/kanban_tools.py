@@ -24,6 +24,7 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_PARK_REVIEW_SCHEMA, KANBAN_REOPEN_REVIEW_SCHEMA,
+    KANBAN_COMPLETE_PARKED_REVIEW_SCHEMA,
     KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
 
@@ -1239,6 +1240,45 @@ def _handle_reopen_review(args: dict[str, Any], **kw) -> str:
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status", "assignee")))
 
 
+# H4V3 compatibility seam (hermes-github-kanban #6): public, guarded exposure
+# of parked-review completion. The authority re-proves parked review INSIDE
+# the completion transaction (status + parked provenance + no assignee + no
+# live run/claim) and CAS-guards the done transition on it, so a reviewer
+# assignment that lands after the reconciler's parked read cannot be silently
+# completed. Guard rejection is an explicit conflict error with NOTHING
+# changed — never a done transition, never a guessed mutation. Plain
+# kanban_complete semantics for ordinary human/worker flows are unchanged.
+# Deletable with the parked-review seam.
+@_kanban_handler("kanban_complete_parked_review")
+def _handle_complete_parked_review(args: dict[str, Any], **kw) -> str:
+    """Complete a task that still proves parked review at commit time."""
+    _reject_delegated_child_mutation("kanban_complete_parked_review")
+    _require_orchestrator_tool("kanban_complete_parked_review")
+    tid = args.get("task_id")
+    _check(tid, "task_id is required")
+    tid = str(tid)
+    _enforce_worker_task_ownership(tid)
+    summary = _redact(_require_text(args, "summary", "summary is required"))
+    with _board(args.get("board")) as (kb, conn):
+        try:
+            ok = kb.complete_task(conn, tid, summary=summary, require_parked=True)
+        except kb.ParkedReviewGuardError as guard_err:
+            # Structured conflict: the transaction rolled back, the task is
+            # unchanged (including any assignment that won the race).
+            return tool_error(
+                f"kanban_complete_parked_review refused: {guard_err}. Nothing changed.",
+                conflict="parked_review_guard",
+                reason=guard_err.reason,
+            )
+        except kb.LiveClaimError as claim_err:
+            return tool_error(
+                f"kanban_complete_parked_review refused: {claim_err}. Nothing changed.")
+        _check(ok, f"could not complete {tid} (parents unsatisfied or state changed)")
+        run = kb.latest_run(conn, tid)
+        return _ok(task_id=tid, run_id=run.id if run else None,
+                   status="done", completed=True)
+
+
 @_kanban_handler("kanban_link")
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact (cycles/self-links/running
@@ -1259,9 +1299,11 @@ def _handle_link(args: dict, **kw) -> str:
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # Board-routing / external-reconciliation tools are hidden from task workers.
-# kanban_park_review and kanban_reopen_review are H4V3 #6 compat seams.
+# kanban_park_review, kanban_reopen_review, and kanban_complete_parked_review
+# are H4V3 #6 compat seams.
 _ORCHESTRATOR_TOOLS = frozenset({
     "kanban_list", "kanban_unblock", "kanban_park_review", "kanban_reopen_review",
+    "kanban_complete_parked_review",
 })
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
@@ -1279,6 +1321,8 @@ _TOOLS = (
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
     ("kanban_park_review", KANBAN_PARK_REVIEW_SCHEMA, _handle_park_review, "⏸"),
     ("kanban_reopen_review", KANBAN_REOPEN_REVIEW_SCHEMA, _handle_reopen_review, "↪"),
+    ("kanban_complete_parked_review", KANBAN_COMPLETE_PARKED_REVIEW_SCHEMA,
+     _handle_complete_parked_review, "✔"),
     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:

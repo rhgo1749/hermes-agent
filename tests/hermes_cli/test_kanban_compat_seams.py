@@ -354,3 +354,118 @@ def test_reopen_fails_closed_on_stale_or_invalid_state(conn):
     assert _task(conn, done_root).status == "done"
 
     assert kb.reopen_review_task(conn, "t_missing00") is False
+
+
+# ---------------------------------------------------------------------------
+# Seam 4: authority-guarded parked-review completion
+# ---------------------------------------------------------------------------
+
+def _completed_events(conn, tid: str) -> list[str]:
+    return [
+        row["kind"] for row in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? AND kind = 'completed'", (tid,),
+        ).fetchall()
+    ]
+
+
+def test_guarded_completion_completes_a_still_parked_root(conn):
+    """The happy path stays exact: a proven parked root completes with the
+    ordinary completed event/run provenance."""
+    tid = _parked_root(conn)
+
+    assert kb.complete_task(conn, tid, summary="PR merged into main",
+                            require_parked=True) is True
+
+    task = _task(conn, tid)
+    assert task.status == "done"
+    assert task.completed_at is not None
+    assert _completed_events(conn, tid) == ["completed"]
+
+
+def test_guarded_completion_refuses_when_reviewer_assignment_lands_first(conn):
+    """The reproduced t_7320d885 interleaving, at the authority boundary.
+
+    ``assign_task`` accepts a same-status assignment of a parked review
+    (upstream semantics); the plain status-only pre-read cannot see it. The
+    in-transaction guard sees the assignee and refuses; the assignment
+    survives and NOTHING transitions to done."""
+    tid = _parked_root(conn)
+
+    # The interleaving: assignment commits after the reconciler's parked read.
+    assert kb.assign_task(conn, tid, "review-bot") is True
+    assert _task(conn, tid).status == "review"
+
+    with pytest.raises(kb.ParkedReviewGuardError, match="retains an assignee"):
+        kb.complete_task(conn, tid, summary="PR merged into main",
+                         require_parked=True)
+
+    task = _task(conn, tid)
+    assert task.status == "review"
+    assert task.assignee == "review-bot", "the winning assignment must survive"
+    assert task.completed_at is None
+    assert _completed_events(conn, tid) == []
+
+
+def test_guarded_completion_refuses_a_reviewer_claim_and_non_parked_states(conn):
+    """A claimed (running) card and a reviewer-assigned review are both
+    refused: completion never drops active ownership or guesses state."""
+    tid, _run_id = _running_claimed_task(conn)
+    with pytest.raises(kb.ParkedReviewGuardError, match="not parked review"):
+        kb.complete_task(conn, tid, summary="merged", require_parked=True)
+    assert _task(conn, tid).status == "running"
+
+    # A review that was never parked (legacy reviewer-assigned review) has no
+    # parked provenance and must not complete through the guarded operation.
+    legacy = kb.create_task(conn, title="legacy review root", assignee="builder")
+    assert kb.request_review(conn, legacy, summary="done", reviewer="review-bot") is True
+    with pytest.raises(kb.ParkedReviewGuardError, match="parked"):
+        kb.complete_task(conn, legacy, summary="merged", require_parked=True)
+    assert _task(conn, legacy).status == "review"
+
+
+def test_plain_complete_task_semantics_unchanged(conn):
+    """Preserved contract: require_parked defaults off — ordinary human review
+    approval and worker completion behave exactly as before (including
+    plain review approval that keeps the reviewer assignee)."""
+    tid = kb.create_task(conn, title="human approval", assignee="builder")
+    assert kb.request_review(conn, tid, summary="impl done", reviewer="review-bot") is True
+    assert kb.complete_task(conn, tid, result="approved") is True
+    task = _task(conn, tid)
+    assert task.status == "done"
+    assert task.assignee == "review-bot"
+
+    ready = kb.create_task(conn, title="manual cli completion", assignee="builder")
+    assert kb.complete_task(conn, ready, summary="manual") is True
+    assert _task(conn, ready).status == "done"
+
+
+def test_guarded_completion_interleaving_is_atomic_under_write_txn(conn, monkeypatch):
+    """The guard reads INSIDE the BEGIN IMMEDIATE transaction, not a snapshot
+    taken before it.
+
+    The assignment commits on a separate connection AFTER ``complete_task``
+    was entered but BEFORE its write transaction begins — the exact window a
+    caller-side pre-read leaves open. The in-transaction guard still refuses
+    and the winning assignment survives the rollback."""
+    tid = _parked_root(conn)
+    real_write_txn = kb.write_txn
+    injected: list[bool] = []
+
+    def racing_write_txn(c, **kwargs):
+        if not injected:
+            injected.append(True)
+            # Commits cleanly: no writer lock is held yet (this runs before
+            # BEGIN IMMEDIATE) — exactly the real interleaving window.
+            with kbc.connect() as other:
+                assert kb.assign_task(other, tid, "late-reviewer") is True
+        return real_write_txn(c, **kwargs)
+
+    monkeypatch.setattr(kb, "write_txn", racing_write_txn)
+    with pytest.raises(kb.ParkedReviewGuardError, match="retains an assignee"):
+        kb.complete_task(conn, tid, summary="PR merged", require_parked=True)
+    monkeypatch.setattr(kb, "write_txn", real_write_txn)
+
+    task = _task(conn, tid)
+    assert task.status == "review"
+    assert task.assignee == "late-reviewer"
+    assert _completed_events(conn, tid) == []

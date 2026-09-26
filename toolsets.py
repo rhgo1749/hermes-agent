@@ -36,6 +36,7 @@ _HERMES_CORE_TOOLS = [
     "kanban_unblock",
     "kanban_park_review",  # H4V3 compat seam (hermes-github-kanban #6)
     "kanban_reopen_review",  # H4V3 compat seam (hermes-github-kanban #6)
+    "kanban_complete_parked_review",  # H4V3 compat seam (hermes-github-kanban #6)
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
     "computer_use",
     # Service-gated connector account status and authorization links.

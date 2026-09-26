@@ -211,3 +211,93 @@ def test_new_tool_names_in_orchestrator_registry(board_env):
     assert review_schema is not None
     review_properties = review_schema["parameters"]["properties"]
     assert "park" not in review_properties
+
+
+# ---------------------------------------------------------------------------
+# Seam 4 (public surface): kanban_complete_parked_review
+# ---------------------------------------------------------------------------
+
+def _park(tid: str) -> None:
+    parked = _dispatch("kanban_park_review", {
+        "task_id": tid, "summary": "PR open; parking per issue #6",
+        "expected_status": "ready"})
+    assert parked.get("ok"), parked
+
+
+def test_public_guarded_completion_completes_a_still_parked_root(board_env):
+    tid = _make_ready_task("guarded completion root")
+    _park(tid)
+
+    completed = _dispatch("kanban_complete_parked_review", {
+        "task_id": tid, "summary": "PR merged into main"})
+    assert completed.get("ok"), completed
+    assert completed["status"] == "done"
+    assert completed["run_id"] is not None
+    assert _state(tid)["status"] == "done"
+
+
+def test_public_guarded_completion_refuses_late_reviewer_assignment(board_env):
+    """Public-dispatch form of the reproduced t_7320d885 interleaving: the
+    assignment lands after the reconciler's parked read; the guarded tool
+    returns an explicit structured conflict and NOTHING changes."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    tid = _make_ready_task("interleaved completion root")
+    _park(tid)
+    with kbc.connect_closing() as conn:
+        assert kb.assign_task(conn, tid, "review-bot") is True
+
+    refused = _dispatch("kanban_complete_parked_review", {
+        "task_id": tid, "summary": "PR merged into main"})
+    assert refused.get("error"), refused
+    assert refused["conflict"] == "parked_review_guard"
+    assert "retains an assignee" in refused["reason"]
+    state = _state(tid)
+    assert state["status"] == "review"
+    assert state["assignee"] == "review-bot", "the winning assignment must survive"
+
+
+def test_public_plain_complete_semantics_unchanged_for_human_review(board_env):
+    """Preserved contract: ordinary kanban_complete of a reviewer-assigned
+    review still works and completes (the guard is opt-in, not global)."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    tid = _make_ready_task("human approval root")
+    with kbc.connect_closing() as conn:
+        assert kb.request_review(conn, tid, summary="impl done", reviewer="review-bot") is True
+
+    completed = _dispatch("kanban_complete", {
+        "task_id": tid, "summary": "Review approved by maintainer"})
+    assert completed.get("ok"), completed
+    assert _state(tid)["status"] == "done"
+
+
+def test_public_guarded_completion_is_orchestrator_only(board_env, monkeypatch):
+    """Dispatcher workers and delegate children cannot drive the control-plane
+    guarded completion."""
+    from tools import kanban_tools as kt
+    tid = _make_ready_task("worker cannot guarded-complete")
+    _park(tid)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_other00000")
+    result = json.loads(kt._handle_complete_parked_review({
+        "task_id": tid, "summary": "merged"}))
+    assert result.get("error") and "orchestrator-only" in result["error"], result
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(board_env))
+    child = _dispatch("kanban_complete_parked_review", {
+        "task_id": tid, "summary": "merged"})
+    assert child.get("error") and "delegate_task child" in child["error"], child
+    assert _state(tid)["status"] == "review"
+
+
+def test_guarded_completion_tool_in_orchestrator_registry(board_env):
+    from tools import kanban_tools as kt
+    from tools.registry import registry
+    from toolsets import _HERMES_CORE_TOOLS
+    assert "kanban_complete_parked_review" in {n for n, _s, _h, _e in kt._TOOLS}
+    assert "kanban_complete_parked_review" in _HERMES_CORE_TOOLS
+    assert "kanban_complete_parked_review" in kt._ORCHESTRATOR_TOOLS
+    schema = registry.get_schema("kanban_complete_parked_review")
+    assert schema is not None
+    assert schema["parameters"]["required"] == ["task_id", "summary"]
