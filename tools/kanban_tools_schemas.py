@@ -519,6 +519,67 @@ KANBAN_UNBLOCK_SCHEMA = _schema(
     ["task_id"],
 )
 
+# H4V3 compatibility seam (hermes-github-kanban #6): public orchestrator
+# operation to atomically park unresolved external work in non-runnable review.
+# It is deliberately separate from worker-visible request_review so the
+# external reconciler's lifecycle authority is explicit and guarded.
+KANBAN_PARK_REVIEW_SCHEMA = _schema(
+    "kanban_park_review",
+    (
+        "Atomically park a task in the non-runnable 'review' phase while "
+        "external work is still unresolved (for example, an open or "
+        "closed-unmerged pull request). Clears the live claim and assignee "
+        "in the same authority-side update while preserving the "
+        "implementer's review provenance. Supply the exact fresh "
+        "expected_status; for a running task also supply its current "
+        "expected_run_id from kanban_show. Orchestrator-only; dispatcher "
+        "workers cannot use this control-plane operation."
+    ),
+    {
+        "task_id": _prop("string", "Task id to park in non-runnable review."),
+        "summary": _prop("string", "Short reason/evidence for parking the task."),
+        "expected_status": {
+            "type": "string",
+            "enum": ["ready", "running"],
+            "description": "Exact task status observed immediately before the mutation.",
+        },
+        "expected_run_id": {
+            "type": "integer",
+            "description": (
+                "Current run id from kanban_show. Required when "
+                "expected_status='running'; omit for 'ready'."
+            ),
+        },
+    },
+    ["task_id", "summary", "expected_status"],
+)
+
+# H4V3 compatibility seam (hermes-github-kanban #6): public, guarded exposure
+# of the existing core reopen_review_task primitive so a trusted orchestrator
+# plugin can drive parked-review rework through the public tool surface — no
+# private DB import, no CLI shell-out. Remove when upstream exposes an
+# equivalent public reopen.
+KANBAN_REOPEN_REVIEW_SCHEMA = _schema(
+    "kanban_reopen_review",
+    (
+        "Reopen a parked or review-pending Kanban task for trusted rework: "
+        "it moves back to ready (or parent-gated todo) with the implementer "
+        "restored from the review handoff, preserving the task, its root/PR "
+        "history, and the failure counters. An optional reason is recorded "
+        "as a CHANGES REQUESTED comment so the re-run worker sees it. "
+        "Orchestrator-only — dispatcher-spawned task workers never see this "
+        "tool. Fails closed when the task is not in 'review'."
+    ),
+    {
+        "task_id": _prop("string", "Task id currently in 'review' to reopen for rework."),
+        "reason": _prop("string", (
+            "Optional one- or two-sentence rework reason shown to the "
+            "re-run worker (recorded as a CHANGES REQUESTED comment)."
+        )),
+    },
+    ["task_id"],
+)
+
 KANBAN_LINK_SCHEMA = _schema(
     "kanban_link",
     (
