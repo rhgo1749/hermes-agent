@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -59,6 +60,42 @@ def test_resume_session_matches_exact_task_prompt(monkeypatch: pytest.MonkeyPatc
     assert kbd._resume_session_for_worker(
         _task(str(tmp_path)), str(profile), board=None,
     ) == "right"
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        ({"protocol_violation": True}, None),
+        ({}, (100, 110, "crashed")),
+    ],
+)
+def test_previous_protocol_violation_attempt_is_not_resumable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    metadata: dict[str, object],
+    expected: tuple[int, int, str] | None,
+) -> None:
+    class _Cursor:
+        def fetchone(self):
+            return {
+                "started_at": 100,
+                "ended_at": 110,
+                "outcome": "crashed",
+                "metadata": json.dumps(metadata),
+            }
+
+    class _Conn:
+        def execute(self, _sql, _params):
+            return _Cursor()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(kbd._kbc, "connect", lambda board=None: _Conn())
+
+    assert kbd._previous_resumable_worker_attempt(
+        _task(str(tmp_path)), board=None,
+    ) == expected
 
 
 def test_default_spawn_passes_resolved_resume_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
