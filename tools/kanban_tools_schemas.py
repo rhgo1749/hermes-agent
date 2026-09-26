@@ -580,6 +580,32 @@ KANBAN_REOPEN_REVIEW_SCHEMA = _schema(
     ["task_id"],
 )
 
+# H4V3 compatibility seam (hermes-github-kanban #6): authority-guarded
+# completion of a proven parked review. Deletable with the parked-review seam.
+KANBAN_COMPLETE_PARKED_REVIEW_SCHEMA = _schema(
+    "kanban_complete_parked_review",
+    (
+        "Complete a Kanban task whose card still proves parked review at "
+        "the moment of completion. The authority re-checks, inside the same "
+        "write transaction, that the task is in 'review' with parked-review "
+        "provenance, no assignee, and no live run/claim, and the done "
+        "transition is CAS-guarded on that state. If a reviewer assignment "
+        "or claim lands first, the completion is refused with an explicit "
+        "conflict error and NOTHING changes — the card is not completed and "
+        "the conflicting assignment is preserved. Ordinary human/worker "
+        "completion through kanban_complete is unaffected. Orchestrator-only "
+        "control-plane operation for trusted reconciler plugins."
+    ),
+    {
+        "task_id": _prop("string", "Task id currently proving parked review."),
+        "summary": _prop("string", (
+            "Non-empty completion evidence (e.g. fresh merge read) recorded "
+            "on the completed run and event."
+        )),
+    },
+    ["task_id", "summary"],
+)
+
 KANBAN_LINK_SCHEMA = _schema(
     "kanban_link",
     (
