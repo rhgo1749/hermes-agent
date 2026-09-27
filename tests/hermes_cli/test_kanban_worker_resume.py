@@ -62,6 +62,41 @@ def test_resume_session_matches_exact_task_prompt(monkeypatch: pytest.MonkeyPatc
     ) == "right"
 
 
+def test_resume_session_is_fresh_when_profile_soul_changed_after_session_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "investigator"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr(
+        kbd,
+        "_previous_resumable_worker_attempt",
+        lambda _task, _board: (100, 300, "blocked"),
+    )
+
+    db = SessionDB(db_path=profile / "state.db")
+    try:
+        db.create_session("stale", source="kanban")
+        db.append_message("stale", "user", "work kanban task t_resume123")
+        db.append_message("stale", "assistant", "old contract reasoning")
+        db.end_session("stale", "blocked")
+        with db._lock:
+            db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (200, "stale"))
+            db._conn.commit()
+    finally:
+        db.close()
+
+    soul = profile / "SOUL.md"
+    soul.write_text("new role contract\n", encoding="utf-8")
+    import os
+    os.utime(soul, (250, 250))
+
+    assert kbd._resume_session_for_worker(
+        _task(str(tmp_path)), str(profile), board=None,
+    ) is None
+
+
 @pytest.mark.parametrize(
     ("metadata", "expected"),
     [

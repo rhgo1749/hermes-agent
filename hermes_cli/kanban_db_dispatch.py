@@ -2763,6 +2763,24 @@ def _resume_session_for_worker(
                     <= prior_ended_at + 120
                 ):
                     continue
+
+                # A resumed worker keeps the system prompt minted when the root
+                # session started. If the profile SOUL changed afterwards, that
+                # conversation carries stale role/lifecycle instructions even
+                # though the task retry itself is otherwise resumable. Start a
+                # fresh session so the current profile contract is injected.
+                soul_path = Path(profile_home) / "SOUL.md"
+                try:
+                    soul_mtime = soul_path.stat().st_mtime
+                except OSError:
+                    soul_mtime = 0.0
+                if session_started_at and soul_mtime > session_started_at:
+                    _kb._log.info(
+                        "kanban worker: profile SOUL changed after session %s started for %s; starting fresh",
+                        root, task.id,
+                    )
+                    return None
+
                 messages = db.get_messages(root, include_inactive=True, limit=8)
                 first_user = next((m for m in messages if m.get("role") == "user"), None)
                 if not first_user or str(first_user.get("content") or "").strip() != expected_prompt:
