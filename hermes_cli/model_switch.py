@@ -449,6 +449,8 @@ class ModelSwitchResult:
     api_key: str = ""
     base_url: str = ""
     api_mode: str = ""
+    command: str = ""
+    args: list[str] = field(default_factory=list)
     request_overrides: Optional[dict] = None
     error_message: str = ""
     warning_message: str = ""
@@ -1186,6 +1188,8 @@ class _Switch:
     api_key: str = ""
     base_url: str = ""
     api_mode: str = ""
+    command: str = ""
+    args: list[str] = field(default_factory=list)
     validation_headers: dict = field(default_factory=dict)
     suppress_ollama_headers: bool = False
     validation: dict = field(default_factory=dict)
@@ -1208,6 +1212,8 @@ class _Switch:
         rt = resolve_runtime_provider(target_model=self.new_model, **kwargs)
         self.api_key, self.base_url = rt.get("api_key", ""), rt.get("base_url", "")
         self.api_mode = rt.get("api_mode", "")
+        self.command = str(rt.get("command") or "")
+        self.args = list(rt.get("args") or [])
         self.validation_headers = rt.get("extra_headers") or self.validation_headers
 
 
@@ -1730,7 +1736,8 @@ def _build_switch_result(st: _Switch) -> ModelSwitchResult:
     return ModelSwitchResult(
         success=True, new_model=st.new_model, target_provider=st.target_provider,
         provider_changed=st.provider_changed, api_key=st.api_key, base_url=st.base_url, api_mode=st.api_mode,
-        request_overrides=dict(request_overrides or {}), warning_message=" | ".join(warnings) if warnings else "",
+        command=st.command, args=list(st.args), request_overrides=dict(request_overrides or {}),
+        warning_message=" | ".join(warnings) if warnings else "",
         provider_label=st.provider_label, resolved_via_alias=st.resolved_alias, capabilities=capabilities,
         runtime_capabilities={
             k: v for k, v in runtime_capabilities.items() if isinstance(k, str) and isinstance(v, bool)},
