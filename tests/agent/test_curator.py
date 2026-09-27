@@ -654,6 +654,65 @@ def test_run_review_synchronous_invokes_llm_stub(curator_env, monkeypatch):
 
 
 
+
+def test_async_review_retains_profile_home_after_scope_exit(curator_env, monkeypatch):
+    """A multiplexed profile's async review must keep the caller's HERMES_HOME
+    ContextVar after the scheduling scope exits. A bare ``threading.Thread``
+    starts with an empty context and otherwise falls back to the launch home.
+    """
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    c = curator_env["curator"]
+    default_home = curator_env["home"]
+    profile_home = default_home / "profiles" / "worker"
+    (profile_home / "skills").mkdir(parents=True)
+
+    default_state = default_home / "skills" / ".curator_state"
+    c.save_state({"paused": False, "marker": "default"})
+    default_before = default_state.read_bytes()
+
+    entered_report = threading.Event()
+    release_report = threading.Event()
+    report_finished = threading.Event()
+    real_write_report = c._write_run_report
+
+    def _blocking_write_report(**kwargs):
+        entered_report.set()
+        assert release_report.wait(5), "caller did not release async review"
+        try:
+            return real_write_report(**kwargs)
+        finally:
+            report_finished.set()
+
+    monkeypatch.setattr(c, "_write_run_report", _blocking_write_report)
+
+    token = set_hermes_home_override(profile_home)
+    try:
+        c.run_curator_review(synchronous=False, consolidate=False)
+        assert entered_report.wait(5), "async curator worker did not reach report write"
+    finally:
+        reset_hermes_home_override(token)
+        release_report.set()
+
+    assert report_finished.wait(5), "async curator report did not finish"
+    for thread in threading.enumerate():
+        if thread.name == "curator-review" and thread.is_alive():
+            thread.join(timeout=10.0)
+
+    assert default_state.read_bytes() == default_before
+
+    token = set_hermes_home_override(profile_home)
+    try:
+        profile_state = c.load_state()
+    finally:
+        reset_hermes_home_override(token)
+    assert profile_state["last_run_duration_seconds"] is not None
+    assert Path(profile_state["last_report_path"]).is_relative_to(profile_home)
+
+
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
