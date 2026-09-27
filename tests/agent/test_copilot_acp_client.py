@@ -55,6 +55,16 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         )
         self.assertEqual(chunks[1].choices, [])
 
+    def test_completion_does_not_fabricate_zero_usage(self) -> None:
+        with patch.object(self.client, "_run_prompt", return_value=("OK", "")):
+            response = self.client._create_chat_completion(
+                model="gemini-test",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=False,
+            )
+
+        self.assertIsNone(response.usage)
+
 
     def _dispatch(self, message: dict, *, cwd: str) -> dict:
         process = _FakeProcess()

@@ -1,8 +1,7 @@
 """Gateway runtime-metadata footer (model · context % · cwd), off by default to keep replies
 minimal. Config: ``display.runtime_footer: {enabled: bool, fields: [model, context_pct, cwd]}``
 (order shown; drop any to hide), per-platform override ``display.platforms.<p>.runtime_footer``,
-toggled by ``/footer on|off``. Fields: ``model`` (vendor prefix dropped), ``context_pct`` (last-call
-occupancy), ``latency`` (turn wall-clock, opt-in — NOT in the default set so an unset ``fields``
+toggled by ``/footer on|off``. Fields: ``model`` (vendor prefix dropped), ``context_pct`` (last-call occupancy; ``~`` prefix when locally estimated), ``latency`` (turn wall-clock, opt-in — NOT in the default set so an unset ``fields``
 renders exactly as before), ``served_model`` (opt-in, ``alias → served``: the deployment a routing
 proxy reported via ``x-litellm-model-id`` / ``x-litellm-model-api-base``, or Hermes' own fallback
 route; skipped when the served model is the requested one), ``cwd`` (home-relative). ``gateway/run.py`` appends the footer to the
@@ -74,15 +73,16 @@ def _format_latency(seconds: float) -> str:
 
 
 def format_runtime_footer(*, model: Optional[str], context_tokens: int,
-                          context_length: Optional[int], cwd: Optional[str] = None,
-                          turn_seconds: Optional[float] = None,
+                          context_length: Optional[int], context_estimated: bool = False,
+                          cwd: Optional[str] = None, turn_seconds: Optional[float] = None,
                           requested_model: Optional[str] = None, served_model: Optional[str] = None,
                           fields: Iterable[str] = _DEFAULT_FIELDS) -> str:
     """Render the footer line, or "" if no fields have data. Fields whose data is missing (and
     unknown field names) are skipped silently — a partial footer beats ``?%`` or empty slots."""
     def context_pct() -> str:
         if context_length and context_length > 0 and context_tokens >= 0:
-            return f"{max(0, min(100, round((context_tokens / context_length) * 100)))}%"
+            pct = max(0, min(100, round((context_tokens / context_length) * 100)))
+            return f"{'~' if context_estimated else ''}{pct}%"
         return ""
 
     def served() -> str:
@@ -105,7 +105,8 @@ def format_runtime_footer(*, model: Optional[str], context_tokens: int,
 
 def build_footer_line(*, user_config: dict[str, Any] | None, platform_key: str | None,
                       model: Optional[str], context_tokens: int, context_length: Optional[int],
-                      cwd: Optional[str] = None, turn_seconds: Optional[float] = None,
+                      context_estimated: bool = False, cwd: Optional[str] = None,
+                      turn_seconds: Optional[float] = None,
                       requested_model: Optional[str] = None, served_model: Optional[str] = None) -> str:
     """Entry point for gateway/run.py: footer text, or "" when disabled / no data. Callers append it
     to the final response themselves, preserving a single blank line of separation.
@@ -115,6 +116,7 @@ def build_footer_line(*, user_config: dict[str, Any] | None, platform_key: str |
     if not cfg.get("enabled"):
         return ""
     return format_runtime_footer(model=model, context_tokens=context_tokens,
-                                 context_length=context_length, cwd=cwd, turn_seconds=turn_seconds,
+                                 context_length=context_length, context_estimated=context_estimated,
+                                 cwd=cwd, turn_seconds=turn_seconds,
                                  requested_model=requested_model, served_model=served_model,
                                  fields=cfg.get("fields") or _DEFAULT_FIELDS)

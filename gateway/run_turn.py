@@ -1657,6 +1657,7 @@ class GatewayTurnMixin:
                 platform_key=_platform_config_key(source.platform), model=agent_result.get("model"),
                 context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                 context_length=agent_result.get("context_length") or None,
+                context_estimated=bool(agent_result.get("context_estimated", False)),
                 cwd=_terminal_scope_cwd(""), turn_seconds=_turn_seconds,
                 requested_model=agent_result.get("requested_model"),
                 served_model=agent_result.get("served_model"),

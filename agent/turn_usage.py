@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from agent.image_token_cost import calibrate_from_usage
 from agent.usage_anchor import capture_usage_anchor, set_usage_anchor
@@ -73,6 +73,8 @@ def _fold_moa_usage(agent, canonical_usage):
 def record_response_usage(
     agent: Any, response: Any, *, messages: List[Dict[str, Any]], api_call_count: int,
     api_duration: float, compression_attempts: int, max_compression_attempts: int,
+    request_messages: Optional[List[Dict[str, Any]]] = None,
+    request_tools: Optional[List[Dict[str, Any]]] = None,
 ) -> ResponseUsageOutcome:
     """Fold ``response.usage`` into compressor, anchors, session counters, state.db
     and the API-call log line (see module docstring). No-usage responses only
@@ -92,6 +94,25 @@ def record_response_usage(
         _note_usage_less = getattr(compressor, "note_usage_less_response", None)
         if callable(_note_usage_less):
             _note_usage_less()
+        # The provider did not price/count this request, but UI context occupancy
+        # should not collapse to a fake 0%.  Estimate the actual outbound message
+        # set (including its system message) plus the tools that were on this wire.
+        # Keep the estimate display-only: session token/cost counters and usage
+        # anchors remain gated on provider-confirmed usage below.
+        _estimate_messages = request_messages if request_messages is not None else messages
+        _estimate_tools = request_tools if request_tools is not None else (getattr(agent, "tools", None) or None)
+        try:
+            from agent.model_metadata import estimate_request_tokens_rough
+
+            _estimated_prompt = estimate_request_tokens_rough(
+                _estimate_messages or [], tools=_estimate_tools or None
+            )
+        except Exception:
+            logger.debug("usage-less request-size estimate failed", exc_info=True)
+        else:
+            _note_estimate = getattr(compressor, "note_usage_less_display_estimate", None)
+            if callable(_note_estimate):
+                _note_estimate(_estimated_prompt)
         logger.info(
             "API call #%d: model=%s provider=%s in=? out=? total=? latency=%.1fs usage=unavailable",
             agent.session_api_calls, agent.model, agent.provider or "unknown", api_duration,

@@ -193,7 +193,8 @@ def check_api_response(
     _usage_outcome = record_response_usage(
         agent, response, messages=messages, api_call_count=api_call_count,
         api_duration=api_duration, compression_attempts=compression_attempts,
-        max_compression_attempts=max_compression_attempts,
+        max_compression_attempts=max_compression_attempts, request_messages=api_messages,
+        request_tools=api_kwargs.get("tools") if isinstance(api_kwargs, dict) else None,
     )
     compression_attempts = _usage_outcome.compression_attempts
     if _usage_outcome.rearmed:

@@ -2920,6 +2920,16 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         adjudicate context pressure, so rough estimates decide instead of waiting forever (#2153)."""
         self._provider_omits_usage = True
 
+    def note_usage_less_display_estimate(self, prompt_tokens: int) -> None:
+        """Publish a rough request-size estimate for UI occupancy only.
+
+        This deliberately does not touch ``last_real_prompt_tokens``: pricing, cache
+        accounting, anchors, and compression verdicts must never mistake the local
+        estimate for provider-reported usage.
+        """
+        if isinstance(prompt_tokens, int) and not isinstance(prompt_tokens, bool) and prompt_tokens > 0:
+            self.last_prompt_tokens = prompt_tokens
+
     def note_native_compaction_checkpoint(self) -> None:
         """Wait for real usage before trusting a newly checkpointed request.
 

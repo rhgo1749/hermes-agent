@@ -723,7 +723,11 @@ class CopilotACPClient:
         )
         completion = SimpleNamespace(
             choices=[SimpleNamespace(message=message, finish_reason="tool_calls" if tool_calls else "stop")],
-            usage=SimpleNamespace(prompt_tokens=0, completion_tokens=0, total_tokens=0, prompt_tokens_details=SimpleNamespace(cached_tokens=0)),
+            # ACP v1 does not define token-usage metadata on session/prompt.  Treat
+            # that as unavailable instead of fabricating an exact-looking zero;
+            # Hermes will keep accounting gated on real provider usage and use a
+            # clearly-marked local estimate for context occupancy.
+            usage=None,
             model=model or "copilot-acp",
         )
         return _completion_to_stream_chunks(completion) if stream else completion

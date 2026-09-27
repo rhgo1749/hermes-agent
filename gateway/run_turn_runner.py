@@ -1959,12 +1959,19 @@ class TurnRunner:
         agent = ctx.agent_holder[0]
         has_comp = bool(agent) and hasattr(agent, "context_compressor")
         comp = agent.context_compressor if has_comp else None
+        _last_prompt_tokens = getattr(comp, "last_prompt_tokens", 0) if has_comp else 0
+        _context_estimated = False
+        if has_comp and _last_prompt_tokens > 0:
+            with suppress(Exception):
+                from agent.context_breakdown import context_display_source
+                _context_estimated = context_display_source(comp) != "provider_usage"
         usage = {
-            "last_prompt_tokens": getattr(comp, "last_prompt_tokens", 0) if has_comp else 0,
+            "last_prompt_tokens": _last_prompt_tokens,
             "input_tokens": getattr(agent, "session_prompt_tokens", 0) if has_comp else 0,
             "output_tokens": getattr(agent, "session_completion_tokens", 0) if has_comp else 0,
             "model": getattr(agent, "model", None) if agent else None,
             "context_length": (getattr(comp, "context_length", 0) or 0) if has_comp else 0,
+            "context_estimated": _context_estimated,
         }
         compacted_in_place, effective_session_id, history_offset = self._sync_session_after_run(agent_history)
         # failure_reason must survive the empty-response path too (TUI billing, transient-failure

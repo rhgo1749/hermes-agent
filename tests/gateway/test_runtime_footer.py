@@ -73,6 +73,39 @@ def test_format_footer_skips_missing_context_length():
     assert "/tmp/wd" in out
 
 
+def test_usage_less_provider_footer_uses_local_estimate():
+    from types import SimpleNamespace
+
+    from agent.context_breakdown import context_display_source
+    from agent.context_compressor import ContextCompressor
+    from agent.turn_usage import record_response_usage
+
+    comp = ContextCompressor(model="gemini-test", config_context_length=1_000_000, quiet_mode=True)
+    agent = SimpleNamespace(
+        context_compressor=comp, session_api_calls=0, model="gemini-test",
+        provider="antigravity-cli", tools=[],
+    )
+    request_messages = [
+        {"role": "system", "content": "rules " * 4000},
+        {"role": "user", "content": "hello"},
+    ]
+    record_response_usage(
+        agent, SimpleNamespace(usage=None), messages=request_messages,
+        request_messages=request_messages, request_tools=[], api_call_count=1,
+        api_duration=0.2, compression_attempts=0, max_compression_attempts=3,
+    )
+
+    assert comp.last_prompt_tokens > 0
+    assert context_display_source(comp) == "local_estimate"
+    out = format_runtime_footer(
+        model="gemini-test", context_tokens=comp.last_prompt_tokens,
+        context_length=comp.context_length, context_estimated=True, cwd="/tmp",
+        fields=("model", "context_pct"),
+    )
+    assert out.startswith("gemini-test · ~")
+    assert out.endswith("%")
+
+
 # ---------------------------------------------------------------------------
 # resolve_footer_config
 # ---------------------------------------------------------------------------
