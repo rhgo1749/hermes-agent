@@ -229,6 +229,8 @@ class TestOneTurnNeverPersisted:
                 api_key="sk-test",
                 base_url="https://openrouter.ai/api/v1",
                 api_mode="chat_completions",
+                command="antigravity-acp-mux",
+                args=["--uid="],
                 runtime_capabilities={"openai_native_compaction": True},
                 provider_label="OpenRouter",
             ),
@@ -278,6 +280,8 @@ class TestOneTurnNeverPersisted:
         assert runner._session_model_overrides[sk]["capabilities"] == {
             "openai_native_compaction": True
         }
+        assert runner._session_model_overrides[sk]["command"] == "antigravity-acp-mux"
+        assert runner._session_model_overrides[sk]["args"] == ["--uid="]
         assert sk in runner._pending_one_turn_model_restores
         # ...but NEVER written through to the persistent session store.
         runner.async_session_store.set_model_override.assert_not_awaited()

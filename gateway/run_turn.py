@@ -196,10 +196,11 @@ class GatewayTurnMixin:
             override_model = override.get("model", model)
             override_runtime = {
                 k: override.get(k) for k in (
-                    "provider", "requested_provider", "api_key", "base_url", "api_mode",
+                    "provider", "requested_provider", "api_key", "base_url", "api_mode", "command", "args",
                     "max_tokens", "credential_pool", "request_overrides", "capabilities",
                 )
             }
+            override_runtime["args"] = list(override_runtime["args"] or [])
             override_runtime["capabilities"] = dict(override_runtime["capabilities"] or {})
             if override_runtime.get("api_key"):
                 if override_runtime.get("credential_pool") is None:

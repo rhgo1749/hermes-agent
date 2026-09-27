@@ -2687,6 +2687,8 @@ class TestModelRoutesAgentCreation:
                 "api_key": "sk-session",
                 "base_url": "https://session.example/v1",
                 "api_mode": "responses",
+                "command": "antigravity-acp-mux",
+                "args": ["--uid="],
                 "credential_pool": "pool-session",
             },
         )
@@ -2696,6 +2698,8 @@ class TestModelRoutesAgentCreation:
         assert captured["model"] == "session/override-model"
         assert captured["provider"] == "sessionprov"
         assert captured["api_key"] == "sk-session"
+        assert captured["command"] == "antigravity-acp-mux"
+        assert captured["args"] == ["--uid="]
 
 
 class TestStoredSessionModelFilter:
