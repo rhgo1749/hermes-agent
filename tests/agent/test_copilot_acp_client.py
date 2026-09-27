@@ -715,6 +715,26 @@ def test_close_terminates_every_live_session_process(tmp_path):
     assert all(proc.poll() is not None for proc in spawned)
 
 
+def test_message_fingerprint_normalizes_json_tool_argument_formatting():
+    from agent.copilot_acp_client import _message_fingerprint
+
+    left = {
+        "role": "assistant", "content": "",
+        "tool_calls": [{
+            "id": "call-1", "type": "function",
+            "function": {"name": "probe", "arguments": '{"b": 2, "a": 1}'},
+        }],
+    }
+    right = {
+        "role": "assistant", "content": "",
+        "tool_calls": [{
+            "id": "call-1", "type": "function",
+            "function": {"name": "probe", "arguments": '{"a":1,"b":2}'},
+        }],
+    }
+    assert _message_fingerprint(left) == _message_fingerprint(right)
+
+
 def test_continuation_frontier_accepts_only_append_only_history():
     from agent.copilot_acp_client import (
         _ACPConversationState, _context_fingerprint, _continuation_delta,
