@@ -138,11 +138,3 @@ recycled PID gets killed on reclaim.
 `tests/cron/`, `tests/hermes_cli/test_kanban*.py`, `tests/tools/test_kanban*.py`. Schedule parsing
 and catch-up windows are pure functions — test them as data. Never assert on the verb list or
 toolset size (root: no change-detectors). Time-based tests use loose bounds (≥ 2s) and event sync.
-
-**Synthetic Kanban probes must be isolated from project boards.** Unit/integration probes that
-create, claim, mutate, or corrupt task/run rows use a temp `HERMES_HOME`/Kanban DB and must prove
-that isolation before the first mutation. If a real dispatcher/live-board probe is genuinely
-required in this downstream deployment, explicitly target the dedicated `hermes-core-probe` board
-with `HERMES_KANBAN_BOARD=hermes-core-probe` (or the equivalent explicit `--board` CLI scope).
-Never let an ad-hoc validation command inherit a dispatched worker's owning production board. If
-isolation cannot be established, the gate is `NOT RUN`, not permission to probe the project board.
