@@ -29,6 +29,7 @@ from hermes_cli import main as hermes_main
 import hermes_cli.main_web_build as main_web_build
 import hermes_cli.main_install_repair as main_install_repair
 from hermes_cli import update_cmd
+from hermes_cli import update_cmd_git
 
 
 GIT = ["git"]
@@ -147,6 +148,51 @@ def test_equivalent_cherry_picked_commit_is_still_safe(repo_pair):
     )
     assert safe is True
     assert reason == ""
+
+
+def test_promisor_clone_skips_patch_equivalence_probe(repo_pair, monkeypatch):
+    """Promisor/partial clones must not run git cherry: it can serially lazy-fetch
+    omitted trees/blobs for every upstream commit. SHA-ahead work is conservatively kept."""
+    (repo_pair / "feature.txt").write_text("unmerged work\n")
+    _git(repo_pair, "add", "feature.txt")
+    _git(repo_pair, "commit", "-qm", "feature work")
+    _git(repo_pair, "config", "remote.origin.promisor", "true")
+    _git(repo_pair, "config", "remote.origin.partialclonefilter", "tree:0")
+
+    real_git_run = update_cmd_git._git_run
+
+    def no_cherry(git_cmd, args, cwd=None, **kwargs):
+        assert args[0] != "cherry", "promisor clone must not invoke git cherry"
+        return real_git_run(git_cmd, args, cwd, **kwargs)
+
+    monkeypatch.setattr(update_cmd_git, "_git_run", no_cherry)
+    safe, reason = update_cmd._assess_parked_branch_switch(
+        GIT, repo_pair, "old-feature", "main"
+    )
+    assert safe is True
+    assert reason == "unmerged:1"
+
+
+def test_slow_cherry_times_out_to_safe_unmerged_fallback(repo_pair, monkeypatch):
+    """A bounded cherry timeout preserves committed work instead of wedging update."""
+    (repo_pair / "feature.txt").write_text("unmerged work\n")
+    _git(repo_pair, "add", "feature.txt")
+    _git(repo_pair, "commit", "-qm", "feature work")
+
+    real_git_run = update_cmd_git._git_run
+
+    def timeout_cherry(git_cmd, args, cwd=None, **kwargs):
+        if args[0] == "cherry":
+            assert kwargs.get("timeout") == update_cmd_git._PARKED_CHERRY_TIMEOUT_SECONDS
+            return subprocess.CompletedProcess(git_cmd + list(args), 124, "", "timeout")
+        return real_git_run(git_cmd, args, cwd, **kwargs)
+
+    monkeypatch.setattr(update_cmd_git, "_git_run", timeout_cherry)
+    safe, reason = update_cmd._assess_parked_branch_switch(
+        GIT, repo_pair, "old-feature", "main"
+    )
+    assert safe is True
+    assert reason == "unmerged:1"
 
 
 def test_config_opt_out_blocks_auto_switch(repo_pair, monkeypatch):

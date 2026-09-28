@@ -17,6 +17,7 @@ logger = logging.getLogger("hermes_cli.update_cmd")  # log-record parity with th
 
 _ORPHAN_RESCUE_REFS_TO_KEEP = 10
 _ORPHAN_RESCUE_REF_MAX_AGE_DAYS = 30
+_PARKED_CHERRY_TIMEOUT_SECONDS = 30
 
 _GIT_TEXT_KW = dict(capture_output=True, text=True, encoding="utf-8", errors="replace")
 _BAR = "=" * 68
@@ -28,19 +29,31 @@ def _git_ok(git_cmd, args, cwd, **kw) -> bool:
     return _git_stdout(git_cmd, args, cwd, **kw) is not None
 
 
-def _git_run(git_cmd, args, cwd=None, *, check=False):
+def _git_run(git_cmd, args, cwd=None, *, check=False, timeout=None):
     """Run ``git_cmd + args`` and return the CompletedProcess.
 
     The updater's git runner: capture all output and decode as UTF-8 regardless of the
-    Windows ANSI code page (#52649). ``check=True`` raises on non-zero exit.
+    Windows ANSI code page (#52649). ``check=True`` raises on non-zero exit. Optional
+    ``timeout`` is used only by bounded read-only probes; timeout maps to rc=124 so callers
+    can fail safe without leaving a child git process behind.
     """
-    return subprocess.run(
-        git_cmd + list(args),
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-        check=check,
-    )
+    try:
+        return subprocess.run(
+            git_cmd + list(args),
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            check=check,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        result = subprocess.CompletedProcess(
+            exc.cmd, 124, stdout="",
+            stderr=f"git {args[0]} timed out after {timeout}s")
+        if check:
+            raise subprocess.CalledProcessError(
+                124, exc.cmd, output="", stderr=result.stderr) from exc
+        return result
 
 
 def _git_stdout(git_cmd, args, cwd, **kw) -> Optional[str]:
@@ -181,7 +194,35 @@ def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: 
         return False, "unverifiable"
     if status.stdout.strip():
         return False, "dirty"
-    cherry = _git_run(git_cmd, ["cherry", f"origin/{target_branch}"], cwd)
+
+    # Count SHA-ahead commits before asking for patch equivalence. This is commit-graph only
+    # and stays cheap on promisor/partial clones; ``git cherry`` may need every changed tree/blob.
+    ahead = _git_run(
+        git_cmd, ["rev-list", "--count", f"origin/{target_branch}..HEAD"], cwd)
+    if ahead.returncode != 0:
+        return False, "unverifiable"
+    try:
+        ahead_count = int(ahead.stdout.strip() or "0")
+    except ValueError:
+        return False, "unverifiable"
+    if ahead_count == 0:
+        return True, ""
+
+    # A promisor remote can turn ``git cherry`` into hundreds of serial lazy fetches when the
+    # newly-fetched target has tree/blob objects omitted by a filter such as tree:0. Patch
+    # equivalence is only an optimization here: treating the committed work as unmerged keeps it
+    # safe on its branch and lets the caller either switch away or merge the target in place.
+    promisor = _git_run(git_cmd, ["config", "--bool", "remote.origin.promisor"], cwd)
+    if promisor.returncode == 0 and promisor.stdout.strip().lower() == "true":
+        return True, f"unmerged:{ahead_count}"
+
+    cherry = _git_run(
+        git_cmd, ["cherry", f"origin/{target_branch}"], cwd,
+        timeout=_PARKED_CHERRY_TIMEOUT_SECONDS)
+    if cherry.returncode == 124:
+        # Fail safe toward preserving the parked branch. The caller's unmerged path never drops
+        # committed work; exact patch-equivalence is not worth wedging the updater indefinitely.
+        return True, f"unmerged:{ahead_count}"
     if cherry.returncode != 0:
         return False, "unverifiable"
     unmerged = [line for line in cherry.stdout.splitlines() if line.startswith("+")]
