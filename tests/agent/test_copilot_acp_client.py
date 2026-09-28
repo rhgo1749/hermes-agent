@@ -748,26 +748,6 @@ def test_cli_death_is_reported_as_a_crash_not_a_timeout(tmp_path):
         assert "exited early: fatal: agent segfaulted" in str(exc)
     else:
         raise AssertionError("session on a dead CLI must raise")
-def test_message_fingerprint_normalizes_json_tool_argument_formatting():
-    from agent.copilot_acp_client import _message_fingerprint
-
-    left = {
-        "role": "assistant", "content": "",
-        "tool_calls": [{
-            "id": "call-1", "type": "function",
-            "function": {"name": "probe", "arguments": '{"b": 2, "a": 1}'},
-        }],
-    }
-    right = {
-        "role": "assistant", "content": "",
-        "tool_calls": [{
-            "id": "call-1", "type": "function",
-            "function": {"name": "probe", "arguments": '{"a":1,"b":2}'},
-        }],
-    }
-    assert _message_fingerprint(left) == _message_fingerprint(right)
-
-
 def test_continuation_frontier_accepts_only_append_only_history():
     from agent.copilot_acp_client import (
         _ACPConversationState, _context_fingerprint, _continuation_delta,

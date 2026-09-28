@@ -463,41 +463,14 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
-def _fingerprint_prompt_message(message: dict[str, Any], role: str) -> str:
-    """Semantic prompt row for frontier checks, normalizing JSON tool arguments only.
-
-    Hermes may round-trip ``{"a": 1}`` as ``{"a":1}`` while preserving the exact
-    tool call. Treat those as identical without changing the real prompt bytes sent to ACP.
-    """
-    if role != "assistant":
-        return _render_prompt_message(message, role)
-
-    content = _render_message_content(message.get("content"))
-    parts = [content] if content else []
-    for tool_call in message.get("tool_calls") or []:
-        if not isinstance(tool_call, dict):
-            continue
-        function = tool_call.get("function")
-        if not isinstance(function, dict) or not str(function.get("name") or "").strip():
-            continue
-        payload = {
-            "id": str(tool_call.get("id") or ""),
-            "type": str(tool_call.get("type") or "function"),
-            "function": {
-                "name": str(function.get("name") or ""),
-                "arguments": _normalized_tool_arguments(function.get("arguments", "{}")),
-            },
-        }
-        parts.append(json.dumps(
-            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
-        ))
-    return "\n".join(parts).strip()
-
-
 def _message_fingerprint(message: dict[str, Any]) -> str:
-    """Fingerprint exactly the semantic row representation this ACP bridge replays."""
+    """Fingerprint exactly the semantic row representation this ACP bridge replays.
+
+    Timestamps/provider sidecars ignored by ``_render_prompt_message`` must not cause a
+    false cache break; anything the ACP backend actually sees must.
+    """
     role = str(message.get("role") or "unknown").strip().lower()
-    rendered = _fingerprint_prompt_message(message, role)
+    rendered = _render_prompt_message(message, role)
     return _sha256_text(f"{role}\0{rendered}")
 
 
