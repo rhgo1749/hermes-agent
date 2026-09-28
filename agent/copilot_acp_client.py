@@ -59,11 +59,9 @@ _TOOL_HISTORY_CONTINUATION_NOTE = (
 )
 _DUPLICATE_NO_PROGRESS_CORRECTION = (
     "Your proposed tool call exactly repeats the most recent completed call, and that call's tool response explicitly "
-    "reported that the result/state is unchanged. That exact tool is deliberately unavailable for this correction "
-    "turn. Do not emit it again. Continue from the existing result: choose a different available tool only if it "
-    "advances the task, otherwise answer or perform the next required action."
+    "reported that the result/state is unchanged. Do not repeat that same call. Continue from the existing result: "
+    "choose a different tool only if it advances the task, otherwise answer or perform the next required action."
 )
-_MAX_DUPLICATE_NO_PROGRESS_CORRECTIONS = 2
 _INITIALIZE_PARAMS = {
     "protocolVersion": 1,
     "clientCapabilities": {"fs": {"readTextFile": True, "writeTextFile": True}},
@@ -345,18 +343,6 @@ def _repeats_latest_unchanged_call(messages: list[dict[str, Any]], tool_calls: l
     return (name, _normalized_tool_arguments(arguments)) == previous
 
 
-def _without_openai_tool(tools: list[dict[str, Any]] | None, blocked_name: str) -> list[dict[str, Any]]:
-    """Return tool schemas excluding one exact function name; malformed entries pass through."""
-    filtered: list[dict[str, Any]] = []
-    for tool in tools or []:
-        function = tool.get("function") if isinstance(tool, dict) else None
-        name = str(function.get("name") or "").strip() if isinstance(function, dict) else ""
-        if name == blocked_name:
-            continue
-        filtered.append(tool)
-    return filtered
-
-
 def _render_message_content(content: Any) -> str:
     if content is None:
         return ""
@@ -484,33 +470,14 @@ class CopilotACPClient:
         started = time.monotonic()
         response_text, reasoning = self._run_prompt(prompt_text, timeout_seconds=timeout_seconds, model=model)
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
-        duplicate_signature = _latest_unchanged_tool_signature(messages or [])
-        if duplicate_signature is not None and _repeats_latest_unchanged_call(messages or [], tool_calls):
-            blocked_name, _ = duplicate_signature
-            correction_tools = _without_openai_tool(tools, blocked_name)
-            correction_choice = tool_choice if correction_tools else None
-            correction_base = _format_messages_as_prompt(
-                messages or [], model=model, tools=correction_tools, tool_choice=correction_choice,
-            )
-            for correction_index in range(_MAX_DUPLICATE_NO_PROGRESS_CORRECTIONS):
-                remaining = timeout_seconds - (time.monotonic() - started)
-                if remaining <= 0:
-                    break
-                corrected_prompt = (
-                    f"{correction_base}\n\n{_DUPLICATE_NO_PROGRESS_CORRECTION} "
-                    f"Blocked tool: {blocked_name}. Correction attempt {correction_index + 1}."
-                )
+        if _repeats_latest_unchanged_call(messages or [], tool_calls):
+            remaining = timeout_seconds - (time.monotonic() - started)
+            if remaining > 0:
+                corrected_prompt = f"{prompt_text}\n\n{_DUPLICATE_NO_PROGRESS_CORRECTION}"
                 response_text, reasoning = self._run_prompt(
                     corrected_prompt, timeout_seconds=remaining, model=model,
                 )
                 tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
-                if not _repeats_latest_unchanged_call(messages or [], tool_calls):
-                    break
-            if _repeats_latest_unchanged_call(messages or [], tool_calls):
-                raise RuntimeError(
-                    f"ACP backend repeated unchanged no-progress tool call {blocked_name!r} "
-                    f"after {_MAX_DUPLICATE_NO_PROGRESS_CORRECTIONS} correction attempts; refusing to execute it again."
-                )
         message = SimpleNamespace(
             content=cleaned_text, tool_calls=tool_calls, reasoning=reasoning or None, reasoning_content=reasoning or None,
             reasoning_details=None,

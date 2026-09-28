@@ -447,32 +447,6 @@ def test_repeated_unchanged_tool_call_is_corrected_inside_acp_bridge():
     assert response.choices[0].message.content == "CONTINUED"
 
 
-def test_persistently_repeated_unchanged_tool_never_escapes_bridge():
-    client = CopilotACPClient(acp_cwd="/tmp")
-    messages = [
-        {"role": "assistant", "content": "", "tool_calls": [{
-            "id": "call-1", "type": "function",
-            "function": {"name": "probe_once", "arguments": "{}"},
-        }]},
-        {"role": "tool", "tool_call_id": "call-1", "content": '{"unchanged":true}'},
-    ]
-    repeated = '<tool_call>{"id":"again","type":"function","function":{"name":"probe_once","arguments":"{}"}}</tool_call>'
-
-    with patch.object(CopilotACPClient, "_run_prompt", return_value=(repeated, "")) as run_prompt:
-        with pytest.raises(RuntimeError, match="refusing to execute it again"):
-            client._create_chat_completion(
-                model="gemini-test", messages=messages,
-                tools=[{"type": "function", "function": {"name": "probe_once", "parameters": {}}}],
-                timeout=30,
-            )
-
-    assert run_prompt.call_count == 3
-    for correction in run_prompt.call_args_list[1:]:
-        prompt = correction.args[0]
-        assert "That exact tool is deliberately unavailable" in prompt
-        assert "Available tools (OpenAI function schema). [{\"name\": \"probe_once\"" not in prompt
-
-
 def test_changed_arguments_are_not_suppressed_after_unchanged_result():
     client = CopilotACPClient(acp_cwd="/tmp")
     messages = [
