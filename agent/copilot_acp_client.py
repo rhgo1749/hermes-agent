@@ -20,7 +20,6 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -451,112 +450,6 @@ def _fs_write_text_file(params: dict[str, Any], cwd: str) -> Any:
 _FS_HANDLERS = {"fs/read_text_file": _fs_read_text_file, "fs/write_text_file": _fs_write_text_file}
 
 
-@dataclass(frozen=True)
-class _ACPConversationState:
-    session_id: str
-    context_fingerprint: str
-    request_fingerprints: tuple[str, ...]
-    response_fingerprint: str
-
-
-def _sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", errors="surrogatepass")).hexdigest()
-
-
-def _message_fingerprint(message: dict[str, Any]) -> str:
-    """Fingerprint exactly the semantic row representation this ACP bridge replays.
-
-    Timestamps/provider sidecars ignored by ``_render_prompt_message`` must not cause a
-    false cache break; anything the ACP backend actually sees must.
-    """
-    role = str(message.get("role") or "unknown").strip().lower()
-    rendered = _render_prompt_message(message, role)
-    return _sha256_text(f"{role}\0{rendered}")
-
-
-def _context_fingerprint(model: str | None, tools: list[dict[str, Any]] | None, tool_choice: Any) -> str:
-    rendered_tools = _render_tool_bridge_sections(tools, tool_choice)
-    payload = json.dumps(
-        {"model": str(model or ""), "tool_bridge": rendered_tools},
-        ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
-    )
-    return _sha256_text(payload)
-
-
-def _response_fingerprint(content: str, tool_calls: list[Any]) -> str:
-    message: dict[str, Any] = {"role": "assistant", "content": content or ""}
-    if tool_calls:
-        rendered_calls: list[dict[str, Any]] = []
-        for call in tool_calls:
-            function = getattr(call, "function", None)
-            rendered_calls.append({
-                "id": str(getattr(call, "id", "") or ""),
-                "type": str(getattr(call, "type", "function") or "function"),
-                "function": {
-                    "name": str(getattr(function, "name", "") or ""),
-                    "arguments": getattr(function, "arguments", "{}"),
-                },
-            })
-        message["tool_calls"] = rendered_calls
-    return _message_fingerprint(message)
-
-
-def _continuation_delta(
-    messages: list[dict[str, Any]], state: _ACPConversationState, context_fingerprint: str,
-) -> list[dict[str, Any]] | None:
-    """Return append-only Hermes rows after the ACP-native assistant turn, else fail closed.
-
-    The prior request rows must be byte-equivalent under the bridge's renderer and the
-    next row must be the exact assistant response emitted by that ACP session. Compression,
-    rewind, prompt/tool changes, or response rewriting therefore force a full replay.
-    """
-    if state.context_fingerprint != context_fingerprint:
-        return None
-    prefix_len = len(state.request_fingerprints)
-    if len(messages) <= prefix_len:
-        return None
-    if tuple(_message_fingerprint(m) for m in messages[:prefix_len]) != state.request_fingerprints:
-        return None
-    assistant = messages[prefix_len]
-    if (not isinstance(assistant, dict)
-            or str(assistant.get("role") or "").strip().lower() != "assistant"
-            or _message_fingerprint(assistant) != state.response_fingerprint):
-        return None
-    delta = messages[prefix_len + 1:]
-    if not delta:
-        return None
-    # A new system row is a context rewrite, never an append-only continuation.
-    if any(str(m.get("role") or "").strip().lower() == "system" for m in delta if isinstance(m, dict)):
-        return None
-    return delta
-
-
-def _format_continuation_delta(messages: list[dict[str, Any]]) -> str:
-    transcript: list[str] = []
-    for message in (m for m in messages if isinstance(m, dict)):
-        role = str(message.get("role") or "unknown").strip().lower()
-        if rendered := _render_prompt_message(message, role):
-            transcript.append(f"{_ROLE_LABELS.get(role, 'Context')}:\n{rendered}")
-    sections = [
-        "Hermes continuation delta: the ACP session already contains all earlier conversation context and your previous response.",
-    ]
-    if transcript:
-        sections.append("New conversation events since your previous ACP turn:\n\n" + "\n\n".join(transcript))
-    if _has_completed_tool_history(messages):
-        sections.append(_TOOL_HISTORY_CONTINUATION_NOTE)
-    sections.append("Continue from these new events only; do not restart or repeat completed earlier work.")
-    return "\n\n".join(section.strip() for section in sections if section.strip())
-
-
-def _resume_session_missing(exc: BaseException) -> bool:
-    text = str(exc).lower()
-    return (
-        "session not found" in text
-        or "no session with this id" in text
-        or "current gemini_home" in text
-    )
-
-
 class CopilotACPClient:
     """Minimal OpenAI-client-compatible facade for Copilot ACP."""
 
@@ -583,8 +476,6 @@ class CopilotACPClient:
         # while its own leaked.
         self._active_processes: set[subprocess.Popen[str]] = set()
         self._active_process_lock = threading.Lock()
-        self._conversation_states: dict[str, _ACPConversationState] = {}
-        self._conversation_state_lock = threading.Lock()
 
     @staticmethod
     def _terminate_process(proc: subprocess.Popen[str]) -> None:
@@ -601,17 +492,14 @@ class CopilotACPClient:
         to rebuild a client that is mid-request."""
         with self._active_process_lock:
             self._active_processes.discard(proc)
-        # The OpenAI-compatible client is reusable even though each ACP child is intentionally
-        # short-lived. Keeping the facade open lets Hermes' request-client slot preserve the
-        # durable ACP session id/frontier across sequential model calls.
+            if not self._active_processes:
+                self.is_closed = True
         self._terminate_process(proc)
 
     def close(self) -> None:
         with self._active_process_lock:
             procs, self._active_processes = tuple(self._active_processes), set()
         self.is_closed = True
-        with self._conversation_state_lock:
-            self._conversation_states.clear()
         for proc in procs:
             self._terminate_process(proc)
 
@@ -620,38 +508,21 @@ class CopilotACPClient:
         tools: list[dict[str, Any]] | None = None, tool_choice: Any = None, stream: bool = False, **_: Any,
     ) -> Any:
         request_messages = messages or []
-        full_prompt_text = _format_messages_as_prompt(request_messages, model=model, tools=tools, tool_choice=tool_choice)
+        prompt_text = _format_messages_as_prompt(request_messages, model=model, tools=tools, tool_choice=tool_choice)
         affinity_key = _conversation_affinity(request_messages, self._acp_cwd)
-        context_fingerprint = _context_fingerprint(model, tools, tool_choice)
-
-        resume_session_id = ""
-        prompt_text = full_prompt_text
-        if affinity_key:
-            with self._conversation_state_lock:
-                prior_state = self._conversation_states.get(affinity_key)
-            if prior_state is not None:
-                delta = _continuation_delta(request_messages, prior_state, context_fingerprint)
-                if delta is not None:
-                    resume_session_id = prior_state.session_id
-                    prompt_text = _format_continuation_delta(delta)
-                else:
-                    logger.info("ACP continuation frontier changed; rebuilding session with full replay.")
-
         timeout_seconds = _effective_timeout(timeout)
         started = time.monotonic()
-        session_result: dict[str, Any] = {}
         response_text, reasoning = self._run_prompt(
             prompt_text, timeout_seconds=timeout_seconds, model=model, affinity_key=affinity_key,
-            resume_session_id=resume_session_id, full_prompt_text=full_prompt_text, session_result=session_result,
         )
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
-        duplicate_signature = _latest_unchanged_tool_signature(request_messages)
-        if duplicate_signature is not None and _repeats_latest_unchanged_call(request_messages, tool_calls):
+        duplicate_signature = _latest_unchanged_tool_signature(messages or [])
+        if duplicate_signature is not None and _repeats_latest_unchanged_call(messages or [], tool_calls):
             blocked_name, _ = duplicate_signature
             correction_tools = _without_openai_tool(tools, blocked_name)
             correction_choice = tool_choice if correction_tools else None
             correction_base = _format_messages_as_prompt(
-                request_messages, model=model, tools=correction_tools, tool_choice=correction_choice,
+                messages or [], model=model, tools=correction_tools, tool_choice=correction_choice,
             )
             for correction_index in range(_MAX_DUPLICATE_NO_PROGRESS_CORRECTIONS):
                 remaining = timeout_seconds - (time.monotonic() - started)
@@ -661,35 +532,17 @@ class CopilotACPClient:
                     f"{correction_base}\n\n{_DUPLICATE_NO_PROGRESS_CORRECTION} "
                     f"Blocked tool: {blocked_name}. Correction attempt {correction_index + 1}."
                 )
-                # A correction changes the available tool schema, so it deliberately starts a
-                # fresh ACP session rather than polluting the resumable conversation frontier.
-                correction_result: dict[str, Any] = {}
                 response_text, reasoning = self._run_prompt(
                     corrected_prompt, timeout_seconds=remaining, model=model, affinity_key=affinity_key,
-                    resume_session_id="", full_prompt_text=corrected_prompt, session_result=correction_result,
                 )
                 tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
-                if not _repeats_latest_unchanged_call(request_messages, tool_calls):
-                    session_result = correction_result
-                    context_fingerprint = _context_fingerprint(model, correction_tools, correction_choice)
+                if not _repeats_latest_unchanged_call(messages or [], tool_calls):
                     break
-            if _repeats_latest_unchanged_call(request_messages, tool_calls):
+            if _repeats_latest_unchanged_call(messages or [], tool_calls):
                 raise RuntimeError(
                     f"ACP backend repeated unchanged no-progress tool call {blocked_name!r} "
                     f"after {_MAX_DUPLICATE_NO_PROGRESS_CORRECTIONS} correction attempts; refusing to execute it again."
                 )
-
-        session_id = str(session_result.get("session_id") or "").strip()
-        if affinity_key and session_id:
-            state = _ACPConversationState(
-                session_id=session_id,
-                context_fingerprint=context_fingerprint,
-                request_fingerprints=tuple(_message_fingerprint(m) for m in request_messages if isinstance(m, dict)),
-                response_fingerprint=_response_fingerprint(cleaned_text, tool_calls),
-            )
-            with self._conversation_state_lock:
-                self._conversation_states[affinity_key] = state
-
         message = SimpleNamespace(
             content=cleaned_text, tool_calls=tool_calls, reasoning=reasoning or None, reasoning_content=reasoning or None,
             reasoning_details=None,
@@ -742,10 +595,9 @@ class CopilotACPClient:
 
     @contextlib.contextmanager
     def _session(
-        self, timeout_seconds: float, *, allow_file_requests: bool = True, affinity_key: str = "",
-        resume_session_id: str = "",
+        self, timeout_seconds: float, *, allow_file_requests: bool = True, affinity_key: str = ""
     ) -> Iterator[tuple[dict[str, Any], Callable[..., Any]]]:
-        """Start one ACP process and yield a new or resumed session plus request callable."""
+        """Start one ACP process and yield its ``session/new`` result plus request callable."""
         proc = self._spawn(affinity_key=affinity_key)
         inbox: queue.Queue[dict[str, Any]] = queue.Queue()
         stderr_tail: deque[str] = deque(maxlen=40)
@@ -801,17 +653,7 @@ class CopilotACPClient:
 
         try:
             _request("initialize", _INITIALIZE_PARAMS)
-            resume_session_id = str(resume_session_id or "").strip()
-            if resume_session_id:
-                session = _request(
-                    "session/resume",
-                    {"sessionId": resume_session_id, "cwd": self._acp_cwd, "mcpServers": []},
-                ) or {}
-                session = dict(session)
-                session.setdefault("sessionId", resume_session_id)
-                session["_hermes_resumed"] = True
-            else:
-                session = _request("session/new", {"cwd": self._acp_cwd, "mcpServers": []}) or {}
+            session = _request("session/new", {"cwd": self._acp_cwd, "mcpServers": []}) or {}
             if not str(session.get("sessionId") or "").strip():
                 raise RuntimeError("Copilot ACP did not return a sessionId.")
             yield session, _request
@@ -819,68 +661,31 @@ class CopilotACPClient:
             self._release_process(proc)
 
     def list_models(self, *, timeout_seconds: float = 15.0) -> list[str]:
-        """Return enabled models from a deliberately one-shot discovery client."""
-        try:
-            with self._session(timeout_seconds, allow_file_requests=False) as (session, _):
-                return _session_model_ids(session)
-        finally:
-            self.close()
+        """Return the enabled models advertised by a short-lived authenticated ACP session."""
+        with self._session(timeout_seconds, allow_file_requests=False) as (session, _):
+            return _session_model_ids(session)
 
     def _run_prompt(
-        self, prompt_text: str, *, timeout_seconds: float, model: str | None = None, affinity_key: str = "",
-        resume_session_id: str = "", full_prompt_text: str | None = None,
-        session_result: dict[str, Any] | None = None,
+        self, prompt_text: str, *, timeout_seconds: float, model: str | None = None, affinity_key: str = ""
     ) -> tuple[str, str]:
-        """Run one prompt, resuming the ACP-native session when possible.
-
-        A resume miss (notably after mux account failover) is the one safe automatic
-        downgrade: create a fresh session and replay ``full_prompt_text`` once. Other
-        resume errors propagate so the provider's bounded retry/failover policy owns them.
-        """
+        # The CLI's `--model` spawn flag is deliberately NOT used: `copilot --acp` validates it (unknown id
+        # aborts the spawn) but ignores it for the session; the model is applied after session/new instead.
         requested_model = str(model or "").strip()
-
-        def _run_once(text: str, resume_id: str) -> tuple[str, str]:
-            with self._session(
-                timeout_seconds, affinity_key=affinity_key, resume_session_id=resume_id,
-            ) as (session, _request):
-                session_id = str(session.get("sessionId") or "").strip()
-                resumed = bool(session.get("_hermes_resumed"))
-                # New sessions need explicit model selection. Resumed sessions already persist
-                # the selected model; avoiding a redundant set_config call keeps the native
-                # continuation prefix stable.
-                if not resumed and requested_model and requested_model != "copilot-acp":
-                    try:
-                        if (selection := _model_selection_request(session, requested_model)) is not None:
-                            _request(*selection)
-                        else:
-                            logger.warning("Copilot ACP does not offer model %r; using the session default.", requested_model)
-                    except Exception as exc:
-                        logger.warning(
-                            "Copilot ACP model selection for %r failed; continuing with the session default: %s",
-                            requested_model, exc,
-                        )
-                text_parts: list[str] = []
-                reasoning_parts: list[str] = []
-                prompt = {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]}
-                _request("session/prompt", prompt, text_parts=text_parts, reasoning_parts=reasoning_parts)
-                if session_result is not None:
-                    session_result.clear()
-                    session_result.update(session_id=session_id, resumed=resumed)
-                return "".join(text_parts), "".join(reasoning_parts)
-
-        resume_session_id = str(resume_session_id or "").strip()
-        if resume_session_id:
-            try:
-                return _run_once(prompt_text, resume_session_id)
-            except RuntimeError as exc:
-                if not _resume_session_missing(exc):
-                    raise
-                logger.info(
-                    "ACP session %s is unavailable in the selected account/home; rebuilding with one full replay.",
-                    resume_session_id[:12],
-                )
-                return _run_once(full_prompt_text or prompt_text, "")
-        return _run_once(prompt_text, "")
+        with self._session(timeout_seconds, affinity_key=affinity_key) as (session, _request):
+            session_id = str(session.get("sessionId") or "").strip()
+            if requested_model and requested_model != "copilot-acp":
+                try:
+                    if (selection := _model_selection_request(session, requested_model)) is not None:
+                        _request(*selection)
+                    else:
+                        logger.warning("Copilot ACP does not offer model %r; using the session default.", requested_model)
+                except Exception as exc:
+                    logger.warning("Copilot ACP model selection for %r failed; continuing with the session default: %s", requested_model, exc)
+            text_parts: list[str] = []
+            reasoning_parts: list[str] = []
+            prompt = {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt_text}]}
+            _request("session/prompt", prompt, text_parts=text_parts, reasoning_parts=reasoning_parts)
+            return "".join(text_parts), "".join(reasoning_parts)
 
     def _handle_server_message(
         self, msg: dict[str, Any], *, process: subprocess.Popen[str], cwd: str, text_parts: list[str] | None, reasoning_parts: list[str] | None,

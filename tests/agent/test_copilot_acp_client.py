@@ -424,10 +424,7 @@ def test_repeated_unchanged_tool_call_is_corrected_inside_acp_bridge():
     ]
     calls = []
 
-    def fake_run_prompt(
-        prompt_text, *, timeout_seconds, model=None, affinity_key="", resume_session_id="",
-        full_prompt_text=None, session_result=None,
-    ):
+    def fake_run_prompt(prompt_text, *, timeout_seconds, model=None, affinity_key=""):
         calls.append(prompt_text)
         if len(calls) == 1:
             return (
@@ -505,10 +502,7 @@ def test_run_prompt_receives_picker_model():
     client = CopilotACPClient(acp_cwd="/tmp")
     seen = {}
 
-    def fake_run_prompt(
-        prompt_text, *, timeout_seconds, model=None, affinity_key="", resume_session_id="",
-        full_prompt_text=None, session_result=None,
-    ):
+    def fake_run_prompt(prompt_text, *, timeout_seconds, model=None, affinity_key=""):
         seen["model"] = model
         seen["affinity_key"] = affinity_key
         return "ok", ""
@@ -706,9 +700,7 @@ def test_overlapping_sessions_reap_their_own_process(tmp_path):
 
     session_b.__exit__(None, None, None)
     assert proc_b.poll() is not None
-    assert client.is_closed is False, "child teardown must keep the reusable ACP facade open"
-    client.close()
-    assert client.is_closed is True
+    assert client.is_closed is True, "the last session to drain still flips is_closed for single-session callers"
 
 
 def test_close_terminates_every_live_session_process(tmp_path):
@@ -748,152 +740,3 @@ def test_cli_death_is_reported_as_a_crash_not_a_timeout(tmp_path):
         assert "exited early: fatal: agent segfaulted" in str(exc)
     else:
         raise AssertionError("session on a dead CLI must raise")
-def test_continuation_frontier_accepts_only_append_only_history():
-    from agent.copilot_acp_client import (
-        _ACPConversationState, _context_fingerprint, _continuation_delta,
-        _message_fingerprint, _response_fingerprint,
-    )
-
-    tools = [{"type": "function", "function": {"name": "read_state", "parameters": {}}}]
-    context_fp = _context_fingerprint("gemini-test", tools, None)
-    prior_request = [{"role": "user", "content": "start"}]
-    state = _ACPConversationState(
-        session_id="s1",
-        context_fingerprint=context_fp,
-        request_fingerprints=tuple(_message_fingerprint(m) for m in prior_request),
-        response_fingerprint=_response_fingerprint("FIRST", []),
-    )
-    continued = [
-        *prior_request,
-        {"role": "assistant", "content": "FIRST"},
-        {"role": "user", "content": "next"},
-    ]
-
-    assert _continuation_delta(continued, state, context_fp) == [{"role": "user", "content": "next"}]
-
-    mutated = [
-        {"role": "user", "content": "changed"},
-        {"role": "assistant", "content": "FIRST"},
-        {"role": "user", "content": "next"},
-    ]
-    assert _continuation_delta(mutated, state, context_fp) is None
-    assert _continuation_delta(continued, state, _context_fingerprint("other-model", tools, None)) is None
-
-
-def test_chat_completion_resumes_session_in_new_process_and_sends_delta_only(tmp_path):
-    server = tmp_path / "durable_acp.py"
-    log_path = tmp_path / "wire.jsonl"
-    session_path = tmp_path / "session.txt"
-    server.write_text(
-        f'''import json
-import pathlib
-import sys
-
-LOG = pathlib.Path({str(log_path)!r})
-SESSION = pathlib.Path({str(session_path)!r})
-
-def log(payload):
-    with LOG.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(payload) + "\\n")
-
-for line in sys.stdin:
-    request = json.loads(line)
-    method = request.get("method")
-    log({{"method": method}})
-    if method == "initialize":
-        result = {{"protocolVersion": 1, "agentCapabilities": {{"sessionCapabilities": {{"resume": {{}}}}}}}}
-    elif method == "session/new":
-        SESSION.write_text("durable-session", encoding="utf-8")
-        result = {{
-            "sessionId": "durable-session",
-            "configOptions": [{{
-                "id": "model", "category": "model", "currentValue": "gemini-test",
-                "options": [{{"value": "gemini-test", "name": "Gemini Test"}}],
-            }}],
-        }}
-    elif method == "session/resume":
-        sid = (request.get("params") or {{}}).get("sessionId")
-        if not SESSION.exists() or SESSION.read_text(encoding="utf-8") != sid:
-            print(json.dumps({{"jsonrpc":"2.0","id":request["id"],"error":{{"code":-32002,"message":"Session not found in the current GEMINI_HOME"}}}}), flush=True)
-            continue
-        result = {{"configOptions": []}}
-    elif method == "session/set_config_option":
-        result = {{}}
-    elif method == "session/prompt":
-        text = (request.get("params") or {{}}).get("prompt", [{{}}])[0].get("text", "")
-        log({{"prompt": text}})
-        reply = "SECOND" if "Hermes continuation delta" in text else "FIRST"
-        print(json.dumps({{
-            "jsonrpc": "2.0", "method": "session/update",
-            "params": {{"update": {{"sessionUpdate": "agent_message_chunk", "content": {{"text": reply}}}}}},
-        }}), flush=True)
-        result = {{"stopReason": "end_turn"}}
-    else:
-        result = {{}}
-    print(json.dumps({{"jsonrpc":"2.0","id":request["id"],"result":result}}), flush=True)
-''',
-        encoding="utf-8",
-    )
-    client = CopilotACPClient(command=sys.executable, args=[str(server)], acp_cwd=str(tmp_path))
-
-    first_messages = [{"role": "user", "content": "hello"}]
-    first = client._create_chat_completion(model="gemini-test", messages=first_messages, timeout=30)
-    assert first.choices[0].message.content == "FIRST"
-    assert client.is_closed is False
-
-    second_messages = [
-        *first_messages,
-        {"role": "assistant", "content": "FIRST"},
-        {"role": "user", "content": "next"},
-    ]
-    second = client._create_chat_completion(model="gemini-test", messages=second_messages, timeout=30)
-    assert second.choices[0].message.content == "SECOND"
-
-    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
-    methods = [event["method"] for event in events if "method" in event]
-    prompts = [event["prompt"] for event in events if "prompt" in event]
-    assert methods.count("session/new") == 1
-    assert methods.count("session/resume") == 1
-    assert methods.count("session/prompt") == 2
-    assert "Conversation transcript" in prompts[0]
-    assert "User:\nhello" in prompts[0]
-    assert "Hermes continuation delta" in prompts[1]
-    assert "User:\nnext" in prompts[1]
-    assert "User:\nhello" not in prompts[1]
-    client.close()
-
-
-def test_resume_miss_rebuilds_with_full_prompt_once(monkeypatch, tmp_path):
-    from contextlib import contextmanager
-
-    client = CopilotACPClient(acp_cwd=str(tmp_path))
-    seen = []
-
-    @contextmanager
-    def fake_session(timeout_seconds, *, allow_file_requests=True, affinity_key="", resume_session_id=""):
-        seen.append(("open", resume_session_id))
-        if resume_session_id:
-            raise RuntimeError("Copilot ACP session/resume failed: Session not found in the current GEMINI_HOME")
-
-        session = {"sessionId": "replacement", "configOptions": []}
-
-        def request(method, params, *, text_parts=None, reasoning_parts=None):
-            if method == "session/prompt":
-                text = params["prompt"][0]["text"]
-                seen.append(("prompt", text))
-                if text_parts is not None:
-                    text_parts.append("OK")
-            return {}
-
-        yield session, request
-
-    monkeypatch.setattr(client, "_session", fake_session)
-    result = {}
-    response = client._run_prompt(
-        "DELTA", timeout_seconds=30, model="gemini-test", affinity_key="sha256:test",
-        resume_session_id="old-session", full_prompt_text="FULL", session_result=result,
-    )
-
-    assert response == ("OK", "")
-    assert seen == [("open", "old-session"), ("open", ""), ("prompt", "FULL")]
-    assert result == {"session_id": "replacement", "resumed": False}
