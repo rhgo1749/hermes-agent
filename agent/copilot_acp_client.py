@@ -57,11 +57,6 @@ _TOOL_HISTORY_CONTINUATION_NOTE = (
     "only when new evidence makes a fresh read necessary. If a tool response says the state/result is unchanged or "
     "that repeating the call makes no progress, continue with the result already present instead of calling it again."
 )
-_DUPLICATE_NO_PROGRESS_CORRECTION = (
-    "Your proposed tool call exactly repeats the most recent completed call, and that call's tool response explicitly "
-    "reported that the result/state is unchanged. Do not repeat that same call. Continue from the existing result: "
-    "choose a different tool only if it advances the task, otherwise answer or perform the next required action."
-)
 _INITIALIZE_PARAMS = {
     "protocolVersion": 1,
     "clientCapabilities": {"fs": {"readTextFile": True, "writeTextFile": True}},
@@ -278,71 +273,6 @@ def _render_prompt_message(message: dict[str, Any], role: str) -> str:
     return content
 
 
-def _normalized_tool_arguments(arguments: Any) -> str:
-    if isinstance(arguments, str):
-        text = arguments.strip() or "{}"
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            return text
-        return json.dumps(parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return json.dumps(arguments if arguments is not None else {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
-
-
-def _tool_result_reports_unchanged(content: Any) -> bool:
-    text = _render_message_content(content)
-    if not text:
-        return False
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        parsed = None
-    if isinstance(parsed, dict) and parsed.get("unchanged") is True:
-        return True
-    compact = "".join(text.lower().split())
-    return '"unchanged":true' in compact
-
-
-def _latest_unchanged_tool_signature(messages: list[dict[str, Any]]) -> tuple[str, str] | None:
-    """Return the most recent completed tool call iff its result explicitly says unchanged."""
-    for index in range(len(messages) - 1, -1, -1):
-        message = messages[index]
-        if not isinstance(message, dict) or str(message.get("role") or "").strip().lower() != "tool":
-            continue
-        call_id = str(message.get("tool_call_id") or "").strip()
-        if not call_id or not _tool_result_reports_unchanged(message.get("content")):
-            return None
-        for prior in range(index - 1, -1, -1):
-            assistant = messages[prior]
-            if not isinstance(assistant, dict) or str(assistant.get("role") or "").strip().lower() != "assistant":
-                continue
-            for tool_call in assistant.get("tool_calls") or []:
-                if not isinstance(tool_call, dict) or str(tool_call.get("id") or "").strip() != call_id:
-                    continue
-                function = tool_call.get("function")
-                if not isinstance(function, dict):
-                    return None
-                name = str(function.get("name") or "").strip()
-                if not name:
-                    return None
-                return name, _normalized_tool_arguments(function.get("arguments", "{}"))
-        return None
-    return None
-
-
-def _repeats_latest_unchanged_call(messages: list[dict[str, Any]], tool_calls: list[Any]) -> bool:
-    if len(tool_calls) != 1:
-        return False
-    previous = _latest_unchanged_tool_signature(messages)
-    if previous is None:
-        return False
-    call = tool_calls[0]
-    function = getattr(call, "function", None)
-    name = str(getattr(function, "name", "") or "").strip()
-    arguments = getattr(function, "arguments", "{}")
-    return (name, _normalized_tool_arguments(arguments)) == previous
-
-
 def _render_message_content(content: Any) -> str:
     if content is None:
         return ""
@@ -466,18 +396,8 @@ class CopilotACPClient:
         tools: list[dict[str, Any]] | None = None, tool_choice: Any = None, stream: bool = False, **_: Any,
     ) -> Any:
         prompt_text = _format_messages_as_prompt(messages or [], model=model, tools=tools, tool_choice=tool_choice)
-        timeout_seconds = _effective_timeout(timeout)
-        started = time.monotonic()
-        response_text, reasoning = self._run_prompt(prompt_text, timeout_seconds=timeout_seconds, model=model)
+        response_text, reasoning = self._run_prompt(prompt_text, timeout_seconds=_effective_timeout(timeout), model=model)
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
-        if _repeats_latest_unchanged_call(messages or [], tool_calls):
-            remaining = timeout_seconds - (time.monotonic() - started)
-            if remaining > 0:
-                corrected_prompt = f"{prompt_text}\n\n{_DUPLICATE_NO_PROGRESS_CORRECTION}"
-                response_text, reasoning = self._run_prompt(
-                    corrected_prompt, timeout_seconds=remaining, model=model,
-                )
-                tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
         message = SimpleNamespace(
             content=cleaned_text, tool_calls=tool_calls, reasoning=reasoning or None, reasoning_content=reasoning or None,
             reasoning_details=None,
