@@ -7,7 +7,6 @@ as one prompt, collects text chunks, and returns the minimal OpenAI-client shape
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
 import logging
 import os
@@ -372,33 +371,6 @@ def _render_message_content(content: Any) -> str:
     return str(content).strip()
 
 
-def _conversation_affinity(messages: list[dict[str, Any]], cwd: str) -> str:
-    """Opaque stable key for account/cache locality across short-lived ACP sessions.
-
-    Only the immutable opening prefix through the first user message participates, so
-    later tool/user turns do not move a conversation between provider account caches.
-    The subprocess receives only the digest, never prompt text.
-    """
-    opening: list[str] = []
-    saw_user = False
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        role = str(message.get("role") or "").strip().lower()
-        if role in {"assistant", "tool"}:
-            break
-        if role not in {"system", "context", "user"}:
-            continue
-        opening.append(f"{role}\0{_render_message_content(message.get('content'))}")
-        if role == "user":
-            saw_user = True
-            break
-    if not saw_user:
-        return ""
-    material = f"{Path(cwd).resolve()}\0" + "\0".join(opening)
-    return "sha256:" + hashlib.sha256(material.encode("utf-8", errors="surrogatepass")).hexdigest()
-
-
 def _ensure_path_within_cwd(path_text: str, cwd: str, *, verb: str) -> Path:
     # Raw-string check BEFORE resolve(): resolving an NT-namespace path is the NTLM-leak trigger.
     if nt_error := get_nt_namespace_error(path_text, verb=verb):
@@ -507,14 +479,10 @@ class CopilotACPClient:
         self, *, model: str | None = None, messages: list[dict[str, Any]] | None = None, timeout: float | None = None,
         tools: list[dict[str, Any]] | None = None, tool_choice: Any = None, stream: bool = False, **_: Any,
     ) -> Any:
-        request_messages = messages or []
-        prompt_text = _format_messages_as_prompt(request_messages, model=model, tools=tools, tool_choice=tool_choice)
-        affinity_key = _conversation_affinity(request_messages, self._acp_cwd)
+        prompt_text = _format_messages_as_prompt(messages or [], model=model, tools=tools, tool_choice=tool_choice)
         timeout_seconds = _effective_timeout(timeout)
         started = time.monotonic()
-        response_text, reasoning = self._run_prompt(
-            prompt_text, timeout_seconds=timeout_seconds, model=model, affinity_key=affinity_key,
-        )
+        response_text, reasoning = self._run_prompt(prompt_text, timeout_seconds=timeout_seconds, model=model)
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
         duplicate_signature = _latest_unchanged_tool_signature(messages or [])
         if duplicate_signature is not None and _repeats_latest_unchanged_call(messages or [], tool_calls):
@@ -533,7 +501,7 @@ class CopilotACPClient:
                     f"Blocked tool: {blocked_name}. Correction attempt {correction_index + 1}."
                 )
                 response_text, reasoning = self._run_prompt(
-                    corrected_prompt, timeout_seconds=remaining, model=model, affinity_key=affinity_key,
+                    corrected_prompt, timeout_seconds=remaining, model=model,
                 )
                 tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
                 if not _repeats_latest_unchanged_call(messages or [], tool_calls):
@@ -558,7 +526,7 @@ class CopilotACPClient:
         )
         return _completion_to_stream_chunks(completion) if stream else completion
 
-    def _spawn(self, *, affinity_key: str = "") -> subprocess.Popen[str]:
+    def _spawn(self) -> subprocess.Popen[str]:
         # Fast-fail when the CLI rejects --acp (else the parent waits the full child timeout for stdout that
         # never arrives). ``None`` falls through to the spawn's established start error.
         if _acp_supported(self._acp_command, self._acp_args) is False:
@@ -574,12 +542,9 @@ class CopilotACPClient:
 
             # Hide the console the CLI child would otherwise flash on Windows (#56747). Hide-only — stdio
             # pipes stay intact for the ACP wire.
-            child_env = _build_subprocess_env()
-            if affinity_key:
-                child_env["ACP_MUX_AFFINITY"] = affinity_key
             proc = subprocess.Popen(
                 [self._acp_command] + self._acp_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding='utf-8', errors='replace', bufsize=1, cwd=self._acp_cwd, env=child_env,
+                text=True, encoding='utf-8', errors='replace', bufsize=1, cwd=self._acp_cwd, env=_build_subprocess_env(),
                 creationflags=windows_hide_flags(),
             )
         except FileNotFoundError as exc:
@@ -595,10 +560,10 @@ class CopilotACPClient:
 
     @contextlib.contextmanager
     def _session(
-        self, timeout_seconds: float, *, allow_file_requests: bool = True, affinity_key: str = ""
+        self, timeout_seconds: float, *, allow_file_requests: bool = True
     ) -> Iterator[tuple[dict[str, Any], Callable[..., Any]]]:
         """Start one ACP process and yield its ``session/new`` result plus request callable."""
-        proc = self._spawn(affinity_key=affinity_key)
+        proc = self._spawn()
         inbox: queue.Queue[dict[str, Any]] = queue.Queue()
         stderr_tail: deque[str] = deque(maxlen=40)
 
@@ -665,13 +630,11 @@ class CopilotACPClient:
         with self._session(timeout_seconds, allow_file_requests=False) as (session, _):
             return _session_model_ids(session)
 
-    def _run_prompt(
-        self, prompt_text: str, *, timeout_seconds: float, model: str | None = None, affinity_key: str = ""
-    ) -> tuple[str, str]:
+    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float, model: str | None = None) -> tuple[str, str]:
         # The CLI's `--model` spawn flag is deliberately NOT used: `copilot --acp` validates it (unknown id
         # aborts the spawn) but ignores it for the session; the model is applied after session/new instead.
         requested_model = str(model or "").strip()
-        with self._session(timeout_seconds, affinity_key=affinity_key) as (session, _request):
+        with self._session(timeout_seconds) as (session, _request):
             session_id = str(session.get("sessionId") or "").strip()
             if requested_model and requested_model != "copilot-acp":
                 try:

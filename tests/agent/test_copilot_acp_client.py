@@ -424,7 +424,7 @@ def test_repeated_unchanged_tool_call_is_corrected_inside_acp_bridge():
     ]
     calls = []
 
-    def fake_run_prompt(prompt_text, *, timeout_seconds, model=None, affinity_key=""):
+    def fake_run_prompt(prompt_text, *, timeout_seconds, model=None):
         calls.append(prompt_text)
         if len(calls) == 1:
             return (
@@ -502,9 +502,8 @@ def test_run_prompt_receives_picker_model():
     client = CopilotACPClient(acp_cwd="/tmp")
     seen = {}
 
-    def fake_run_prompt(prompt_text, *, timeout_seconds, model=None, affinity_key=""):
+    def fake_run_prompt(prompt_text, *, timeout_seconds, model=None):
         seen["model"] = model
-        seen["affinity_key"] = affinity_key
         return "ok", ""
 
     with patch.object(CopilotACPClient, "_run_prompt", side_effect=fake_run_prompt):
@@ -512,54 +511,6 @@ def test_run_prompt_receives_picker_model():
             model="gpt-5.6-terra", messages=[{"role": "user", "content": "hi"}]
         )
     assert seen["model"] == "gpt-5.6-terra"
-    assert seen["affinity_key"].startswith("sha256:")
-
-
-def test_conversation_affinity_is_stable_across_later_turns_and_opaque(tmp_path):
-    from agent.copilot_acp_client import _conversation_affinity
-
-    opening = [
-        {"role": "system", "content": "private-system-text"},
-        {"role": "user", "content": "private-user-text"},
-    ]
-    later = opening + [
-        {"role": "assistant", "content": "", "tool_calls": []},
-        {"role": "tool", "tool_call_id": "x", "content": "later-result"},
-        {"role": "user", "content": "later-user-turn"},
-    ]
-    first = _conversation_affinity(opening, str(tmp_path))
-    second = _conversation_affinity(later, str(tmp_path))
-
-    assert first == second
-    assert first.startswith("sha256:")
-    assert "private" not in first
-    assert _conversation_affinity([{"role": "user", "content": "different"}], str(tmp_path)) != first
-
-
-def test_spawn_exports_only_opaque_affinity_to_mux(monkeypatch, tmp_path):
-    captured = {}
-    client = _make_home_client(tmp_path)
-
-    class _Proc:
-        stdin = io.StringIO()
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        def poll(self): return None
-        def terminate(self): pass
-        def wait(self, timeout=None): return 0
-        def kill(self): pass
-
-    def fake_popen(cmd, **kwargs):
-        captured["env"] = kwargs["env"]
-        return _Proc()
-
-    monkeypatch.setattr("agent.copilot_acp_client._acp_supported", lambda *_: True)
-    monkeypatch.setattr("agent.copilot_acp_client.subprocess.Popen", fake_popen)
-    proc = client._spawn(affinity_key="sha256:abc123")
-    try:
-        assert captured["env"]["ACP_MUX_AFFINITY"] == "sha256:abc123"
-    finally:
-        client._release_process(proc)
 
 
 def test_list_models_reads_enabled_session_config_options(tmp_path):
@@ -669,8 +620,8 @@ def _recording_client(tmp_path, spawned):
     client = CopilotACPClient(command=sys.executable, args=[str(server)], acp_cwd=str(tmp_path))
     real_spawn = client._spawn
 
-    def record_spawn(*, affinity_key=""):
-        proc = real_spawn(affinity_key=affinity_key)
+    def record_spawn():
+        proc = real_spawn()
         spawned.append(proc)
         return proc
 
