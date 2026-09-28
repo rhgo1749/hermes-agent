@@ -50,13 +50,6 @@ _PROMPT_PREAMBLE = (
     "IMPORTANT: If you take an action with a tool, you MUST output tool calls using <tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
     "If no tool is needed, answer normally.",
 )
-_TOOL_HISTORY_CONTINUATION_NOTE = (
-    "Continuation rule: tool calls and tool responses in the conversation transcript are completed past actions. "
-    "Use their returned content as current evidence. Do not repeat an identical tool call merely because a standing "
-    "system instruction says to call that tool first, orient, initialize, or inspect state. Repeat a completed call "
-    "only when new evidence makes a fresh read necessary. If a tool response says the state/result is unchanged or "
-    "that repeating the call makes no progress, continue with the result already present instead of calling it again."
-)
 _INITIALIZE_PARAMS = {
     "protocolVersion": 1,
     "clientCapabilities": {"fs": {"readTextFile": True, "writeTextFile": True}},
@@ -213,26 +206,8 @@ def _format_messages_as_prompt(
             transcript.append(f"{_ROLE_LABELS.get(role, 'Context')}:\n{rendered}")
     if transcript:
         sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
-    if _has_completed_tool_history(messages):
-        sections.append(_TOOL_HISTORY_CONTINUATION_NOTE)
     sections.append("Continue the conversation from the latest user request.")
     return "\n\n".join(section.strip() for section in sections if section and section.strip())
-
-
-def _has_completed_tool_history(messages: list[dict[str, Any]]) -> bool:
-    """Whether replay history contains at least one tool result tied to a prior call.
-
-    ACP backends receive OpenAI history flattened into prompt text on every turn. A
-    completed tool row must therefore be called out explicitly as *history*, otherwise
-    some backends reinterpret standing "call X first" instructions as a fresh action on
-    every continuation turn and loop on the same tool despite already having its result.
-    """
-    return any(
-        isinstance(message, dict)
-        and str(message.get("role") or "").strip().lower() == "tool"
-        and bool(str(message.get("tool_call_id") or "").strip())
-        for message in messages
-    )
 
 
 def _render_prompt_message(message: dict[str, Any], role: str) -> str:
