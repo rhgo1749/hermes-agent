@@ -202,50 +202,12 @@ def _format_messages_as_prompt(
     transcript: list[str] = []
     for message in (m for m in messages if isinstance(m, dict)):
         role = str(message.get("role") or "unknown").strip().lower()
-        if rendered := _render_prompt_message(message, role):
+        if rendered := _render_message_content(message.get("content")):
             transcript.append(f"{_ROLE_LABELS.get(role, 'Context')}:\n{rendered}")
     if transcript:
         sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
     sections.append("Continue the conversation from the latest user request.")
     return "\n\n".join(section.strip() for section in sections if section and section.strip())
-
-
-def _render_prompt_message(message: dict[str, Any], role: str) -> str:
-    """Render one history row without orphaning tool results from their calls."""
-    content = _render_message_content(message.get("content"))
-
-    if role == "assistant":
-        parts = [content] if content else []
-        for tool_call in message.get("tool_calls") or []:
-            if not isinstance(tool_call, dict):
-                continue
-            function = tool_call.get("function")
-            if not isinstance(function, dict) or not str(function.get("name") or "").strip():
-                continue
-            payload = {
-                "id": str(tool_call.get("id") or ""),
-                "type": str(tool_call.get("type") or "function"),
-                "function": {
-                    "name": str(function.get("name") or ""),
-                    "arguments": function.get("arguments", "{}"),
-                },
-            }
-            parts.append(f"<tool_call>\n{json.dumps(payload, ensure_ascii=False, default=str)}\n</tool_call>")
-        return "\n".join(parts).strip()
-
-    if role == "tool" and message.get("tool_call_id"):
-        result: Any = content
-        if content.lstrip().startswith(("{", "[")):
-            try:
-                result = json.loads(content)
-            except json.JSONDecodeError:
-                pass
-        payload: dict[str, Any] = {"tool_call_id": str(message["tool_call_id"]), "content": result}
-        if message.get("name"):
-            payload["name"] = str(message["name"])
-        return f"<tool_response>\n{json.dumps(payload, ensure_ascii=False, default=str)}\n</tool_response>"
-
-    return content
 
 
 def _render_message_content(content: Any) -> str:
