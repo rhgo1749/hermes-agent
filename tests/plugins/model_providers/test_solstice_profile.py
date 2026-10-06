@@ -4,6 +4,9 @@ brokered OAuth row with an opaque bearer rotates on its stored expiry."""
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import subprocess
+import sys
 import time
 
 import hermes_cli.auth
@@ -20,6 +23,21 @@ def _pool_row(provider: str, *, access: str, expires_at_ms: int) -> dict:
 
 def _write_pool(home, provider: str, row: dict) -> None:
     (home / "auth.json").write_text(json.dumps({"version": 1, "credential_pool": {provider: [row]}}))
+
+
+def test_solstice_discovery_keeps_runtime_transport_lazy():
+    root = Path(__file__).resolve().parents[3]
+    script = """
+import sys
+import providers
+
+assert "agent.gemini_native_adapter" not in sys.modules
+profile = providers.get_provider_profile("solstice")
+assert profile is not None and profile.name == "solstice"
+assert "agent.gemini_native_adapter" not in sys.modules
+"""
+    result = subprocess.run([sys.executable, "-c", script], cwd=root, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def test_solstice_is_off_every_discovery_surface_until_signed_in_but_always_resolves(monkeypatch, tmp_path):
