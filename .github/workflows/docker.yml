@@ -149,12 +149,12 @@ jobs:
         variant: [slim, desktop]
         include:
           - arch: amd64
-            runner: ubuntu-latest-32-core
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
             platform: linux/amd64
           # arm64 builds on the native arm64 larger runner. A build of
           # linux/arm64 on an x64 host uses emulation.
           - arch: arm64
-            runner: ubuntu-latest-32-arm-core
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-arm-core' || 'ubuntu-24.04-arm' }}
             platform: linux/arm64
 
     runs-on: ${{ matrix.runner }}

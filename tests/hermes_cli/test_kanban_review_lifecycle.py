@@ -188,6 +188,28 @@ def test_request_review_unknown_task_returns_false(kanban_home: Path) -> None:
         assert kb.request_review(conn, "t_deadbeefcafe") is False
 
 
+def test_parked_completion_refuses_late_reviewer_without_writes(kanban_home: Path) -> None:
+    """The parked handoff remains atomic and completion rechecks its authority."""
+    with kbc.connect() as conn, kbc.connect() as other:
+        tid = kb.create_task(conn, title="parked handoff", assignee="worker")
+        assert kb.request_review(conn, tid, park=True, expected_status="ready") is True
+        parked = kb.get_task(conn, tid)
+        assert parked is not None
+        assert parked.status == "review" and parked.assignee is None
+        assert parked.current_run_id is None
+        payload = _events(conn, tid, kind="review_requested")[-1][1]
+        assert payload is not None and payload["parked"] is True
+        assert kb.assign_task(other, tid, "reviewer") is True
+        before = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
+        events = _events(conn, tid)
+        runs = conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0]
+        with pytest.raises(kb.ParkedReviewGuardError, match="assignee"):
+            kb.complete_task(conn, tid, summary="stale approval", require_parked=True)
+        assert dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()) == before
+        assert _events(conn, tid) == events
+        assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0] == runs
+
+
 def test_request_review_refuses_to_clear_live_claim_without_ownership(
     kanban_home: Path,
 ) -> None:

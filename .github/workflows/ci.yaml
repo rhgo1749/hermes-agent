@@ -17,6 +17,11 @@ name: CI
 on:
   workflow_dispatch:
     inputs:
+      base_ref:
+        description: 'Base branch for manual validation (PRs use their actual target SHA).'
+        required: false
+        type: string
+        default: main
       release:
         description: 'Stable-release candidate run: force every applicability lane and make the aggregate gate strict (skipped required lanes fail).'
         required: false
@@ -24,6 +29,11 @@ on:
         default: false
   workflow_call:
     inputs:
+      base_ref:
+        description: 'Base branch for manual validation (PRs use their actual target SHA).'
+        required: false
+        type: string
+        default: main
       release:
         description: 'Stable-release candidate run: force every applicability lane and make the aggregate gate strict (skipped required lanes fail).'
         required: false
@@ -153,6 +163,7 @@ jobs:
     uses: ./.github/workflows/lint.yml
     with:
       event_name: ${{ needs.detect.outputs.event_name }}
+      base_ref: ${{ inputs.base_ref || 'main' }}
       python: ${{ needs.detect.outputs.python == 'true' }}
 
   js-tests:
@@ -231,6 +242,8 @@ jobs:
     needs: detect
     if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/contributor-check.yml
+    with:
+      base_ref: ${{ inputs.base_ref || 'main' }}
 
   uv-lockfile:
     name: Check uv.lock
