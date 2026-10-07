@@ -87,4 +87,12 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        # Each check already sizes its own worker pool from the runner cores.
+        # Avoid nested pool contention on standard fork runners without changing
+        # test selection or timeouts; upstream keeps its larger-runner schedule.
+        run: |
+          if [ "$GITHUB_REPOSITORY" = 'NousResearch/hermes-agent' ]; then
+            node .github/scripts/run-workspace-checks.mjs
+          else
+            node .github/scripts/run-workspace-checks.mjs --concurrency 1
+          fi
