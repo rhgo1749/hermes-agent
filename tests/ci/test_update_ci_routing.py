@@ -105,7 +105,8 @@ def _inputs_for(called: str, given: dict[str, Any]) -> dict[str, Any]:
     return {name: given.get(name, spec.get("default")) for name, spec in declared.items()}
 
 
-def _run_workflow(rel: str, *, inputs: dict[str, Any], detect: dict[str, Any] | None = None) -> dict:
+def _run_workflow(rel: str, *, inputs: dict[str, Any], detect: dict[str, Any] | None = None,
+                  event_name: str = "pull_request") -> dict:
     """Which jobs of ``rel`` run on a pull request, recursing into called workflows.
 
     Returns ``{job: {"inputs": ..., "jobs": <child result>}}`` for every job that runs.
@@ -132,7 +133,7 @@ def _run_workflow(rel: str, *, inputs: dict[str, Any], detect: dict[str, Any] | 
             all_ran = all(n in ran for n in needs)
             ctx = {
                 "inputs": inputs,
-                "github": {"event_name": "pull_request", "ref_type": "branch"},
+                "github": {"event_name": event_name, "ref_type": "branch"},
                 "needs": {n: {"outputs": (ran.get(n) or {}).get("outputs", {}),
                               "result": "success" if n in ran else "skipped"} for n in needs},
                 "__status__": {"always": True, "success": all_ran, "failure": False, "cancelled": False},
@@ -153,14 +154,23 @@ def _run_workflow(rel: str, *, inputs: dict[str, Any], detect: dict[str, Any] | 
                 called = uses[2:]
                 given = {k: gha.render(v, ctx) for k, v in (body.get("with") or {}).items()}
                 entry["inputs"] = _inputs_for(called, given)
-                entry["jobs"] = _run_workflow(called, inputs=entry["inputs"])
+                entry["jobs"] = _run_workflow(called, inputs=entry["inputs"], event_name=event_name)
             ran[name] = entry
         assert progressed, f"{rel}: unresolvable needs among {pending}"
     return ran
 
 
 def _ci_run(lanes: dict[str, bool]) -> dict:
-    return _run_workflow(".github/workflows/ci.yaml", inputs={}, detect=_detect_outputs(lanes))
+    detect = _detect_outputs(lanes)
+    run = _run_workflow(".github/workflows/ci.yaml", inputs={}, detect=detect)
+    standalone = _yaml(".github/workflows/windows-install-update-e2e.yml")["jobs"]["detect"]
+    classify = next(s for s in standalone["steps"] if s.get("id") == "classify")
+    assert classify["uses"] == "./.github/actions/detect-changes"
+    assert standalone["outputs"]["e2e_upgrade"] == "${{ steps.classify.outputs.e2e_upgrade }}"
+    run["windows-install-update-e2e"] = {"jobs": _run_workflow(
+        ".github/workflows/windows-install-update-e2e.yml", inputs={}, detect=detect)}
+    assert _reached(run, "tests-os", "install-update-e2e", "install-update") is None
+    return run
 
 
 def _reached(run: dict, *path: str) -> dict | None:
@@ -179,6 +189,8 @@ def _selected_test_files(node: dict, name: str, *, windows_only: bool = False) -
     matrix = body.get("strategy", {}).get("matrix", {})
     if "shard" in matrix:
         cells = [{"shard": s} for s in gha.render(matrix["shard"], ctx)]
+    elif "slice" in matrix:
+        cells = [{"slice": s} for s in gha.render(matrix["slice"], ctx)]
     else:
         cells = matrix.get("include", [{}])
     if windows_only:
@@ -208,12 +220,12 @@ def _windows_desktop_updater_tests_selected(run: dict) -> bool:
     return expected <= selected
 
 
-# Each real consumer of a lane, as a path of job names from ci.yaml down.
+# Each real consumer, including the independent Windows workflow outside the aggregate.
 _CONSUMERS: dict[str, tuple[tuple[str, ...], ...]] = {
     "e2e_upgrade": (
         ("tests", "e2e-upgrade-plan"),
         ("tests", "e2e-upgrade"),
-        ("tests-os", "install-update-e2e", "install-update"),
+        ("windows-install-update-e2e", "install-update"),
     ),
     "e2e": (("tests", "e2e"), ("tests-os", "e2e-windows")),
     "e2e_desktop_update": (("e2e-desktop-update", "update"),),
@@ -792,12 +804,12 @@ def _strict_env(run: dict, path: tuple[str, ...], rel: str, job: str, step_name:
     return gha.to_string(gha.render(step["env"]["HERMES_E2E_STRICT_ACCEPTANCE"], node["ctx"]))
 
 
-@pytest.mark.parametrize("value", ["upd-txn", "1"])
-def test_strict_acceptance_dispatch_reaches_every_e2e_suite(value):
+@pytest.mark.parametrize("value,release", [("upd-txn", False), ("1", False), ("", True)])
+def test_strict_acceptance_dispatch_reaches_every_e2e_suite(value, release):
     """`gh workflow run ci.yaml -f strict_acceptance=upd-txn` (the batch's acceptance run)."""
     lanes = cc.classify([])  # a dispatch has no diff: every lane on
-    run = _run_workflow(".github/workflows/ci.yaml", inputs={"release": False, "strict_acceptance": value},
-                        detect=_detect_outputs(lanes))
+    run = _run_workflow(".github/workflows/ci.yaml", inputs={"release": release, "strict_acceptance": value},
+                        detect=_detect_outputs(lanes), event_name="workflow_dispatch")
     for path, rel, job, step in _STRICT_STEPS:
         assert _strict_env(run, path, rel, job, step) == value, "/".join(path)
 
@@ -805,16 +817,20 @@ def test_strict_acceptance_dispatch_reaches_every_e2e_suite(value):
 def test_pull_requests_never_run_strict():
     run = _ci_run(cc.classify([]))
     for path, rel, job, step in _STRICT_STEPS:
+        if job == "install-update":
+            path = ("windows-install-update-e2e", "install-update")
         assert _strict_env(run, path, rel, job, step) == "", "/".join(path)
 
 
-def test_windows_install_update_dispatch_alone_sets_strict():
+@pytest.mark.parametrize("event_name,value", [("workflow_dispatch", "upd-txn"),
+                                              ("workflow_dispatch", ""), ("schedule", "")])
+def test_windows_install_update_dispatch_alone_sets_strict(event_name, value):
     jobs = _run_workflow(".github/workflows/windows-install-update-e2e.yml",
-                         inputs={"strict_acceptance": "upd-txn"})
+                         inputs={"strict_acceptance": value}, event_name=event_name)
     assert _strict_env({"w": {"jobs": jobs}}, ("w", "install-update"),
                        ".github/workflows/windows-install-update-e2e.yml", "install-update",
-                       "Run Windows install + update E2E") == "upd-txn"
-    assert "workflow_dispatch" in _on(_yaml(".github/workflows/windows-install-update-e2e.yml"))
+                       "Run Windows install + update E2E") == value
+    assert event_name in _on(_yaml(".github/workflows/windows-install-update-e2e.yml"))
 
 
 def test_run_tests_forwards_the_strict_switch():

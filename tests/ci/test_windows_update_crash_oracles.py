@@ -228,7 +228,7 @@ def test_orphan_marker_guard_fires_once_the_fix_lands(monkeypatch):
 # Review 5411223855 (F52): a runtime proof the crash file ran, beside the static selection check
 # above: a lost opt-in env or any other zero-execution path also exits 0 per file.
 def test_workflow_requires_the_crash_journey_manifest(tmp_path, monkeypatch):
-    from tests.ci import workflow_steps
+    from tests.ci import _gha_expr as gha, workflow_steps
 
     yaml = pytest.importorskip("hermes_yaml")
     wf = yaml.safe_load((_REPO / ".github/workflows/windows-install-update-e2e.yml").read_text(encoding="utf-8-sig"))
@@ -236,7 +236,24 @@ def test_workflow_requires_the_crash_journey_manifest(tmp_path, monkeypatch):
     names = [s.get("name") for s in steps]
     run, check = steps[names.index("Run Windows install + update E2E")], steps[names.index("Every crash cell ran")]
     assert names.index("Every crash cell ran") > names.index("Run Windows install + update E2E")
-    workflow_steps.required(check, {"inputs": {}})  # neither disabled nor advisory
+    all_files = {path.relative_to(_REPO).as_posix() for path in (_REPO / _SUITE).glob("test_*.py")}
+    for repository, count in (("NousResearch/hermes-agent", 1), ("rhgo1749/hermes-agent", 3)):
+        seen = []
+        checked = 0
+        for index in range(1, count + 1):
+            ctx = {"inputs": {}, "github": {"repository": repository}, "matrix": {"slice": f"{index}/{count}"}}
+            outputs, _ = workflow_steps._run(run, ctx, _REPO, receipt=True)
+            selected = workflow_steps.selected_files(run, ctx, _REPO)
+            seen.extend(selected)
+            crash_selected = f"{_SUITE}/test_crash_cells.py" in selected
+            assert outputs["crash_cells_selected"] == str(crash_selected).lower()
+            ctx["steps"] = {"e2e": {"outputs": outputs}}
+            assert gha.condition(check.get("if"), ctx) == crash_selected
+            if crash_selected:
+                workflow_steps.required(check, ctx)  # owning slice is neither disabled nor advisory
+                checked += 1
+        assert set(seen) == all_files and len(seen) == len(all_files)
+        assert checked == 1
     assert check["env"]["HERMES_E2E_ARTIFACTS"] == run["env"]["HERMES_E2E_ARTIFACTS"]
     assert f"'{crash.CELLS_RAN_MANIFEST}'" in check["run"] and "throw" in check["run"]
 

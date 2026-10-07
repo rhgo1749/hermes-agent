@@ -51,10 +51,10 @@ on:
       e2e_upgrade:
         description: >-
           Run the Windows install + update journey (tests/e2e/core/windows_update).
-          A slow lane; a caller that passes nothing gets it.
+          Explicit release/acceptance validation; ordinary PRs use the independent path/nightly workflow.
         type: boolean
         required: false
-        default: true
+        default: false
       strict_acceptance:
         description: >-
           Acceptance runs only: known_failure owners whose gaps FAIL this run instead of xfailing ('upd-txn', a comma list, or '1' for every gap). Sets HERMES_E2E_STRICT_ACCEPTANCE for the E2E suites (tests/e2e/core/_pending_fixes.py).
