@@ -34,6 +34,11 @@ on:
         type: boolean
         required: true
         default: true
+      diagnose_windows:
+        description: Measure existing marker and lineage cases on one standard x64 runner; not an acceptance run.
+        type: boolean
+        required: false
+        default: false
   workflow_call:
     inputs:
       desktop_updater:
@@ -281,7 +286,7 @@ jobs:
           exit 1
 
   failed-windows-files:
-    if: inputs.rerun_windows
+    if: inputs.rerun_windows && !inputs.diagnose_windows
     name: Retry ${{ matrix.arch }} / ${{ matrix.file }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
@@ -331,3 +336,117 @@ jobs:
           OPENROUTER_API_KEY: ''
           OPENAI_API_KEY: ''
           NOUS_API_KEY: ''
+
+
+  windows-diagnostics:
+    if: github.event_name == 'workflow_dispatch' && inputs.rerun_windows && inputs.diagnose_windows
+    name: Diagnose Windows hand-off startup (not acceptance)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      HERMES_TEST_WORKERS: '1'
+      HERMES_TEST_FILE_TIMEOUT: '300'
+      HERMES_TEST_FILE_RETRIES: '0'
+      OPENROUTER_API_KEY: ''
+      OPENAI_API_KEY: ''
+      NOUS_API_KEY: ''
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - name: Set up locked Python and test dependencies
+        uses: ./.github/actions/setup-pm
+        with:
+          packages: git,ripgrep
+          extras: '["all", "telegram", "anthropic", "mistral", "fal", "modal", "daytona", "parallel-web"]'
+          test-environment: 'true'
+          prune-python-cache: true
+      - name: Run two existing cases without instrumentation
+        id: control
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/handoff-diagnostics"
+          scripts/run_tests.sh \
+            tests/scripts/desktop_update/test_desktop_update_windows_marker.py \
+            tests/scripts/desktop_update/test_desktop_update_windows_handoff_lineage.py -- \
+            -m "platforms and not integration" \
+            -k 'test_claim_is_the_first_action_and_writes_a_v2_body or (test_handoff_run_adopts_only_the_desktop_bridge_for_that_run and ok)' \
+            -v --tb=long --durations=0 |& tee "$RUNNER_TEMP/handoff-diagnostics/control.log"
+      - name: Record native startup controls and instrument only this disposable checkout
+        id: instrument
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'handoff-diagnostics'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors |
+            ConvertTo-Json | Set-Content (Join-Path $dir 'cpu.json')
+          $ps = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
+          $controls = @(
+            '[Console]::WriteLine($PSVersionTable.PSVersion)',
+            'Get-CimInstance Win32_Process -Filter ("ProcessId=" + $PID) | Select-Object ProcessId',
+            'Add-Type -TypeDefinition "public class HermesDiagnosticBaseline {}"'
+          )
+          foreach ($command in $controls) {
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            & $ps -NoProfile -NonInteractive -Command $command
+            if ($LASTEXITCODE -ne 0) { throw "native control failed: $command" }
+            "$command`t$($watch.Elapsed.TotalMilliseconds)" | Add-Content (Join-Path $dir 'native-controls.tsv')
+          }
+          $template = @'
+          & {
+            $__diagWatch = [Diagnostics.Stopwatch]::StartNew()
+            $__diagFile = Join-Path '__TRACE_ROOT__' ("phases-" + $PID + ".tsv")
+            [IO.File]::AppendAllText($__diagFile, ("{0:o}`t{1}`t__LABEL__`tstart`n" -f [DateTime]::UtcNow, $PID))
+            try { __COMMAND__ } finally {
+              [IO.File]::AppendAllText($__diagFile, ("{0:o}`t{1}`t__LABEL__`tend`t{2}`n" -f [DateTime]::UtcNow, $PID, $__diagWatch.Elapsed.TotalMilliseconds))
+            }
+          }
+          '@
+          foreach ($name in 'windows.ps1', 'marker.ps1', 'marker-claim.ps1', 'update-job.ps1', 'runtime.ps1') {
+            $path = Join-Path 'scripts/desktop-update' $name
+            $source = [IO.File]::ReadAllText((Resolve-Path $path))
+            Get-FileHash $path | Format-List | Out-String | Add-Content (Join-Path $dir 'original-hashes.txt')
+            $tokens = $null; $errors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+            if ($errors.Count) { throw "original parse error in $name : $errors" }
+            $commands = @($ast.FindAll({ param($node)
+              $node -is [Management.Automation.Language.CommandAst] -and
+                $node.GetCommandName() -in 'Add-Type', 'Get-CimInstance'
+            }, $true) | Sort-Object { $_.Extent.StartOffset } -Descending)
+            foreach ($node in $commands) {
+              $label = "$name`:$($node.Extent.StartLineNumber):$($node.GetCommandName())"
+              $replacement = $template.Replace('__TRACE_ROOT__', $dir.Replace("'", "''")).Replace('__LABEL__', $label).Replace('__COMMAND__', $node.Extent.Text)
+              $source = $source.Remove($node.Extent.StartOffset, $node.Extent.EndOffset - $node.Extent.StartOffset).
+                Insert($node.Extent.StartOffset, $replacement)
+            }
+            if ($name -eq 'windows.ps1') {
+              $traceRoot = $dir.Replace("'", "''")
+              $entry = "`n[IO.File]::AppendAllText((Join-Path '$traceRoot' (`"phases-`" + `$PID + `".tsv`")), (`"{0:o}`t{1}`tBOOT`n`" -f [DateTime]::UtcNow, `$PID))`n"
+              $source = $source.Insert($ast.ParamBlock.Extent.EndOffset, $entry)
+            }
+            $null = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+            if ($errors.Count) { throw "instrumented parse error in $name : $errors" }
+            [IO.File]::WriteAllText((Resolve-Path $path), $source, [Text.UTF8Encoding]::new($false))
+            "$name`t$($commands.Count) commands" | Add-Content (Join-Path $dir 'instrumentation.txt')
+          }
+          git diff -- scripts/desktop-update | Set-Content (Join-Path $dir 'disposable-instrumentation.diff')
+      - name: Run the same existing cases with phase timing
+        if: ${{ !cancelled() && steps.instrument.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          scripts/run_tests.sh \
+            tests/scripts/desktop_update/test_desktop_update_windows_marker.py \
+            tests/scripts/desktop_update/test_desktop_update_windows_handoff_lineage.py -- \
+            -m "platforms and not integration" \
+            -k 'test_claim_is_the_first_action_and_writes_a_v2_body or (test_handoff_run_adopts_only_the_desktop_bridge_for_that_run and ok)' \
+            -v --tb=long --durations=0 |& tee "$RUNNER_TEMP/handoff-diagnostics/instrumented.log"
+      - name: Preserve diagnostics even when a selected file times out
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-handoff-diagnostics-x64-${{ github.sha }}
+          path: ${{ runner.temp }}/handoff-diagnostics/
+          if-no-files-found: error
+          retention-days: 7
