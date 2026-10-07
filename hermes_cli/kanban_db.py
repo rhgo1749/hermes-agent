@@ -1,3 +1,6 @@
+# health: allow FILE_LINES -- H4V3 fork ops: transient parked-review compat seam
+# (~165 lines) that retires once upstream NousResearch/hermes-agent#107718 primitives
+# land; sibling extraction is deliberately deferred to keep the operational diff minimal.
 """SQLite-backed Kanban board shared across profiles (the cross-profile coordination primitive).
 
 Lives under the shared Hermes root: ``default`` board DB at ``<root>/kanban.db`` (pre-boards
@@ -1324,7 +1327,7 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
-def create_task(
+def create_task(  # health: allow CC -- the idempotency re-check must share this BEGIN IMMEDIATE txn; a sibling extract would duplicate lock discipline
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
     workspace_kind: Optional[str] = None, workspace_path: Optional[str] = None,
@@ -3524,7 +3527,7 @@ def redact_review_value(value: Any) -> Any:
     return value
 
 
-def request_review(
+def request_review(  # health: allow CC -- park CAS stays inside the existing review flip so the assignee-null/claim-clear flip is one atomic statement
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
