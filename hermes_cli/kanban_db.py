@@ -1392,8 +1392,8 @@ def create_task(
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
-    # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
-    # race may insert twice, the next lookup stabilises on the newest.
+    # Fast path only: recheck under the write transaction below so concurrent
+    # creators that both miss this read still resolve to one authority task.
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
@@ -1419,6 +1419,15 @@ def create_task(
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
+                # Existing BEGIN IMMEDIATE serializes same-key creates (K14).
+                if idempotency_key:
+                    existing = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
+                    ).fetchone()
+                    if existing:
+                        return existing["id"]
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
@@ -2771,6 +2780,67 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+_PARKED_REVIEW_NONSTATE_EVENTS = (
+    "commented", "attached", "attachment_removed",
+    "completion_blocked_hallucination", "completion_blocked_empty_result",
+    "suspected_hallucinated_references", "assigned", "claim_rejected",
+    "claim_extended", "linked", "unlinked", "reprioritized", "edited",
+    "specified",
+)
+
+
+def _parked_review_guard_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """H4V3 compatibility seam (hermes-github-kanban #6): why this task does
+    NOT currently prove parked review, or ``None`` when it does.
+
+    MUST be called inside an open write transaction (``write_txn``): every
+    competing mutation commits under the same ``BEGIN IMMEDIATE`` writer
+    serialisation, so this read and the caller's guarded UPDATE are atomic.
+    Proof required: ``review`` status, no assignee, no current run, no claim,
+    and the latest lifecycle event (ignoring ``_PARKED_REVIEW_NONSTATE_EVENTS``)
+    is a ``review_requested`` carrying ``parked: true``.
+    """
+    row = conn.execute(
+        "SELECT status, assignee, current_run_id, claim_lock, worker_pid "
+        "FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return "task not found"
+    if row["status"] != "review":
+        return f"task is {row['status']!r}, not parked review"
+    if row["assignee"] is not None:
+        return "parked review retains an assignee"
+    if row["current_run_id"] is not None:
+        return "parked review retains a live run"
+    if row["claim_lock"] is not None or row["worker_pid"] is not None:
+        return "parked review retains a claim"
+    placeholders = ",".join("?" * len(_PARKED_REVIEW_NONSTATE_EVENTS))
+    event = conn.execute(
+        f"SELECT kind, payload FROM task_events WHERE task_id = ? "
+        f"AND kind NOT IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+        (task_id, *_PARKED_REVIEW_NONSTATE_EVENTS),
+    ).fetchone()
+    kind = _row_get(event, "kind")
+    payload = _json_dict(_row_get(event, "payload"))
+    if kind != "review_requested" or payload.get("parked") is not True:
+        return f"latest lifecycle event is {kind!r}, not a parked review_requested"
+    return None
+
+
+class ParkedReviewGuardError(ValueError):
+    """H4V3 compatibility seam (hermes-github-kanban #6):
+    ``complete_task(require_parked=True)`` refused — inside the completion
+    transaction the task no longer proves parked-review status, parked
+    provenance, no assignee, and no live run/claim. The transaction rolled
+    back; the task is unchanged. A ``ValueError`` so tool error handlers treat
+    it as recoverable."""
+
+    def __init__(self, task_id: str, reason: str):
+        self.task_id = task_id
+        self.reason = reason
+        super().__init__(f"parked-review completion refused for {task_id}: {reason}")
+
+
 class LiveClaimError(ValueError):
     """``complete_task`` refused: the task is ``running`` under a live claim and
     the caller neither owns its run (``expected_run_id``) nor passed ``force``.
@@ -2805,6 +2875,7 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
+    require_parked: bool = False,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2822,6 +2893,18 @@ def complete_task(
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
+
+    ``require_parked=True`` is the H4V3 compatibility seam for
+    hermes-github-kanban #6 (upstream owner NousResearch/hermes-agent#107718):
+    inside the SAME ``BEGIN IMMEDIATE`` write transaction the task must still
+    prove parked review (:func:`_parked_review_guard_reason`) and the terminal
+    UPDATE is additionally CAS-guarded on the parked row (``review`` status,
+    no assignee, no current run), so a reviewer assignment or claim that lands
+    after the caller's earlier read cannot be silently completed. Failure
+    raises :class:`ParkedReviewGuardError` with the transaction rolled back —
+    no ``done`` transition, no event, no run. Plain completions
+    (``require_parked=False``, every ordinary human/worker flow) are unchanged.
+    Deletable with the parked-review seam.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
@@ -2849,6 +2932,15 @@ def complete_task(
             (task_id,),
         ).fetchone()
         prior_status = trow["status"] if trow else None
+        # H4V3 compatibility seam (hermes-github-kanban #6): the parked-review
+        # proof re-runs INSIDE this BEGIN IMMEDIATE transaction, so an
+        # assignment/claim that lands after the caller's earlier read cannot
+        # slip through. Raising rolls the whole transaction back — no done
+        # transition, no event, no run. Deletable with the parked-review seam.
+        if require_parked:
+            guard_reason = _parked_review_guard_reason(conn, task_id)
+            if guard_reason is not None:
+                raise ParkedReviewGuardError(task_id, guard_reason)
         # Refuse to close a LIVE worker's run without proof of ownership
         # (expected_run_id) or an explicit human override (force=True); see
         # _claim_is_live for what "live" means.
@@ -2871,7 +2963,16 @@ def complete_task(
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
+        if require_parked:
+            # H4V3 #6: the terminal UPDATE itself is CAS-guarded on the parked
+            # row, so the guard read and the done transition are one atomic
+            # authority decision even against a concurrent same-txn writer.
+            sql += " AND status = 'review' AND assignee IS NULL AND current_run_id IS NULL"
         if conn.execute(sql, params).rowcount != 1:
+            if require_parked:
+                raise ParkedReviewGuardError(
+                    task_id, "parked-review row changed under the completion CAS",
+                )
             return False
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
@@ -3427,6 +3528,7 @@ def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
+    park: bool = False, expected_status: Optional[str] = None,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
 
@@ -3435,6 +3537,19 @@ def request_review(
     re-review defaults to the latest ``changes_requested`` provenance. A live
     claim is only cleared with proof of ownership (``expected_run_id``) or
     ``force=True``. Returns ``bool``, or ``(ok, reason)`` with ``with_reason``.
+
+    ``park=True`` is the H4V3 compatibility seam for hermes-github-kanban #6
+    (upstream owner NousResearch/hermes-agent#107718): an atomic
+    parked-review handoff that lands the card in ``review`` with the live
+    claim cleared AND the assignee nulled, so no reviewer/assignee is
+    spawnable by the dispatcher's review lane until a trusted rework
+    (:func:`reopen_review_task`) or an explicit operator assignment.
+    Implementer provenance still rides the ``review_requested`` event;
+    ``reviewer`` must not be named together with ``park``. Parked handoffs
+    must provide ``expected_status`` (``ready`` or ``running``); running
+    handoffs additionally require ``expected_run_id``. Those preconditions
+    are included in the same UPDATE CAS that clears the claim and assignee.
+    Deletable once upstream ships an equivalent parked-review primitive.
 
     ``metadata["artifacts"]`` names the handoff's deliverable
     files; a review handoff is the last implementer transition, and the
@@ -3449,6 +3564,17 @@ def request_review(
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
+    if park and reviewer is not None:
+        return _ret(False, "parked review cannot name a reviewer profile")
+    if park:
+        if expected_status not in {"ready", "running"}:
+            return _ret(False, "parked review requires expected_status='ready' or 'running'")
+        if expected_status == "running" and expected_run_id is None:
+            return _ret(False, "parking a running task requires expected_run_id")
+        if expected_status == "ready" and expected_run_id is not None:
+            return _ret(False, "parking a ready task must not include expected_run_id")
+    elif expected_status is not None:
+        return _ret(False, "expected_status is supported only for parked review")
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
     # Declared (metadata["artifacts"]) and prose-referenced files
@@ -3478,14 +3604,20 @@ def request_review(
                     "(worker ownership) or force=True (explicit operator "
                     "override) instead of clearing the live run's claim",
                 )
-            if reviewer is None:
-                reviewer = _prior_reviewer(conn, task_id)
-                if reviewer is False:
+            # Parked review deliberately does NOT adopt prior-reviewer
+            # provenance as an assignee: naming any profile here would make
+            # the row spawnable by the review lane, which is exactly what the
+            # H4V3 #6 parked review state forbids. The dispatcher skips unassigned
+            # review rows (kanban_db_dispatch review lane -> skipped_unassigned).
+            if reviewer is None and not park:
+                prior_reviewer = _prior_reviewer(conn, task_id)
+                if prior_reviewer is False:
                     return _ret(
                         False, "re-review has no durable reviewer provenance (the "
                         "latest changes_requested event is missing or "
                         "malformed); pass reviewer= explicitly",
                     )
+                reviewer = prior_reviewer
             reviewer = _canonical_assignee(reviewer)
             # The actor is the run that did the work. ``assignee`` is the actor
             # only while a worker holds the card; on a never-claimed card it is
@@ -3504,12 +3636,30 @@ def request_review(
                 implementer = arow["profile"] if arow else None
             if implementer is None and trow["assignee"] != reviewer:
                 implementer = trow["assignee"]
-            assignee_sql = ", assignee = ?" if reviewer is not None else ""
+            # H4V3 #6 parked review: clear the assignee in the SAME CAS UPDATE
+            # as the status flip (claim fields are already cleared there), so
+            # the parked row is never observable as "review with a spawnable
+            # assignee". Legacy callers (reviewer named) keep the reassign
+            # semantics exactly as before.
             run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
-            params: tuple[Any, ...] = (
-                *(() if reviewer is None else (reviewer,)), task_id,
-                *(() if expected_run_id is None else (int(expected_run_id),)),
+            status_guard = (
+                " AND status = ?" if expected_status is not None
+                else " AND status IN ('running', 'ready')"
             )
+            if park:
+                assignee_sql = ", assignee = NULL"
+                params: tuple[Any, ...] = (
+                    task_id,
+                    *((expected_status,) if expected_status is not None else ()),
+                    *(() if expected_run_id is None else (int(expected_run_id),)),
+                )
+            else:
+                assignee_sql = ", assignee = ?" if reviewer is not None else ""
+                params = (
+                    *(() if reviewer is None else (reviewer,)), task_id,
+                    *((expected_status,) if expected_status is not None else ()),
+                    *(() if expected_run_id is None else (int(expected_run_id),)),
+                )
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -3519,8 +3669,7 @@ def request_review(
                        worker_pid    = NULL
                 """ + assignee_sql + """
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """ + run_guard,
+                """ + status_guard + run_guard,
                 params,
             )
             if cur.rowcount != 1:
@@ -3541,6 +3690,11 @@ def request_review(
                 "implementer": implementer,
                 "reviewer": reviewer,
             }
+            if park:
+                # Durable marker so a fresh public read-back (kanban_show /
+                # CLI) can distinguish an H4V3 #6 parked review from a legacy
+                # reviewer-assigned review; reopen restores the implementer.
+                payload["parked"] = True
             staged = _cleaned_artifact_paths(metadata)
             if staged:
                 payload["artifacts"] = staged
@@ -3765,11 +3919,20 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
-def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def reopen_review_task(
+    conn: sqlite3.Connection, task_id: str, *,
+    reason: Optional[str] = None, author: Optional[str] = None,
+) -> bool:
     """``review`` -> ``ready``/``todo`` so the implementer re-runs on the new
     comments; restores the implementer from the ``review_requested`` event.
     Preserves ``consecutive_failures`` and the block loop counter (review is
-    not a block; only :func:`complete_task` clears them)."""
+    not a block; only :func:`complete_task` clears them). When a rework reason
+    is supplied, its CHANGES REQUESTED comment commits with the reopen so a
+    dispatcher cannot start the implementer before the handoff is visible."""
+    reason = str(redact_review_value(reason or "")).strip()
+    author = str(redact_review_value(author or "")).strip()
+    if reason and not author:
+        return False
     now = int(time.time())
     with write_txn(conn):
         _reclaim_dangling_run(
@@ -3798,6 +3961,8 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         _append_event(
             conn, task_id, "review_reopened", payload if payload != {"status": "ready"} else None,
         )
+        if reason:
+            add_comment(conn, task_id, author, f"CHANGES REQUESTED: {reason}")
         return True
 
 
