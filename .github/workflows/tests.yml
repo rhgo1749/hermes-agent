@@ -120,11 +120,16 @@ jobs:
           key: test-durations-${{ github.run_id }}-${{ matrix.slice }}
 
   e2e:
-    # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
-    # writer processes per test; a 4-vCPU runner serialises them into timeouts.
+    # Keep process trees serial on standard fork runners, but split the full
+    # discovered suite across machines to fit the unchanged 30-minute budget.
     if: inputs.e2e
+    name: e2e (${{ matrix.slice }}/${{ github.repository == 'NousResearch/hermes-agent' && 1 || 4 }})
     runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: ${{ fromJSON(github.repository == 'NousResearch/hermes-agent' && '[1]' || '[1,2,3,4]') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -189,6 +194,7 @@ jobs:
           # Bound the trees, not the child readiness/turn timeouts. At 4 the
           # PTY turn and serve-SIGTERM deadlines still starved intermittently.
           HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && '3' || '1' }}
+          HERMES_TEST_SLICE: ${{ format('{0}/{1}', matrix.slice, github.repository == 'NousResearch/hermes-agent' && 1 || 4) }}
           # Multi-process episodes (torture chamber, compaction kill -9,
           # gateway liveness, delivery exactly-once through a real gateway,
           # the cron virtual-clock soak) legitimately run past the 300 s default.
