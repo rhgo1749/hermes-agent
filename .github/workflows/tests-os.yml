@@ -27,6 +27,13 @@ name: OS-specific tests
 # nothing.
 
 on:
+  workflow_dispatch:
+    inputs:
+      rerun_windows:
+        description: Run only the Windows files that failed or timed out in run 37636770012.
+        type: boolean
+        required: true
+        default: true
   workflow_call:
     inputs:
       desktop_updater:
@@ -71,6 +78,7 @@ concurrency:
 
 jobs:
   os-tests:
+    if: ${{ !inputs.rerun_windows }}
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout || 30 }}
@@ -271,3 +279,55 @@ jobs:
             "::error::leftover pid=$($p.ProcessId) ppid=$($p.ParentProcessId): $($p.CommandLine)"
           }
           exit 1
+
+  failed-windows-files:
+    if: inputs.rerun_windows
+    name: Retry ${{ matrix.arch }} / ${{ matrix.file }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+            timeout: 30
+            file: test_desktop_update_windows_commit_outcome.py
+          - arch: x64
+            runner: windows-latest
+            timeout: 30
+            file: test_desktop_update_windows_handoff_lineage.py
+          - arch: x64
+            runner: windows-latest
+            timeout: 30
+            file: test_desktop_update_windows_marker.py
+          - arch: arm64
+            runner: windows-11-arm
+            timeout: 60
+            file: test_desktop_update_windows_commit_outcome.py
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - name: Set up native ARM64 build dependencies
+        if: runner.arch == 'ARM64'
+        uses: ./.github/actions/setup-windows-build-deps
+      - name: Set up locked Python and test dependencies
+        uses: ./.github/actions/setup-pm
+        with:
+          packages: git,ripgrep
+          extras: '["all", "telegram", "anthropic", "mistral", "fal", "modal", "daytona", "parallel-web"]'
+          test-environment: 'true'
+          prune-python-cache: true
+      - name: Re-test failed file without retry or relaxed deadlines
+        shell: bash
+        run: |
+          scripts/run_tests.sh "tests/scripts/desktop_update/$FAILED_FILE" -- \
+            -m "platforms and not integration" -v --tb=long --durations=0
+        env:
+          FAILED_FILE: ${{ matrix.file }}
+          HERMES_TEST_WORKERS: '1'
+          HERMES_TEST_FILE_TIMEOUT: '300'
+          HERMES_TEST_FILE_RETRIES: '0'
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''

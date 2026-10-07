@@ -1,6 +1,13 @@
 name: Tests
 
 on:
+  workflow_dispatch:
+    inputs:
+      rerun_upgrade_git:
+        description: Run only the two Git upgrade files that failed in run 37636770012.
+        type: boolean
+        required: true
+        default: true
   workflow_call:
     inputs:
       # The E2E jobs below are slow lanes (scripts/ci/classify_changes.py).
@@ -33,6 +40,7 @@ concurrency:
 
 jobs:
   test:
+    if: ${{ !inputs.rerun_upgrade_git }}
     # Two 32-core slices instead of one box: on one runner the suite is ~10 min of
     # nearly fully packed work, and a single bigger runner (96-core) scaled ~1.8x for
     # 3x the price because files contend for the shared machine. Separate machines
@@ -222,7 +230,7 @@ jobs:
     # directory gets its own shard without editing this file, and no shard
     # carries the whole tree's wall time against the 60-minute timeout.
     # Skipping this job skips every e2e-upgrade shard with it.
-    if: inputs.e2e_upgrade
+    if: inputs.e2e_upgrade || inputs.rerun_upgrade_git
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -237,15 +245,17 @@ jobs:
         run: |
           set -euo pipefail
           shards=$(python3 - <<'PY'
-          import json, pathlib
+          import json, os, pathlib
           root = pathlib.Path("tests/e2e/core/upgrade")
           shards = ["core"] if any(root.glob("test_*.py")) else []
           shards += sorted(d.name for d in root.iterdir()
                            if d.is_dir() and not d.name.startswith(("_", ".")) and any(d.rglob("test_*.py")))
-          print(json.dumps(shards))
+          print(json.dumps(["git"] if os.environ["RERUN_UPGRADE_GIT"] == "true" else shards))
           PY
           )
           echo "shards=$shards" | tee -a "$GITHUB_OUTPUT"
+        env:
+          RERUN_UPGRADE_GIT: ${{ inputs.rerun_upgrade_git }}
 
   e2e-upgrade:
     # tests/e2e/core/upgrade: a real N-1 -> HEAD `hermes update` (clean,
@@ -269,6 +279,14 @@ jobs:
           # N-1 = `git describe --tags --abbrev=0 HEAD~1`.
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Fetch official release tags for fork upgrade fixtures
+        if: github.repository != 'NousResearch/hermes-agent'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://github.com/NousResearch/hermes-agent.git \
+            'refs/tags/v20*:refs/tags/v20*'
+          git describe --tags --abbrev=0 --match 'v20[0-9][0-9].*' HEAD~1
 
       - name: Set up Node
         # `hermes update` builds the web UI / TUI workspaces.
@@ -352,7 +370,9 @@ jobs:
         run: |
           set -euo pipefail
           source .venv/bin/activate
-          if [ "$SHARD" = core ]; then
+          if [ "$RERUN_UPGRADE_GIT" = true ]; then
+            files=(tests/e2e/core/upgrade/git/test_partial_clone.py tests/e2e/core/upgrade/git/test_shallow_install.py)
+          elif [ "$SHARD" = core ]; then
             mapfile -t files < <(find tests/e2e/core/upgrade -maxdepth 1 -name 'test_*.py' | sort)
           else
             mapfile -t files < <(find "tests/e2e/core/upgrade/$SHARD" -name 'test_*.py' | sort)
@@ -363,6 +383,8 @@ jobs:
           scripts/run_tests.sh --include-integration "${files[@]}"
         env:
           SHARD: ${{ matrix.shard }}
+          RERUN_UPGRADE_GIT: ${{ inputs.rerun_upgrade_git }}
+          HERMES_TEST_FILE_RETRIES: ${{ inputs.rerun_upgrade_git && '0' || '' }}
           HERMES_E2E_STRICT_ACCEPTANCE: ${{ inputs.strict_acceptance }}
           # Each file drives real installs/updaters (process trees plus uv and
           # git I/O); cpu_count of them at once starves their deadlines. A

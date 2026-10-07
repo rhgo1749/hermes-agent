@@ -1,6 +1,7 @@
 name: Contributor Attribution Check
 
 on:
+  workflow_dispatch:
   workflow_call:
     outputs:
       review_status:
