@@ -15,6 +15,11 @@ name: Lint (ruff + ty)
 on:
   workflow_call:
     inputs:
+      base_ref:
+        description: 'Base branch for manual validation (PRs use their actual target SHA).'
+        required: false
+        type: string
+        default: main
       event_name:
         description: The event name from the calling orchestrator (pull_request or push).
         type: string
@@ -157,14 +162,14 @@ jobs:
     # cannot trade one violation for another. The merge commit is compared with its first
     # parent (current main), so an improvement that lands on main is locked in at once.
     name: code health ratchet (blocking)
-    if: inputs.event_name == 'pull_request'
+    if: inputs.event_name == 'pull_request' || inputs.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
-          fetch-depth: 2 # the merge commit and its first parent (the base branch tip)
+          fetch-depth: 0 # dispatch needs the explicitly selected base, not HEAD^1
 
       - uses: ./.github/actions/setup-pm
         with:
@@ -176,8 +181,19 @@ jobs:
         with:
           command: python -m scripts.ci.python_packages "$(python -m scripts.code_health --print-pins)"
 
-      - name: Ratchet the PR against the base branch tip
-        run: python scripts/check --only health --base HEAD^1
+      - name: Ratchet against the exact validation base
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
+          BASE_REF: ${{ inputs.base_ref }}
+        run: |
+          if [ -z "$BASE_SHA" ]; then
+            git check-ref-format --branch "$BASE_REF"
+            git fetch --no-tags origin "refs/heads/$BASE_REF"
+            BASE_SHA=$(git rev-parse FETCH_HEAD)
+          fi
+          git cat-file -e "$BASE_SHA^{commit}"
+          echo "Validation base SHA: $BASE_SHA"
+          python scripts/check --only health --base "$BASE_SHA"
 
   windows-footguns:
     # Static guardrails on Windows-unsafe Python primitives — os.kill(pid, 0),

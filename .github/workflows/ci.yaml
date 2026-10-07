@@ -17,6 +17,11 @@ name: CI
 on:
   workflow_dispatch:
     inputs:
+      base_ref:
+        description: 'Base branch for manual validation (PRs use their actual target SHA).'
+        required: false
+        type: string
+        default: main
       release:
         description: 'Stable-release candidate run: force every applicability lane and make the aggregate gate strict (skipped required lanes fail).'
         required: false
@@ -24,6 +29,11 @@ on:
         default: false
   workflow_call:
     inputs:
+      base_ref:
+        description: 'Base branch for manual validation (PRs use their actual target SHA).'
+        required: false
+        type: string
+        default: main
       release:
         description: 'Stable-release candidate run: force every applicability lane and make the aggregate gate strict (skipped required lanes fail).'
         required: false
@@ -143,7 +153,9 @@ jobs:
       # changed; unit-level platforms("windows") tests always run.
       desktop_updater: ${{ needs.detect.outputs.desktop_updater == 'true' }}
       e2e: ${{ needs.detect.outputs.e2e == 'true' }}
-      e2e_upgrade: ${{ needs.detect.outputs.e2e_upgrade == 'true' }}
+      # Heavy Windows installs are independent path-gated/nightly checks, not
+      # ordinary PR aggregate dependencies. Release validation stays strict.
+      e2e_upgrade: ${{ inputs.release == true }}
 
   lint:
     name: Python lints
@@ -153,6 +165,7 @@ jobs:
     uses: ./.github/workflows/lint.yml
     with:
       event_name: ${{ needs.detect.outputs.event_name }}
+      base_ref: ${{ inputs.base_ref || 'main' }}
       python: ${{ needs.detect.outputs.python == 'true' }}
 
   js-tests:
@@ -231,6 +244,8 @@ jobs:
     needs: detect
     if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/contributor-check.yml
+    with:
+      base_ref: ${{ inputs.base_ref || 'main' }}
 
   uv-lockfile:
     name: Check uv.lock
