@@ -7,13 +7,53 @@ name: Windows install + update E2E
 # Each file walks one journey (one install) and asserts several user-visible cells;
 # tracked bugs are message-gated xfails (tests/e2e/core/_pending_fixes.py).
 #
-# Called from tests-os.yml when a Python PR touches the install/update code
-# (the classifier's e2e_upgrade lane) and on every push to main. Pushes to
-# wine2e-install/** run it alone, for sabotage proofs and iteration without the
-# rest of CI.
+# Runs independently of the default PR aggregate: affected install/update paths on
+# PRs, nightly full coverage, and explicit manual/iteration runs. Release callers
+# can still require the full journey through workflow_call.
 
 on:
   workflow_call:
+  workflow_dispatch:
+    inputs:
+      test_files:
+        description: 'Optional space-separated test_*.py basenames; empty runs the full suite.'
+        required: false
+        type: string
+        default: ''
+  pull_request:
+    paths:
+      - 'tests/e2e/core/windows_update/**'
+      - 'tests/e2e/core/windows/**'
+      - 'tests/e2e/core/_*'
+      - 'tests/e2e/conftest.py'
+      - 'tests/conftest.py'
+      - 'tests/_fixtures/**'
+      - 'tests/fakes/**'
+      - 'scripts/install.ps1'
+      - 'scripts/build/**'
+      - 'scripts/run_tests.sh'
+      - 'scripts/run_tests_parallel.py'
+      - 'hermes_cli/update*'
+      - 'hermes_cli/_update*'
+      - 'hermes_cli/old_updater*'
+      - 'hermes_cli/_old_updater*'
+      - 'hermes_cli/post_update*'
+      - 'hermes_cli/source_*'
+      - 'hermes_cli/install*'
+      - 'hermes_cli/_install*'
+      - 'hermes_cli/main_install*'
+      - 'hermes_cli/config_migrations*'
+      - 'hermes_cli/subcommands/update/**'
+      - 'pm/**'
+      - 'hermes_platform/**'
+      - '.github/actions/setup-pm/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'setup.py'
+  schedule:
+    - cron: '15 17 * * *'
   push:
     branches: ['wine2e-install/**']
 
@@ -55,9 +95,22 @@ jobs:
       - name: Run Windows install + update E2E
         shell: bash
         run: |
-          scripts/run_tests.sh tests/e2e/core/windows_update/ -- \
+          paths=(tests/e2e/core/windows_update/)
+          if [ -n "$REQUESTED_TEST_FILES" ]; then
+            [[ "$REQUESTED_TEST_FILES" != *$'\n'* && "$REQUESTED_TEST_FILES" != *$'\r'* ]] || exit 2
+            read -r -a names <<< "$REQUESTED_TEST_FILES"
+            paths=()
+            for name in "${names[@]}"; do
+              [[ "$name" =~ ^test_[a-z0-9_]+\.py$ ]] || { printf 'invalid test basename: %s\n' "$name" >&2; exit 2; }
+              path="tests/e2e/core/windows_update/$name"
+              [ -f "$path" ] || { printf 'unknown test file: %s\n' "$path" >&2; exit 2; }
+              paths+=("$path")
+            done
+          fi
+          scripts/run_tests.sh "${paths[@]}" -- \
             -m "platforms and integration" -v --tb=short -rA
         env:
+          REQUESTED_TEST_FILES: ${{ github.event_name == 'workflow_dispatch' && inputs.test_files || '' }}
           HERMES_E2E_WINDOWS_INSTALL: '1'
           # Machine work dirs (serve.git, transcripts) stay short under runner.temp. The fake
           # user profiles live in C:\Users itself, where a real one does: the checkout carries

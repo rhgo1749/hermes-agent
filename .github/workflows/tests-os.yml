@@ -50,11 +50,11 @@ on:
         default: true
       e2e_upgrade:
         description: >-
-          Run the Windows install + update journey (tests/e2e/core/windows_update).
-          A slow lane; a caller that passes nothing gets it.
+          Require the full Windows install + update journey for release validation.
+          Ordinary PRs use the independent path-gated/nightly workflow instead.
         type: boolean
         required: false
-        default: true
+        default: false
 
 permissions:
   contents: read
