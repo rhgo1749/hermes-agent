@@ -39,6 +39,11 @@ on:
         type: boolean
         required: false
         default: false
+      profile_windows:
+        description: Profile Python startup and fixtures for the same two existing cases; no hand-off source instrumentation.
+        type: boolean
+        required: false
+        default: false
   workflow_call:
     inputs:
       desktop_updater:
@@ -360,7 +365,21 @@ jobs:
           extras: '["all", "telegram", "anthropic", "mistral", "fal", "modal", "daytona", "parallel-web"]'
           test-environment: 'true'
           prune-python-cache: true
-      - name: Run two existing cases without instrumentation
+      - name: Profile the existing pytest child command only in this disposable checkout
+        if: inputs.profile_windows
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'handoff-diagnostics'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $path = 'scripts/run_tests_parallel.py'
+          $source = [IO.File]::ReadAllText((Resolve-Path $path))
+          $needle = 'cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]'
+          if ([regex]::Matches($source, [regex]::Escape($needle)).Count -ne 1) { throw 'pytest child command is not unique' }
+          $profileRoot = $dir.Replace('\', '/').Replace("'", "\'")
+          $replacement = "cmd = [sys.executable, '-m', 'cProfile', '-o', str(Path('$profileRoot') / (file.stem + '.prof')), '-m', 'pytest', str(file), *pytest_args]"
+          [IO.File]::WriteAllText((Resolve-Path $path), $source.Replace($needle, $replacement), [Text.UTF8Encoding]::new($false))
+          git diff -- scripts/run_tests_parallel.py | Set-Content (Join-Path $dir 'disposable-profiler.diff')
+      - name: Run two existing cases without hand-off instrumentation
         id: control
         shell: bash
         run: |
@@ -374,7 +393,7 @@ jobs:
             -v --tb=long --durations=0 |& tee "$RUNNER_TEMP/handoff-diagnostics/control.log"
       - name: Record native startup controls and instrument only this disposable checkout
         id: instrument
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && !inputs.profile_windows }}
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP 'handoff-diagnostics'
@@ -442,6 +461,14 @@ jobs:
             -m "platforms and not integration" \
             -k 'test_claim_is_the_first_action_and_writes_a_v2_body or (test_handoff_run_adopts_only_the_desktop_bridge_for_that_run and ok)' \
             -v --tb=long --durations=0 |& tee "$RUNNER_TEMP/handoff-diagnostics/instrumented.log"
+      - name: Summarize the Python profiles
+        if: ${{ !cancelled() && inputs.profile_windows }}
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'handoff-diagnostics'
+          & $env:HERMES_PYTHON -c "import pathlib,pstats,sys; root=pathlib.Path(sys.argv[1]); files=list(root.glob('*.prof')); assert len(files)==2, files; [pstats.Stats(str(f)).sort_stats('cumulative').print_stats(40) for f in files]" $dir |
+            Tee-Object -FilePath (Join-Path $dir 'python-profile-summary.txt')
+          if ($LASTEXITCODE -ne 0) { throw 'Python profile summary failed' }
       - name: Preserve diagnostics even when a selected file times out
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
