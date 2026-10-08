@@ -471,6 +471,8 @@ jobs:
                       assert result.stdout.strip().isdigit(), result.stdout
                       record('CONTROL_END', label=label)
           '@
+          Get-FileHash 'scripts/desktop-update/windows.ps1', 'tests/conftest.py' |
+            Format-List | Out-String | Set-Content (Join-Path $dir 'original-boundary-hashes.txt')
           $rootJson = ConvertTo-Json -Compress $dir
           $moduleJson = ConvertTo-Json -Compress ([string]$env:PSModulePath)
           $fixture = $fixture.Replace('__TRACE_ROOT__', $rootJson).Replace('__MODULE_PATH__', $moduleJson)
@@ -490,13 +492,13 @@ jobs:
           $entry = "`n[IO.File]::AppendAllText('$trace', (`"{0:o}`t{1}`tFILE_BOOT`n`" -f [DateTime]::UtcNow, `$PID))`n"
           $source = $source.Insert($ast.ParamBlock.Extent.EndOffset, $entry)
           $points = @(
-            @{ Text = 'New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction SilentlyContinue | Out-Null'; Label = 'LOG_DIR' },
-            @{ Text = ". (Join-Path `$PSScriptRoot 'marker.ps1')"; Label = 'MARKER_SOURCE' },
-            @{ Text = '$script:MarkerClaim = Invoke-MarkerClaim'; Label = 'CLAIM' },
-            @{ Text = ". (Join-Path `$PSScriptRoot 'update-job.ps1')"; Label = 'JOB_SOURCE' }
+            @{ Text = 'New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction SilentlyContinue | Out-Null'; Label = 'LOG_DIR'; Count = 3 },
+            @{ Text = ". (Join-Path `$PSScriptRoot 'marker.ps1')"; Label = 'MARKER_SOURCE'; Count = 1 },
+            @{ Text = '$script:MarkerClaim = Invoke-MarkerClaim'; Label = 'CLAIM'; Count = 1 },
+            @{ Text = ". (Join-Path `$PSScriptRoot 'update-job.ps1')"; Label = 'JOB_SOURCE'; Count = 1 }
           )
           foreach ($point in $points) {
-            if ([regex]::Matches($source, [regex]::Escape($point.Text)).Count -ne 1) { throw "nonunique phase $($point.Label)" }
+            if ([regex]::Matches($source, [regex]::Escape($point.Text)).Count -ne $point.Count) { throw "unexpected occurrence count for phase $($point.Label)" }
             $before = "[IO.File]::AppendAllText('$trace', (`"{0:o}`t{1}`t$($point.Label)_BEGIN`n`" -f [DateTime]::UtcNow, `$PID)); "
             $after = "; [IO.File]::AppendAllText('$trace', (`"{0:o}`t{1}`t$($point.Label)_END`n`" -f [DateTime]::UtcNow, `$PID))"
             $source = $source.Replace($point.Text, $before + $point.Text + $after)
