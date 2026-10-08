@@ -88,7 +88,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: tests-os-${{ github.ref_type == 'tag' && github.run_id || github.ref }}
+  group: tests-os-${{ github.ref_type == 'tag' && github.run_id || github.ref }}${{ inputs.diagnose_windows && '-diagnostics' || '' }}
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
@@ -463,7 +463,9 @@ jobs:
               monkeypatch.setattr(subprocess, 'Popen', ObservedPopen)
               if request.node.name == 'test_claim_is_the_first_action_and_writes_a_v2_body':
                   ps = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-                  for label, options in (('cim_same_env', {}), ('cim_module_path_only', {'env': dict(os.environ, PSModulePath=__MODULE_PATH__)})):
+                  native_modules = os.path.join(os.environ['SYSTEMROOT'], 'System32', 'WindowsPowerShell', 'v1.0', 'Modules')
+                  inherited_modules = os.environ.get('PSMODULEPATH', '')
+                  for label, options in (('cim_same_env', {}), ('cim_native_modules_first', {'env': dict(os.environ, PSModulePath=native_modules + ';' + inherited_modules)})):
                       record('CONTROL_BEGIN', label=label)
                       command = "$c = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $PID); [Console]::WriteLine($c.ProcessId)"
                       result = subprocess.run([ps, '-NoProfile', '-Command', command],
