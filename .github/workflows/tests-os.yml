@@ -35,17 +35,17 @@ on:
         required: true
         default: true
       diagnose_windows:
-        description: Measure existing marker and lineage cases on one standard x64 runner; not an acceptance run.
+        description: Measure the existing marker case on one standard x64 runner; not an acceptance run.
         type: boolean
         required: false
         default: false
       profile_windows:
-        description: Profile Python startup and fixtures for the same two existing cases; no hand-off source instrumentation.
+        description: Profile Python startup and fixtures for the existing marker case; no hand-off source instrumentation.
         type: boolean
         required: false
         default: false
       boundary_windows:
-        description: Observe native launch, exit and pipe EOF for the same existing cases; not acceptance.
+        description: Observe native launch, exit and pipe EOF for the existing marker case; not acceptance.
         type: boolean
         required: false
         default: false
@@ -508,15 +508,19 @@ jobs:
           [IO.File]::WriteAllText((Resolve-Path $path), $source, [Text.UTF8Encoding]::new($false))
           git diff -- tests/conftest.py scripts/desktop-update/windows.ps1 |
             Set-Content (Join-Path $dir 'disposable-boundaries.diff')
-      - name: Run the same two existing cases with the selected diagnostic mode
+      - name: Run the existing marker case with the selected diagnostic mode
         id: control
         shell: bash
         run: |
           set -o pipefail
           mkdir -p "$RUNNER_TEMP/handoff-diagnostics"
+          printf 'Bash PSModulePath defined=%s; PSMODULEPATH defined=%s\n' "${PSModulePath+yes}" "${PSMODULEPATH+yes}" |
+            tee "$RUNNER_TEMP/handoff-diagnostics/parent-module-env.log"
+          "$HERMES_PYTHON" -c 'import json,os; print(json.dumps({"PSMODULEPATH":os.environ.get("PSMODULEPATH")}))' |
+            tee -a "$RUNNER_TEMP/handoff-diagnostics/parent-module-env.log"
           scripts/run_tests.sh \
             tests/scripts/desktop_update/test_desktop_update_windows_marker.py \
-            tests/scripts/desktop_update/test_desktop_update_windows_handoff_lineage.py -- \
+            -- \
             -m "platforms and not integration" \
             -k 'test_claim_is_the_first_action_and_writes_a_v2_body or (test_handoff_run_adopts_only_the_desktop_bridge_for_that_run and ok)' \
             -v --tb=long --durations=0 |& tee "$RUNNER_TEMP/handoff-diagnostics/control.log"
@@ -586,7 +590,7 @@ jobs:
           set -o pipefail
           scripts/run_tests.sh \
             tests/scripts/desktop_update/test_desktop_update_windows_marker.py \
-            tests/scripts/desktop_update/test_desktop_update_windows_handoff_lineage.py -- \
+            -- \
             -m "platforms and not integration" \
             -k 'test_claim_is_the_first_action_and_writes_a_v2_body or (test_handoff_run_adopts_only_the_desktop_bridge_for_that_run and ok)' \
             -v --tb=long --durations=0 |& tee "$RUNNER_TEMP/handoff-diagnostics/instrumented.log"
@@ -595,7 +599,7 @@ jobs:
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP 'handoff-diagnostics'
-          & $env:HERMES_PYTHON -c "import pathlib,pstats,sys; root=pathlib.Path(sys.argv[1]); files=list(root.glob('*.prof')); assert len(files)==2, files; [pstats.Stats(str(f)).sort_stats('cumulative').print_stats(40) for f in files]" $dir |
+          & $env:HERMES_PYTHON -c "import pathlib,pstats,sys; root=pathlib.Path(sys.argv[1]); files=list(root.glob('*.prof')); assert len(files)==1, files; [pstats.Stats(str(f)).sort_stats('cumulative').print_stats(40) for f in files]" $dir |
             Tee-Object -FilePath (Join-Path $dir 'python-profile-summary.txt')
           if ($LASTEXITCODE -ne 0) { throw 'Python profile summary failed' }
       - name: Preserve diagnostics even when a selected file times out
