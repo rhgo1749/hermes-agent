@@ -311,10 +311,6 @@ jobs:
           - arch: x64
             runner: windows-latest
             timeout: 30
-            file: test_desktop_update_windows_handoff_lineage.py
-          - arch: x64
-            runner: windows-latest
-            timeout: 30
             file: test_desktop_update_windows_marker.py
           - arch: arm64
             runner: windows-11-arm

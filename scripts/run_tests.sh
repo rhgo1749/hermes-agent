@@ -90,8 +90,8 @@ fi
 # and tempfile needs TEMP/TMP. Dropping them breaks collection on native
 # Windows (issues #67385, #70813). PATHEXT is also required: without .EXE,
 # PowerShell opens a native child as a document without waiting for its exit.
-# PowerShell's PSModulePath is also a module location: dropping it forces
-# expensive fallback discovery before the first management/CIM command.
+# PowerShell needs its inherited module locations, with native built-ins first:
+# hosted SDK module trees otherwise make every fresh cmdlet discovery expensive.
 # These are location variables, not
 # credentials, so forwarding them keeps the isolation intent intact. Each is
 # only forwarded when actually set, so POSIX runs are byte-for-byte unchanged.
@@ -102,6 +102,13 @@ for _win_var in USERPROFILE HOMEDRIVE HOMEPATH LOCALAPPDATA APPDATA SYSTEMROOT T
     WIN_ENV+=("$_win_var=${!_win_var}")
   fi
 done
+case "$OSTYPE" in
+  msys*|cygwin*)
+    if [ -n "${SYSTEMROOT:-}" ] && [ -n "${PSModulePath:-}" ]; then
+      WIN_ENV+=("PSModulePath=$SYSTEMROOT\\System32\\WindowsPowerShell\\v1.0\\Modules;$PSModulePath")
+    fi
+    ;;
+esac
 # Native build toolchain (Windows arm64 has no wheels for every pinned C extension, so
 # `uv sync` inside a PM test compiles ruamel-yaml-clib and friends). The MSVC developer
 # environment is exported by scripts/build/windows-deps.ps1 into the job env; without
