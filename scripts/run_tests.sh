@@ -90,12 +90,14 @@ fi
 # and tempfile needs TEMP/TMP. Dropping them breaks collection on native
 # Windows (issues #67385, #70813). PATHEXT is also required: without .EXE,
 # PowerShell opens a native child as a document without waiting for its exit.
+# PowerShell's PSModulePath is also a module location: dropping it forces
+# expensive fallback discovery before the first management/CIM command.
 # These are location variables, not
 # credentials, so forwarding them keeps the isolation intent intact. Each is
 # only forwarded when actually set, so POSIX runs are byte-for-byte unchanged.
 WIN_ENV=()
 for _win_var in USERPROFILE HOMEDRIVE HOMEPATH LOCALAPPDATA APPDATA SYSTEMROOT TEMP TMP \
-    ComSpec PATHEXT PROGRAMFILES ProgramFiles PROGRAMDATA ProgramData; do
+    ComSpec PATHEXT PSModulePath PROGRAMFILES ProgramFiles PROGRAMDATA ProgramData; do
   if [ -n "${!_win_var:-}" ]; then
     WIN_ENV+=("$_win_var=${!_win_var}")
   fi
