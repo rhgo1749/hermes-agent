@@ -463,12 +463,12 @@ jobs:
               monkeypatch.setattr(subprocess, 'Popen', ObservedPopen)
               if request.node.name == 'test_claim_is_the_first_action_and_writes_a_v2_body':
                   ps = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-                  for label, options in (('same_env_inherited_stdin', {}), ('same_env_devnull_stdin', {'stdin': subprocess.DEVNULL}),
-                                         ('module_path_only', {'env': dict(os.environ, PSModulePath=__MODULE_PATH__)})):
+                  for label, options in (('cim_same_env', {}), ('cim_module_path_only', {'env': dict(os.environ, PSModulePath=__MODULE_PATH__)})):
                       record('CONTROL_BEGIN', label=label)
-                      result = subprocess.run([ps, '-NoProfile', '-Command', "[Console]::WriteLine('diagnostic-control')"],
+                      command = "$c = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $PID); [Console]::WriteLine($c.ProcessId)"
+                      result = subprocess.run([ps, '-NoProfile', '-Command', command],
                                               capture_output=True, text=True, timeout=60, check=True, **options)
-                      assert result.stdout.strip() == 'diagnostic-control', result.stdout
+                      assert result.stdout.strip().isdigit(), result.stdout
                       record('CONTROL_END', label=label)
           '@
           $rootJson = ConvertTo-Json -Compress $dir
@@ -489,6 +489,18 @@ jobs:
           }
           $entry = "`n[IO.File]::AppendAllText('$trace', (`"{0:o}`t{1}`tFILE_BOOT`n`" -f [DateTime]::UtcNow, `$PID))`n"
           $source = $source.Insert($ast.ParamBlock.Extent.EndOffset, $entry)
+          $points = @(
+            @{ Text = 'New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction SilentlyContinue | Out-Null'; Label = 'LOG_DIR' },
+            @{ Text = ". (Join-Path `$PSScriptRoot 'marker.ps1')"; Label = 'MARKER_SOURCE' },
+            @{ Text = '$script:MarkerClaim = Invoke-MarkerClaim'; Label = 'CLAIM' },
+            @{ Text = ". (Join-Path `$PSScriptRoot 'update-job.ps1')"; Label = 'JOB_SOURCE' }
+          )
+          foreach ($point in $points) {
+            if ([regex]::Matches($source, [regex]::Escape($point.Text)).Count -ne 1) { throw "nonunique phase $($point.Label)" }
+            $before = "[IO.File]::AppendAllText('$trace', (`"{0:o}`t{1}`t$($point.Label)_BEGIN`n`" -f [DateTime]::UtcNow, `$PID)); "
+            $after = "; [IO.File]::AppendAllText('$trace', (`"{0:o}`t{1}`t$($point.Label)_END`n`" -f [DateTime]::UtcNow, `$PID))"
+            $source = $source.Replace($point.Text, $before + $point.Text + $after)
+          }
           $null = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
           if ($errors.Count) { throw 'boundary-instrumented hand-off parse error' }
           [IO.File]::WriteAllText((Resolve-Path $path), $source, [Text.UTF8Encoding]::new($false))
