@@ -44,6 +44,11 @@ on:
         type: boolean
         required: false
         default: false
+      boundary_windows:
+        description: Observe native launch, exit and pipe EOF for the same existing cases; not acceptance.
+        type: boolean
+        required: false
+        default: false
   workflow_call:
     inputs:
       desktop_updater:
@@ -379,7 +384,117 @@ jobs:
           $replacement = "cmd = [sys.executable, '-m', 'cProfile', '-o', str(Path('$profileRoot') / (file.stem + '.prof')), '-m', 'pytest', str(file), *pytest_args]"
           [IO.File]::WriteAllText((Resolve-Path $path), $source.Replace($needle, $replacement), [Text.UTF8Encoding]::new($false))
           git diff -- scripts/run_tests_parallel.py | Set-Content (Join-Path $dir 'disposable-profiler.diff')
-      - name: Run two existing cases without hand-off instrumentation
+      - name: Observe process exit and pipe EOF only in this disposable checkout
+        if: inputs.boundary_windows
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'handoff-diagnostics'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $fixture = @'
+
+
+          @pytest.fixture(autouse=True)
+          def _disposable_windows_boundaries(_live_system_guard, monkeypatch, request):
+              import ctypes
+              import json
+              import threading
+              import time
+              import subprocess
+              from pathlib import Path
+
+              root = Path(__TRACE_ROOT__)
+              real = subprocess.Popen
+              lock = threading.Lock()
+              rows = root / ('boundaries-' + str(os.getpid()) + '.jsonl')
+
+              def record(event, **data):
+                  with lock, rows.open('a', encoding='utf-8') as stream:
+                      stream.write(json.dumps(dict(event=event, utc_ns=time.time_ns(), **data)) + '\n')
+
+              def native(event):
+                  path = str(root / 'native-boundaries.tsv').replace("'", "''")
+                  return "[IO.File]::AppendAllText('" + path + "', (\"{0:o}`t{1}`t" + event + "`n\" -f [DateTime]::UtcNow, $PID)); "
+
+              class ObservedPopen(real):
+                  def __init__(self, command, *args, **kwargs):
+                      self._diag = isinstance(command, (list, tuple)) and Path(str(command[0])).name.lower() in ('powershell', 'powershell.exe')
+                      self._observer = None
+                      if self._diag:
+                          command = list(command)
+                          if '-Command' in command:
+                              idx = command.index('-Command') + 1
+                              command[idx] = native('COMMAND_BOOT') + command[idx] + '; ' + native('COMMAND_END')
+                          env = kwargs.get('env') or os.environ
+                          record('POPEN_BEGIN', executable=command[0], kind='command' if '-Command' in command else 'file',
+                                 stdin='DEVNULL' if kwargs.get('stdin') == subprocess.DEVNULL else 'inherited',
+                                 env_keys=sorted(env), cwd=str(kwargs.get('cwd') or os.getcwd()))
+                      super().__init__(command, *args, **kwargs)
+                      if self._diag:
+                          record('POPEN_RETURN', pid=self.pid)
+                          handle = int(self._handle)
+                          def observe():
+                              k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+                              wait = k32.WaitForSingleObject
+                              wait.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+                              wait.restype = ctypes.c_ulong
+                              result = wait(handle, 0xffffffff)
+                              record('PROCESS_EXIT', pid=self.pid, wait_result=result)
+                          self._observer = threading.Thread(target=observe, daemon=True)
+                          self._observer.start()
+
+                  def _readerthread(self, fh, buffer):
+                      try:
+                          return super()._readerthread(fh, buffer)
+                      finally:
+                          if self._diag:
+                              record('PIPE_EOF', pid=self.pid)
+
+                  def communicate(self, *args, **kwargs):
+                      if self._diag:
+                          record('COMMUNICATE_BEGIN', pid=self.pid)
+                      try:
+                          return super().communicate(*args, **kwargs)
+                      finally:
+                          if self._diag:
+                              record('COMMUNICATE_RETURN', pid=self.pid, returncode=self.returncode)
+                              if self.returncode is not None and self._observer is not None:
+                                  self._observer.join()
+
+              monkeypatch.setattr(subprocess, 'Popen', ObservedPopen)
+              if request.node.name == 'test_claim_is_the_first_action_and_writes_a_v2_body':
+                  ps = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+                  for label, options in (('same_env_inherited_stdin', {}), ('same_env_devnull_stdin', {'stdin': subprocess.DEVNULL}),
+                                         ('module_path_only', {'env': dict(os.environ, PSModulePath=__MODULE_PATH__)})):
+                      record('CONTROL_BEGIN', label=label)
+                      result = subprocess.run([ps, '-NoProfile', '-Command', "[Console]::WriteLine('diagnostic-control')"],
+                                              capture_output=True, text=True, timeout=60, check=True, **options)
+                      assert result.stdout.strip() == 'diagnostic-control', result.stdout
+                      record('CONTROL_END', label=label)
+          '@
+          $rootJson = ConvertTo-Json -Compress $dir
+          $moduleJson = ConvertTo-Json -Compress ([string]$env:PSModulePath)
+          $fixture = $fixture.Replace('__TRACE_ROOT__', $rootJson).Replace('__MODULE_PATH__', $moduleJson)
+          [IO.File]::AppendAllText((Resolve-Path 'tests/conftest.py'), $fixture, [Text.UTF8Encoding]::new($false))
+          $path = 'scripts/desktop-update/windows.ps1'
+          $source = [IO.File]::ReadAllText((Resolve-Path $path))
+          $tokens = $null; $errors = $null
+          $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw 'original hand-off parse error' }
+          $trace = (Join-Path $dir 'native-boundaries.tsv').Replace("'", "''")
+          $exits = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.ExitStatementAst] }, $true) |
+            Sort-Object { $_.Extent.StartOffset } -Descending)
+          foreach ($node in $exits) {
+            $entry = "[IO.File]::AppendAllText('$trace', (`"{0:o}`t{1}`tFILE_EXIT`n`" -f [DateTime]::UtcNow, `$PID)); "
+            $source = $source.Insert($node.Extent.StartOffset, $entry)
+          }
+          $entry = "`n[IO.File]::AppendAllText('$trace', (`"{0:o}`t{1}`tFILE_BOOT`n`" -f [DateTime]::UtcNow, `$PID))`n"
+          $source = $source.Insert($ast.ParamBlock.Extent.EndOffset, $entry)
+          $null = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw 'boundary-instrumented hand-off parse error' }
+          [IO.File]::WriteAllText((Resolve-Path $path), $source, [Text.UTF8Encoding]::new($false))
+          git diff -- tests/conftest.py scripts/desktop-update/windows.ps1 |
+            Set-Content (Join-Path $dir 'disposable-boundaries.diff')
+      - name: Run the same two existing cases with the selected diagnostic mode
         id: control
         shell: bash
         run: |
@@ -393,7 +508,7 @@ jobs:
             -v --tb=long --durations=0 |& tee "$RUNNER_TEMP/handoff-diagnostics/control.log"
       - name: Record native startup controls and instrument only this disposable checkout
         id: instrument
-        if: ${{ !cancelled() && !inputs.profile_windows }}
+        if: ${{ !cancelled() && !inputs.profile_windows && !inputs.boundary_windows }}
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP 'handoff-diagnostics'
