@@ -45,6 +45,88 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
+def _existing_task(conn, tid):
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    return task
+
+
+def test_internal_done_park_preserves_ended_history_and_reopen_implementer(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="external PR awaiting human review", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        rid = _existing_task(conn, tid).current_run_id
+        assert kb.complete_task(conn, tid, summary="original delivery", expected_run_id=rid)
+        before_run = dict(conn.execute("SELECT * FROM task_runs WHERE id = ?", (rid,)).fetchone())
+        before_events = [dict(row) for row in conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,))]
+        assert kb.request_review(conn, tid, park=True, expected_status="done",
+            expected_run_id=rid, summary="current HEAD proof\nhuman-readable detail")
+        parked = _existing_task(conn, tid)
+        assert parked.status == "review" and parked.assignee is None and parked.current_run_id is None
+        assert parked.completed_at is None
+        assert dict(conn.execute("SELECT * FROM task_runs WHERE id = ?", (rid,)).fetchone()) == before_run
+        after_events = [dict(row) for row in conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,))]
+        assert after_events[:len(before_events)] == before_events
+        payload = json.loads(after_events[-1]["payload"])
+        assert payload["parked"] is True and payload["implementer"] == "worker"
+        assert payload["summary"] == "current HEAD proof"
+        assert after_events[-1]["run_id"] != rid
+        assert not kb.request_review(conn, tid, park=True, expected_status="done", expected_run_id=rid)
+        assert kb.reopen_review_task(conn, tid, reason="new trusted rework", author="reviewer")
+        assert _existing_task(conn, tid).status == "ready"
+        assert _existing_task(conn, tid).assignee == "worker"
+
+
+@pytest.mark.parametrize("bad_run", [None, True, False, 0, -1, "1", 1.0, 999999])
+def test_internal_done_park_missing_or_stale_run_is_unchanged(kanban_home, bad_run):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="done proof required", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        rid = _existing_task(conn, tid).current_run_id
+        assert kb.complete_task(conn, tid, summary="delivery", expected_run_id=rid)
+        before = conn.total_changes
+        assert not kb.request_review(conn, tid, park=True, expected_status="done",
+            expected_run_id=bad_run, summary="must not mutate", force=True)
+        assert conn.total_changes == before and _existing_task(conn, tid).status == "done"
+
+
+@pytest.mark.parametrize("field,value", [("worker_pid", 12345), ("claim_lock", "live"),
+                                          ("claim_expires", 9999999999), ("current_run_id", 1)])
+def test_internal_done_park_refuses_live_fields_even_with_matching_history(kanban_home, field, value):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="live field refusal", assignee="worker")
+        kb.claim_task(conn, tid)
+        rid = _existing_task(conn, tid).current_run_id
+        assert kb.complete_task(conn, tid, summary="delivery", expected_run_id=rid)
+        with kb.write_txn(conn):
+            conn.execute(f"UPDATE tasks SET {field} = ? WHERE id = ?", (value, tid))
+        before = conn.total_changes
+        assert not kb.request_review(conn, tid, park=True, expected_status="done", expected_run_id=rid)
+        assert conn.total_changes == before
+
+
+def test_internal_done_park_old_completion_cannot_cross_new_run_or_aba(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="ABA completion", assignee="worker")
+        kb.claim_task(conn, tid)
+        old = _existing_task(conn, tid).current_run_id
+        assert kb.complete_task(conn, tid, summary="first", expected_run_id=old)
+        assert kb.request_review(conn, tid, park=True, expected_status="done", expected_run_id=old, summary="park")
+        assert kb.reopen_review_task(conn, tid, reason="rework", author="reviewer")
+        assert kb.claim_task(conn, tid) is not None
+        new = _existing_task(conn, tid).current_run_id
+        assert new != old
+        assert not kb.request_review(conn, tid, park=True, expected_status="done", expected_run_id=old)
+        assert _existing_task(conn, tid).current_run_id == new
+        assert kb.complete_task(conn, tid, summary="new delivery", expected_run_id=new)
+        before = conn.total_changes
+        assert not kb.request_review(conn, tid, park=True, expected_status="done", expected_run_id=old)
+        assert conn.total_changes == before
+        assert kb.request_review(conn, tid, park=True, expected_status="done", expected_run_id=new, summary="new park")
+
+
 def _row(conn, tid):
     return conn.execute(
         "SELECT status, block_kind, block_recurrences, current_run_id "

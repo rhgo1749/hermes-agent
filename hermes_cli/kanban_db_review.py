@@ -12,10 +12,14 @@ def _park_precondition_reason(park, reviewer, expected_status, expected_run_id):
         return "expected_status is supported only for parked review" if expected_status is not None else None
     if reviewer is not None:
         return "parked review cannot name a reviewer profile"
-    if expected_status not in {"ready", "running"}:
-        return "parked review requires expected_status='ready' or 'running'"
+    if expected_status not in {"ready", "running", "done"}:
+        return "parked review requires expected_status='ready', 'running' or 'done'"
     if expected_status == "running" and expected_run_id is None:
         return "parking a running task requires expected_run_id"
+    if expected_status == "done" and (
+        type(expected_run_id) is not int or expected_run_id < 1
+    ):
+        return "parking done requires a positive expected_run_id"
     if expected_status == "ready" and expected_run_id is not None:
         return "parking a ready task must not include expected_run_id"
     return None
@@ -44,7 +48,10 @@ def request_review(
     Implementer provenance still rides the ``review_requested`` event;
     ``reviewer`` must not be named together with ``park``. Parked handoffs
     must provide ``expected_status`` (``ready`` or ``running``); running
-    handoffs additionally require ``expected_run_id``. Those preconditions
+    handoffs additionally require ``expected_run_id``. Internally done work
+    can park only with its latest ended run id and no current run/worker/claim.
+    The ended delivery history is preserved; a new parked handoff is recorded.
+    Those preconditions
     are included in the same UPDATE CAS that clears the claim and assignee.
     Deletable once upstream ships an equivalent parked-review primitive.
 
@@ -81,11 +88,25 @@ def request_review(
             if not kb._parents_satisfied(conn, task_id):
                 return _ret(False, "parent dependencies are not satisfied")
             trow = conn.execute(
-                "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
+                "SELECT assignee, status, claim_lock, claim_expires, current_run_id, worker_pid, "
                 "worker_started_at FROM tasks WHERE id = ?", (task_id,),
             ).fetchone()
             if trow is None:
                 return _ret(False, "task not found")
+            done_park = park and expected_status == "done"
+            ended_run = None
+            if done_park:
+                if (trow["status"] != "done" or trow["current_run_id"] is not None
+                        or trow["worker_pid"] is not None or trow["claim_lock"] is not None
+                        or trow["claim_expires"] is not None):
+                    return _ret(False, "done park requires no current run, worker or claim")
+                ended_run = conn.execute(
+                    "SELECT id, ended_at, profile FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if (ended_run is None or ended_run["id"] != expected_run_id
+                        or ended_run["ended_at"] is None):
+                    return _ret(False, "done park latest ended run does not match expected_run_id")
             # Refuse to clear a live worker's claim without proof of ownership
             # (expected_run_id) or an explicit human override (force=True);
             # the same fence as complete_task (_claim_is_live).
@@ -119,6 +140,8 @@ def request_review(
             # routes on this field, and it already refuses a handoff that
             # carries no implementer provenance.
             implementer = None
+            if ended_run is not None:
+                implementer = ended_run["profile"]
             if trow["current_run_id"] is not None:
                 arow = conn.execute(
                     "SELECT profile FROM task_runs WHERE id = ?",
@@ -132,13 +155,19 @@ def request_review(
             # the parked row is never observable as "review with a spawnable
             # assignee". Legacy callers (reviewer named) keep the reassign
             # semantics exactly as before.
-            run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
+            run_guard = (
+                " AND current_run_id IS NULL AND worker_pid IS NULL AND claim_lock IS NULL AND claim_expires IS NULL"
+                " AND (SELECT id FROM task_runs WHERE task_id = tasks.id ORDER BY id DESC LIMIT 1) = ?"
+                if done_park else "" if expected_run_id is None else " AND current_run_id = ?"
+            )
             status_guard = (
                 " AND status = ?" if expected_status is not None
                 else " AND status IN ('running', 'ready')"
             )
             if park:
-                assignee_sql = ", assignee = NULL"
+                assignee_sql = ", assignee = NULL" + (
+                    ", completed_at = NULL, worker_started_at = NULL" if done_park else ""
+                )
                 params: tuple[Any, ...] = (
                     task_id,
                     *((expected_status,) if expected_status is not None else ()),

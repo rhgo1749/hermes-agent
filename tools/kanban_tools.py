@@ -1288,13 +1288,16 @@ def _handle_park_review(args: dict[str, Any], **kw) -> str:
     _enforce_worker_task_ownership(tid)
     summary = _redact(_require_text(args, "summary", "summary is required"))
     expected_status = args.get("expected_status")
-    _check(expected_status in {"ready", "running"},
-           "parked review requires expected_status='ready' or 'running'")
-    expected_run_id = _opt_int(args.get("expected_run_id"))
+    _check(expected_status in {"ready", "running", "done"},
+           "parked review requires expected_status='ready', 'running' or 'done'")
+    raw_run_id = args.get("expected_run_id")
+    if expected_status == "done":
+        _check(type(raw_run_id) is int and raw_run_id > 0, "done park requires a positive integer ended run id")
+    expected_run_id = _opt_int(raw_run_id)
     _check(
-        (expected_status == "running" and expected_run_id is not None)
+        (expected_status in {"running", "done"} and expected_run_id is not None)
         or (expected_status == "ready" and expected_run_id is None),
-        "expected_run_id is required only when expected_status='running'",
+        "expected_run_id is required for running/done; omit for ready",
     )
     with _board(args.get("board")) as (kb, conn):
         try:

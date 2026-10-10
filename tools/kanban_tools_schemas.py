@@ -558,7 +558,8 @@ KANBAN_PARK_REVIEW_SCHEMA = _schema(
         "in the same authority-side update while preserving the "
         "implementer's review provenance. Supply the exact fresh "
         "expected_status; for a running task also supply its current "
-        "expected_run_id from kanban_show. Orchestrator-only; dispatcher "
+        "expected_run_id; for an internally done task supply its latest ended "
+        "run id from kanban_show (no live run/worker/claim may remain). Orchestrator-only; dispatcher "
         "workers cannot use this control-plane operation."
     ),
     {
@@ -566,14 +567,14 @@ KANBAN_PARK_REVIEW_SCHEMA = _schema(
         "summary": _prop("string", "Short reason/evidence for parking the task."),
         "expected_status": {
             "type": "string",
-            "enum": ["ready", "running"],
+            "enum": ["ready", "running", "done"],
             "description": "Exact task status observed immediately before the mutation.",
         },
         "expected_run_id": {
             "type": "integer",
             "description": (
                 "Current run id from kanban_show. Required when "
-                "expected_status='running'; omit for 'ready'."
+                "expected_status='running'; for 'done', supply its latest ended run id. Omit for 'ready'."
             ),
         },
     },
