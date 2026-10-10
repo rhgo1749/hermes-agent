@@ -2,12 +2,6 @@ name: Contributor Attribution Check
 
 on:
   workflow_call:
-    inputs:
-      base_ref:
-        description: 'Base branch for manual validation (PRs use their actual target SHA).'
-        required: false
-        type: string
-        default: main
     outputs:
       review_status:
         description: "JSON array of review status objects"
@@ -29,17 +23,9 @@ jobs:
 
       - name: Check for unmapped contributor emails
         id: check-emails
-        env:
-          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
-          BASE_REF: ${{ inputs.base_ref }}
         run: |
-          if [ -z "$BASE_SHA" ]; then
-            git check-ref-format --branch "$BASE_REF"
-            git fetch --no-tags origin "refs/heads/$BASE_REF"
-            BASE_SHA=$(git rev-parse FETCH_HEAD)
-          fi
-          # Never sweep unrelated fork-main history for a PR targeting a carry branch.
-          MERGE_BASE=$(git merge-base "$BASE_SHA" HEAD)
+          # Get the merge base between this PR and main
+          MERGE_BASE=$(git merge-base origin/main HEAD)
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)

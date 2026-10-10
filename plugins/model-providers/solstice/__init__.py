@@ -17,6 +17,8 @@ from providers.base import ProviderProfile
 
 from .auth import broker_token_request, discover_client
 
+# Lives here, not in transport.py: discovery imports this module from interpreters without the app's
+# HTTP stack (PM's runtime reads config, which lists providers), so the transport loads on first use.
 INFERENCE_BASE_URL = "https://generativelanguage.googleapis.com/v1alpha"
 
 # Verified on the per-user-quota endpoint, which has no model listing a user token may read (its
