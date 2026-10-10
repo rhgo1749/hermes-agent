@@ -90,6 +90,20 @@ def _fire_pre_api_request_hook(
         pass
 
 
+def _apply_kanban_terminal_tool_choice(agent: Any, kwargs: dict) -> None:
+    """Require one tool call after a kanban stop nudge, without changing other turns."""
+    if not getattr(agent, "_kanban_terminal_tool_required", False):
+        return
+    agent._kanban_terminal_tool_required = False
+    if getattr(agent, "api_mode", None) != "chat_completions" or not kwargs.get("tools"):
+        return
+    from agent.delegation_context import owned_kanban_task
+    if not owned_kanban_task():
+        return
+    kwargs["tool_choice"] = "required"
+    logger.info("kanban stop nudge requires one tool call on next model request")
+
+
 def build_api_request(
     agent: Any, *, api_messages: Any, _moa_prepared_request: Any, tools_for_api: Any,
     system_message: Any, messages: Any, original_user_message: Any, approx_tokens: Any,
@@ -122,6 +136,7 @@ def build_api_request(
         api_kwargs = agent._build_api_kwargs(api_messages)
     else:
         api_kwargs = agent._build_api_kwargs(api_messages, tools_for_api=tools_for_api)
+    _apply_kanban_terminal_tool_choice(agent, api_kwargs)
     # Messages were scrubbed above; this walk covers the rest of the payload (tool descriptions,
     # extra_body, kwargs strings) — see sanitize_outbound_kwargs for the #50959 rationale.
     sanitize_outbound_kwargs(agent, api_kwargs)
