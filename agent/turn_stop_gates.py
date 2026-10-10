@@ -156,6 +156,10 @@ def apply_stop_gates(
     _kanban_nudge = _kanban_stop_nudge(agent, messages)
     if _kanban_nudge:
         agent._kanban_stop_nudges = getattr(agent, "_kanban_stop_nudges", 0) + 1
+        # The synthetic reminder alone may be ignored by tool-capable local models.
+        # Arm a one-request tool requirement; the request assembly consumes it.
+        if getattr(agent, "api_mode", None) == "chat_completions":
+            agent._kanban_terminal_tool_required = True
         final_msg["finish_reason"] = "kanban_terminal_required"
         final_msg["_kanban_stop_synthetic"] = True
         append_message(messages, final_msg)

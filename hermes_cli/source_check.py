@@ -414,6 +414,20 @@ def check_for_updates(*, install_root: Path | None = None, home: Path | None = N
     if cached is not None:
         return {**cached, "dirty": co.dirty, "currentBranch": co.current_branch}
     result["fetchedAt"] = int(now * 1000)
+    if branch is None and channel == "main":
+        from hermes_cli.h4v3_fork_update import check_fork_updates
+
+        try:
+            fork_status = check_fork_updates(root)
+        except (OSError, ValueError, RuntimeError) as exc:
+            result.update(error="fork-update-check-failed", message=str(exc), behind=None)
+            _write_cache(cache_file, identity, now, result)
+            return result
+        if fork_status is not None:
+            result.update(fork_status)
+            result["branch"] = "production"
+            _write_cache(cache_file, identity, now, result)
+            return result
     source_target = None
     if not _is_full_sha(co.head):
         result.update(error="head-unavailable", message="Could not read the installed revision.")

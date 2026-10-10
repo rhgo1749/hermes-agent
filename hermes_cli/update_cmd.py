@@ -1513,6 +1513,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
     print("☤ Updating Hermes Agent...")
     print()
 
+    # Opt-in, fork-owned deployment flow: squash upstream changes in an
+    # isolated worktree and publish to fork production BEFORE the stock
+    # source updater begins its transactional fetch/verify/restart pipeline.
+    from hermes_cli.h4v3_fork_update import maybe_prepare_update
+    maybe_prepare_update(args, _m().PROJECT_ROOT)
+
     _pre_update_plan = _begin_update_receipt_and_plan(args)
 
     # Backup before any git/file mutation; the snapshot id (None if disabled/failed) feeds
