@@ -677,6 +677,33 @@ def test_active_pr_guard_holds_through_same_profile_reassign_and_unassign(
         assert kbd.check_respawn_guard(conn, tid) is None
 
 
+def test_recent_success_guard_lifts_after_review_reopened(kanban_home: Path) -> None:
+    """An explicit review rework is a deliberate re-queue after success."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rework after success", assignee="dev")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        kb.add_comment(
+            conn, tid, author="dev",
+            body="Opened https://github.com/example/repo/pull/44 for review.",
+        )
+        _backdate_comments(conn, tid)
+        assert kb.complete_task(conn, tid, summary="PR delivery", expected_run_id=run_id)
+        assert kbd.check_respawn_guard(conn, tid, lane="ready") == "recent_success"
+
+        assert kb.request_review(
+            conn, tid, park=True, expected_status="done", expected_run_id=run_id,
+            summary="park open PR for review",
+        )
+        assert kbd.check_respawn_guard(conn, tid, lane="ready") == "recent_success"
+
+        assert kb.reopen_review_task(conn, tid, reason="fix review feedback", author="reviewer")
+        reopened = kb.get_task(conn, tid)
+        assert reopened is not None and reopened.status == "ready"
+        assert kbd.check_respawn_guard(conn, tid, lane="ready") is None
+
+
 def test_active_pr_guard_lifts_for_implementer_after_changes_requested(
     kanban_home: Path,
 ) -> None:
