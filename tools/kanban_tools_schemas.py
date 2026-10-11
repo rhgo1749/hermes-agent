@@ -534,12 +534,24 @@ KANBAN_UNBLOCK_SCHEMA = _schema(
     "kanban_unblock",
     (
         "Unblock a Kanban task. It moves to ready when all parents are done, "
-        "or todo while any parent remains open. Orchestrator-only — only "
-        "profiles with the kanban toolset can unblock routed work; "
-        "dispatcher-spawned task workers never see this tool."
+        "or todo while any parent remains open. For an automated capability-hold "
+        "recovery, supply expected_block_event_id from kanban_show: the task is "
+        "unblocked only if that exact latest capability block is still current, "
+        "checked atomically. A stale or mismatched event is refused without "
+        "mutation. Omit the precondition for an ordinary orchestrator unblock. "
+        "Orchestrator-only — only profiles with the kanban toolset can unblock "
+        "routed work; dispatcher-spawned task workers never see this tool."
     ),
     {
         "task_id": _prop("string", "Blocked task id to move to ready or parent-gated todo."),
+        "expected_block_event_id": {
+            "type": "integer",
+            "description": (
+                "Optional exact id of the latest 'blocked' event returned by kanban_show. "
+                "When supplied, only the same current capability hold can be released; "
+                "a changed/human hold returns an error and remains untouched."
+            ),
+        },
     },
     ["task_id"],
 )

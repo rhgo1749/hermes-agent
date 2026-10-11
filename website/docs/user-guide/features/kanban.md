@@ -460,7 +460,7 @@ Dispatcher-owned workers receive their task lifecycle tools automatically.
 
 | Tool | Purpose | Required params |
 |---|---|---|
-| `kanban_show` | Read the current task (title, body, prior attempts, parent handoffs, comments, full pre-formatted `worker_context`). Defaults to the env's task id. | — |
+| `kanban_show` | Read the current task (title, body, prior attempts, parent handoffs, comments, the last 50 events with immutable event ids, and full pre-formatted `worker_context`). Defaults to the env's task id. | — |
 | `kanban_list` | List task summaries with filters for `assignee`, `status`, `tenant`, archived visibility, and limit. Intended for orchestrators discovering board work. | — |
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
@@ -473,7 +473,7 @@ Dispatcher-owned workers receive their task lifecycle tools automatically.
 | `kanban_attachments` | List a task's attachments. | — |
 | `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, etc. Returns `gated: true` + `gated_by` when an open parent parked the new card in `todo`. | `title`, `assignee` |
 | `kanban_link` | (Orchestrators) add a `parent_id → child_id` dependency edge after the fact. Returns `gated: true` when the child was `ready` and got demoted back to `todo` because the parent is not done — the child will only run after the parent completes. Refused with `child is already running` when the child is already claimed — an edge added after the claim cannot serialise the run (a worker may still link its *own* running card ahead of a `kind=dependency` block). | `parent_id`, `child_id` |
-| `kanban_unblock` | (Orchestrators) restore a blocked task to its source phase (`review` or `ready`), or `todo` while a parent remains open. | `task_id` |
+| `kanban_unblock` | (Orchestrators) restore a blocked task to its source phase (`review` or `ready`), or `todo` while a parent remains open. For automated capability recovery, pass the exact `expected_block_event_id` from `kanban_show`; a stale or human hold is refused without mutation. Omit it for an intentional unconditional orchestrator action. | `task_id`; optional `expected_block_event_id` |
 
 A typical worker turn looks like:
 
