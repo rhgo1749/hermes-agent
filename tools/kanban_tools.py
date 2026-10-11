@@ -428,7 +428,7 @@ _TASK_SUMMARY_FIELDS = tuple(
     "created_at started_at completed_at current_run_id model_override provider_override".split())
 _RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
 _COMMENT_FIELDS = ("author", "body", "created_at")
-_EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
+_EVENT_FIELDS = ("id", "kind", "payload", "created_at", "run_id")
 _ATTACHMENT_FIELDS = tuple(
     "id filename content_type size uploaded_by stored_path created_at".split())
 _CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id")
@@ -1267,8 +1267,22 @@ def _handle_unblock(args: dict, **kw) -> str:
     _check(tid, "task_id is required")
     tid = str(tid)
     _enforce_worker_task_ownership(tid)
+    precondition_supplied = "expected_block_event_id" in args
+    expected_block_event_id = args.get("expected_block_event_id")
+    if precondition_supplied:
+        _check(
+            type(expected_block_event_id) is int and expected_block_event_id > 0,
+            "expected_block_event_id must be a positive integer",
+        )
     with _board(args.get("board")) as (kb, conn):
-        _check(kb.unblock_task(conn, tid), f"could not unblock {tid} (not blocked or unknown)")
+        if not precondition_supplied:
+            ok = kb.unblock_task(conn, tid)
+        else:
+            ok = kb.unblock_task(conn, tid, expected_block_event_id=expected_block_event_id)
+        if not precondition_supplied:
+            _check(ok, f"could not unblock {tid} (not blocked or unknown)")
+        else:
+            _check(ok, f"could not unblock {tid} (capability block event changed or task is not blocked)")
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
 
 
