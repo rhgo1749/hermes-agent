@@ -1597,9 +1597,9 @@ def check_respawn_guard(
         return None
 
     # 3. Completed run within guard window. Exception: an explicit re-queue
-    #    AFTER that success (done→ready drag, re-promotion, unblock, reclaim) is
-    #    a deliberate "run it again" — otherwise a manual done→ready would sit
-    #    silently held until the window elapses.
+    #    AFTER that success (done→ready drag, re-promotion, unblock, reclaim,
+    #    or review reopen) is a deliberate "run it again" — otherwise a manual
+    #    done→ready would sit silently held until the window elapses.
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
     recent_completed = conn.execute(
         "SELECT ended_at FROM task_runs "
@@ -1612,7 +1612,7 @@ def check_respawn_guard(
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed', 'review_reopened') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()
