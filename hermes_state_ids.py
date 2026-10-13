@@ -32,6 +32,9 @@ SESSION_ID_RECOGNIZERS = (
     # chat-completions _derive_chat_session_id f"api-{sha256[:16]}".
     re.compile(r"^api_\d{9,}_[0-9a-f]{8}$"),
     re.compile(r"^api-[0-9a-f]{16}$"),
+    # gateway/platforms/api_server.py _derive_declared_session_id (C9): declared
+    # X-Hermes-Session-Key pins f"key-{sha256[:16]}".
+    re.compile(r"^key-[0-9a-f]{16}$"),
     # gateway/platforms/api_server_runs.py: /v1/runs falls back to its f"run_{uuid4().hex}".
     re.compile(r"^run_[0-9a-f]{32}$"),
     # acp_adapter/session.py and /v1/responses: str(uuid4()).

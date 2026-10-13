@@ -1449,6 +1449,9 @@ class TestDeriveDeclaredSessionId:
         assert research == _derive_declared_session_id("pilot10-C", "research")
         assert _derive_declared_session_id("k") != _derive_chat_session_id("k", "", None)
         assert not _derive_declared_session_id("k").startswith("api-")
+        # Recovery salvage (hermes_state_ids.SESSION_ID_RECOGNIZERS) must know the mint site.
+        from hermes_state_ids import is_known_session_id
+        assert is_known_session_id(_derive_declared_session_id("pilot10-C"))
 
     def test_launch_profile_prefix_keeps_the_unprefixed_id(self, monkeypatch, tmp_path):
         """Same one-profile rule as fingerprint ids: the launch profile's own /p/<launch>/
