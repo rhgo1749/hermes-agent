@@ -1431,31 +1431,33 @@ class TestDeriveChatSessionId:
 
 
 class TestDeriveDeclaredSessionId:
-    """C9: declared X-Hermes-Session-Key must pin a session id of its own, disjoint from
-    the content-hash fingerprint namespace, namespaced by routed profile (#123989 rules)."""
+    """C9: the declared key SALTS the body fingerprint. Distinct keys isolate
+    byte-identical bodies, while the same key under a different first user message
+    rotates to a new conversation (the key is the memory scope; /new compatibility).
+    Namespace stays disjoint from the ``api-`` fingerprints."""
 
     def test_deterministic_and_distinct_per_key(self):
-        assert _derive_declared_session_id("pilot10-C") == _derive_declared_session_id("pilot10-C")
-        assert _derive_declared_session_id("pilot10-C") != _derive_declared_session_id("pilot10-D")
+        assert _derive_declared_session_id("pilot10-C", "sys", "hi") == \
+            _derive_declared_session_id("pilot10-C", "sys", "hi")
+        assert _derive_declared_session_id("pilot10-C", "sys", "hi") != \
+            _derive_declared_session_id("pilot10-D", "sys", "hi")
 
-    def test_namespaced_and_disjoint_from_fingerprint(self):
-        """Unprefixed form is the exact legacy seed (no live-state migration needed), and the
-        ``key-``/``declared-key\\0`` separators keep this namespace disjoint from fingerprint ids."""
-        legacy = "key-" + hashlib.sha256(b"declared-key\0pilot10-C").hexdigest()[:16]
-        assert _derive_declared_session_id("pilot10-C") == legacy
-        assert _derive_declared_session_id("pilot10-C") == _derive_declared_session_id("pilot10-C", "default")
-        research = _derive_declared_session_id("pilot10-C", "research")
-        assert research != legacy
-        assert research == _derive_declared_session_id("pilot10-C", "research")
-        assert _derive_declared_session_id("k") != _derive_chat_session_id("k", "", None)
-        assert not _derive_declared_session_id("k").startswith("api-")
+    def test_salts_fingerprint_and_stays_disjoint(self):
+        """Same key + different first user message = new conversation (the legacy
+        fingerprint split survives declaring a key); the salted id never lands in
+        the ``api-`` namespace."""
+        fp = _derive_chat_session_id("sys", "hi", None)
+        assert _derive_declared_session_id("k", "sys", "hi") != fp
+        assert not _derive_declared_session_id("k", "sys", "hi").startswith("api-")
+        assert _derive_declared_session_id("k", "sys", "hi") != \
+            _derive_declared_session_id("k", "sys", "fresh topic")
         # Recovery salvage (hermes_state_ids.SESSION_ID_RECOGNIZERS) must know the mint site.
         from hermes_state_ids import is_known_session_id
-        assert is_known_session_id(_derive_declared_session_id("pilot10-C"))
+        assert is_known_session_id(_derive_declared_session_id("pilot10-C", "sys", "hi"))
 
     def test_launch_profile_prefix_keeps_the_unprefixed_id(self, monkeypatch, tmp_path):
         """Same one-profile rule as fingerprint ids: the launch profile's own /p/<launch>/
-        prefix must not fork a second session for the same declared key."""
+        prefix must not fork a second session for the same key and conversation."""
         import hermes_constants
         from hermes_cli import profiles
 
@@ -1463,8 +1465,10 @@ class TestDeriveDeclaredSessionId:
         work.mkdir(parents=True)
         monkeypatch.setattr(hermes_constants, "get_routing_process_hermes_home", lambda: work)
         monkeypatch.setattr(profiles, "get_profile_dir", lambda name: tmp_path / "profiles" / name)
-        assert _derive_declared_session_id("kk", "work") == _derive_declared_session_id("kk")
-        assert _derive_declared_session_id("kk", "research") != _derive_declared_session_id("kk")
+        assert _derive_declared_session_id("kk", "sys", "hi", "work") == \
+            _derive_declared_session_id("kk", "sys", "hi", None)
+        assert _derive_declared_session_id("kk", "sys", "hi", "research") != \
+            _derive_declared_session_id("kk", "sys", "hi", None)
 
 
 # ---------------------------------------------------------------------------
@@ -2598,9 +2602,11 @@ class TestSessionKeyHeader:
 
 
 class TestDeclaredSessionKeyIsolation:
-    """Route-level: a declared X-Hermes-Session-Key pins the agent session bucket.
+    """Route-level: a declared X-Hermes-Session-Key salts the session-id fingerprint.
     Distinct keys keep distinct sessions even for byte-identical bodies (the pilot10
-    C8/C9 merge), and header-less legacy clients keep fingerprint grouping untouched."""
+    C8/C9 merge), the same key opens a fresh session for a new first exchange (/new
+    compatibility, memory scope preserved), and header-less legacy clients keep
+    fingerprint grouping untouched."""
 
     _RESULT = {"final_response": "ok", "messages": [], "api_calls": 1}
 
@@ -2640,8 +2646,10 @@ class TestDeclaredSessionKeyIsolation:
         assert resp_c.status == resp_d.status == 200
         ids = [c.kwargs["session_id"] for c in mock_run.call_args_list]
         assert ids[0] != ids[1]
-        assert ids[0] == _derive_declared_session_id("pilot10-C")
-        assert ids[1] == _derive_declared_session_id("pilot10-D")
+        assert ids[0] == _derive_declared_session_id(
+            "pilot10-C", "shared system prompt", body["messages"][1]["content"], None)
+        assert ids[1] == _derive_declared_session_id(
+            "pilot10-D", "shared system prompt", body["messages"][1]["content"], None)
         fingerprint = _derive_chat_session_id("shared system prompt", body["messages"][1]["content"], None)
         assert fingerprint not in ids
         # The client learns the bucket id it can later address via X-Hermes-Session-Id.
@@ -2649,25 +2657,26 @@ class TestDeclaredSessionKeyIsolation:
         assert resp_c.headers.get("X-Hermes-Session-Key") == "pilot10-C"
 
     @pytest.mark.asyncio
-    async def test_same_key_stays_one_bucket_and_keeps_memory_scope(self, auth_adapter):
-        """Same declared key across different bodies -> one stable session; the key still
-        threads through as the long-term memory scope; wake delivery stays header-only."""
+    async def test_same_key_new_conversation_rotates_and_keeps_memory_scope(self, auth_adapter):
+        """The declared key is the durable memory scope, NOT a transcript: replaying the
+        same first exchange continues one session, while a new first user message under
+        the same key opens a fresh session (the /new-style contract) — both runs keep
+        carrying the key as the long-term memory scope. Wake delivery stays header-only."""
         patcher, mock_run = self._mock_run(auth_adapter)
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
             with patcher:
-                r1 = await cli.post(
-                    "/v1/chat/completions",
-                    headers={"X-Hermes-Session-Key": "chan:stable", "Authorization": "Bearer sk-secret"},
-                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "one"}]})
-                r2 = await cli.post(
-                    "/v1/chat/completions",
-                    headers={"X-Hermes-Session-Key": "chan:stable", "Authorization": "Bearer sk-secret"},
-                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "two"}]})
-        assert r1.status == r2.status == 200
+                for content in ("one", "one", "two"):
+                    r = await cli.post(
+                        "/v1/chat/completions",
+                        headers={"X-Hermes-Session-Key": "chan:stable", "Authorization": "Bearer sk-secret"},
+                        json={"model": "hermes-agent", "messages": [{"role": "user", "content": content}]})
+                    assert r.status == 200
         calls = mock_run.call_args_list
-        assert calls[0].kwargs["session_id"] == calls[1].kwargs["session_id"]
-        assert calls[0].kwargs["session_id"] == _derive_declared_session_id("chan:stable")
+        conv_a = _derive_declared_session_id("chan:stable", None, "one", None)
+        conv_b = _derive_declared_session_id("chan:stable", None, "two", None)
+        assert conv_a != conv_b
+        assert [c.kwargs["session_id"] for c in calls] == [conv_a, conv_a, conv_b]
         assert all(c.kwargs["gateway_session_key"] == "chan:stable" for c in calls)
         assert all(c.kwargs["session_history_delivery"] == "" for c in calls)
 

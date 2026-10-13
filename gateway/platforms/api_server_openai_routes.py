@@ -677,10 +677,10 @@ class OpenAICompatRoutesMixin:
         if not _content_has_visible_payload(user_message):
             return _invalid_request("No user message found in messages")
 
-        # X-Hermes-Session-Key scopes long-term memory per channel AND (C9) pins the
-        # server-side session bucket: declared keys no longer fall through to the
-        # content-hash fingerprint below. Independent of X-Hermes-Session-Id (the key
-        # persists across transcripts, the id rotates on /new).
+        # X-Hermes-Session-Key scopes long-term memory per channel; C9 additionally
+        # salts it into the session-id fingerprint so two channels sending identical
+        # bodies never share a session. It never REPLACES the transcript rotation:
+        # the key persists across transcripts, the id rotates on /new-style bodies.
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
@@ -717,12 +717,18 @@ class OpenAICompatRoutesMixin:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
         elif gateway_session_key:
-            # C9: a declared X-Hermes-Session-Key pins the session bucket, so conversations
-            # that share a long common prefix (full-replay clients) no longer collapse onto
-            # one content-hash session. The id is an opaque hash of the key (never the raw
-            # key), and the body still supplies the history exactly as for header-less
-            # clients — only the persistence/memory grouping changes.
-            session_id = _derive_declared_session_id(gateway_session_key, _api_request_profile.get())
+            # C9 fix, /new-compatible: the declared key is the durable memory/channel
+            # scope, not a transcript (messaging /new opens a fresh session row under
+            # the same key; responses/runs fence recovery the same way). So the id is
+            # the body fingerprint salted with the key: same first exchange = the same
+            # conversation, a different first user message = a new conversation under
+            # the same memory scope (legacy split preserved), and identical bodies
+            # under different keys stay separate (the C9 defect). History comes from
+            # the body exactly as for header-less clients.
+            first_user = next(
+                (cm.get("content", "") for cm in conversation_messages if cm.get("role") == "user"), "")
+            session_id = _derive_declared_session_id(
+                gateway_session_key, system_prompt, first_user, _api_request_profile.get())
         else:
             # Legacy fallback (no declared key): stable id from the conversation fingerprint
             # so Open WebUI-style clients map onto one Hermes session; namespaced by the
