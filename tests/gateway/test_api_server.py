@@ -32,6 +32,7 @@ from gateway.platforms.api_server import (
     _api_request_profile,
     _IdempotencyCache,
     _derive_chat_session_id,
+    _derive_declared_session_id,
     _redact_api_error_text,
     _request_agent_overrides,
     _request_relay_metadata,
@@ -1429,6 +1430,47 @@ class TestDeriveChatSessionId:
         assert _derive_chat_session_id("sys", "hello", "research") != _derive_chat_session_id("sys", "hello")
 
 
+class TestDeriveDeclaredSessionId:
+    """C9: the declared key SALTS the body fingerprint. Distinct keys isolate
+    byte-identical bodies, while the same key under a different first user message
+    rotates to a new conversation (the key is the memory scope; /new compatibility).
+    Namespace stays disjoint from the ``api-`` fingerprints."""
+
+    def test_deterministic_and_distinct_per_key(self):
+        assert _derive_declared_session_id("pilot10-C", "sys", "hi") == \
+            _derive_declared_session_id("pilot10-C", "sys", "hi")
+        assert _derive_declared_session_id("pilot10-C", "sys", "hi") != \
+            _derive_declared_session_id("pilot10-D", "sys", "hi")
+
+    def test_salts_fingerprint_and_stays_disjoint(self):
+        """Same key + different first user message = new conversation (the legacy
+        fingerprint split survives declaring a key); the salted id never lands in
+        the ``api-`` namespace."""
+        fp = _derive_chat_session_id("sys", "hi", None)
+        assert _derive_declared_session_id("k", "sys", "hi") != fp
+        assert not _derive_declared_session_id("k", "sys", "hi").startswith("api-")
+        assert _derive_declared_session_id("k", "sys", "hi") != \
+            _derive_declared_session_id("k", "sys", "fresh topic")
+        # Recovery salvage (hermes_state_ids.SESSION_ID_RECOGNIZERS) must know the mint site.
+        from hermes_state_ids import is_known_session_id
+        assert is_known_session_id(_derive_declared_session_id("pilot10-C", "sys", "hi"))
+
+    def test_launch_profile_prefix_keeps_the_unprefixed_id(self, monkeypatch, tmp_path):
+        """Same one-profile rule as fingerprint ids: the launch profile's own /p/<launch>/
+        prefix must not fork a second session for the same key and conversation."""
+        import hermes_constants
+        from hermes_cli import profiles
+
+        work = tmp_path / "profiles" / "work"
+        work.mkdir(parents=True)
+        monkeypatch.setattr(hermes_constants, "get_routing_process_hermes_home", lambda: work)
+        monkeypatch.setattr(profiles, "get_profile_dir", lambda name: tmp_path / "profiles" / name)
+        assert _derive_declared_session_id("kk", "sys", "hi", "work") == \
+            _derive_declared_session_id("kk", "sys", "hi", None)
+        assert _derive_declared_session_id("kk", "sys", "hi", "research") != \
+            _derive_declared_session_id("kk", "sys", "hi", None)
+
+
 # ---------------------------------------------------------------------------
 # /v1/responses endpoint
 # ---------------------------------------------------------------------------
@@ -2552,6 +2594,149 @@ class TestSessionKeyHeader:
             assert resp.headers.get("X-Hermes-Session-Key") == "webui:chan-1"
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["gateway_session_key"] == "webui:chan-1"
+
+
+# ---------------------------------------------------------------------------
+# Declared X-Hermes-Session-Key session isolation (C9 contract)
+# ---------------------------------------------------------------------------
+
+
+class TestDeclaredSessionKeyIsolation:
+    """Route-level: a declared X-Hermes-Session-Key salts the session-id fingerprint.
+    Distinct keys keep distinct sessions even for byte-identical bodies (the pilot10
+    C8/C9 merge), the same key opens a fresh session for a new first exchange (/new
+    compatibility, memory scope preserved), and header-less legacy clients keep
+    fingerprint grouping untouched."""
+
+    _RESULT = {"final_response": "ok", "messages": [], "api_calls": 1}
+
+    @staticmethod
+    def _identical_body():
+        return {
+            "model": "hermes-agent",
+            "messages": [
+                {"role": "system", "content": "shared system prompt"},
+                {"role": "user", "content": "shared replay prefix\nACTIVE_REQUEST"},
+            ],
+        }
+
+    @staticmethod
+    def _mock_run(auth_adapter):
+        mock_run = AsyncMock(return_value=(dict(TestDeclaredSessionKeyIsolation._RESULT),
+                                           {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}))
+        return patch.object(auth_adapter, "_run_agent", new=mock_run), mock_run
+
+    @pytest.mark.asyncio
+    async def test_identical_bodies_under_different_keys_do_not_merge(self, auth_adapter):
+        """C9 regression: identical body+system prompt under two declared keys must NOT
+        collapse onto the content-hash session the fingerprint fallback would derive."""
+        patcher, mock_run = self._mock_run(auth_adapter)
+        app = _create_app(auth_adapter)
+        body = self._identical_body()
+        async with TestClient(TestServer(app)) as cli:
+            with patcher:
+                resp_c = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Key": "pilot10-C", "Authorization": "Bearer sk-secret"},
+                    json=body)
+                resp_d = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Key": "pilot10-D", "Authorization": "Bearer sk-secret"},
+                    json=body)
+        assert resp_c.status == resp_d.status == 200
+        ids = [c.kwargs["session_id"] for c in mock_run.call_args_list]
+        assert ids[0] != ids[1]
+        assert ids[0] == _derive_declared_session_id(
+            "pilot10-C", "shared system prompt", body["messages"][1]["content"], None)
+        assert ids[1] == _derive_declared_session_id(
+            "pilot10-D", "shared system prompt", body["messages"][1]["content"], None)
+        fingerprint = _derive_chat_session_id("shared system prompt", body["messages"][1]["content"], None)
+        assert fingerprint not in ids
+        # The client learns the bucket id it can later address via X-Hermes-Session-Id.
+        assert resp_c.headers.get("X-Hermes-Session-Id") == ids[0]
+        assert resp_c.headers.get("X-Hermes-Session-Key") == "pilot10-C"
+
+    @pytest.mark.asyncio
+    async def test_same_key_new_conversation_rotates_and_keeps_memory_scope(self, auth_adapter):
+        """The declared key is the durable memory scope, NOT a transcript: replaying the
+        same first exchange continues one session, while a new first user message under
+        the same key opens a fresh session (the /new-style contract) — both runs keep
+        carrying the key as the long-term memory scope. Wake delivery stays header-only."""
+        patcher, mock_run = self._mock_run(auth_adapter)
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patcher:
+                for content in ("one", "one", "two"):
+                    r = await cli.post(
+                        "/v1/chat/completions",
+                        headers={"X-Hermes-Session-Key": "chan:stable", "Authorization": "Bearer sk-secret"},
+                        json={"model": "hermes-agent", "messages": [{"role": "user", "content": content}]})
+                    assert r.status == 200
+        calls = mock_run.call_args_list
+        conv_a = _derive_declared_session_id("chan:stable", None, "one", None)
+        conv_b = _derive_declared_session_id("chan:stable", None, "two", None)
+        assert conv_a != conv_b
+        assert [c.kwargs["session_id"] for c in calls] == [conv_a, conv_a, conv_b]
+        assert all(c.kwargs["gateway_session_key"] == "chan:stable" for c in calls)
+        assert all(c.kwargs["session_history_delivery"] == "" for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_headerless_clients_keep_fingerprint_grouping(self, auth_adapter):
+        """Legacy compatibility: no declared key -> byte-identical behavior to the
+        pre-fix content-hash fallback (same body twice maps to one fingerprint session)."""
+        patcher, mock_run = self._mock_run(auth_adapter)
+        app = _create_app(auth_adapter)
+        body = self._identical_body()
+        async with TestClient(TestServer(app)) as cli:
+            with patcher:
+                for _ in range(2):
+                    resp = await cli.post("/v1/chat/completions",
+                                          headers={"Authorization": "Bearer sk-secret"}, json=body)
+                    assert resp.status == 200
+        ids = [c.kwargs["session_id"] for c in mock_run.call_args_list]
+        expected = _derive_chat_session_id("shared system prompt", body["messages"][1]["content"], None)
+        assert ids == [expected, expected]
+
+    @pytest.mark.asyncio
+    async def test_explicit_session_id_takes_precedence_over_declared_key(self, auth_adapter):
+        """The existing X-Hermes-Session-Id contract (DB history, #13437 identity echo) is
+        untouched when both headers are present; the key keeps its memory-scope role."""
+        db_history = [{"role": "user", "content": "stored"}]
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = db_history
+        mock_db.resolve_resume_session_id.side_effect = lambda sid: sid
+        auth_adapter._session_db = mock_db
+        patcher, mock_run = self._mock_run(auth_adapter)
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patcher:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "existing-session",
+                             "X-Hermes-Session-Key": "chan:pair",
+                             "Authorization": "Bearer sk-secret"},
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "next"}]})
+        assert resp.status == 200
+        kwargs = mock_run.call_args.kwargs
+        assert kwargs["session_id"] == "existing-session"
+        assert kwargs["gateway_session_key"] == "chan:pair"
+        assert kwargs["conversation_history"] == db_history
+        assert resp.headers.get("X-Hermes-Session-Id") == "existing-session"
+
+    @pytest.mark.asyncio
+    async def test_declared_key_requires_api_key(self, adapter):
+        """The key now decides session identity, so the auth gate (403 without
+        API_SERVER_KEY) is load-bearing and pinned here too."""
+        patcher, mock_run = self._mock_run(adapter)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patcher:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Key": "chan:noauth"},
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "hi"}]})
+        assert resp.status == 403
+        assert mock_run.call_count == 0
 
 
 

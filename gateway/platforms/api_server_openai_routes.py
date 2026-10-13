@@ -637,7 +637,8 @@ class OpenAICompatRoutesMixin:
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
         from gateway.platforms.api_server import (
             ThreadSafeAsyncQueue, _api_request_profile, _chat_usage_payload, _coerce_request_bool,
-            _content_has_visible_payload, _derive_chat_session_id, _error_response, _invalid_request,
+            _content_has_visible_payload, _derive_chat_session_id, _derive_declared_session_id,
+            _error_response, _invalid_request,
             _multimodal_validation_error, _normalize_chat_content, _normalize_multimodal_content,
             _openai_error, _redact_api_error_text, _resolve_media_to_data_urls)
         # Bound total in-flight agent runs (configurable; #7483).
@@ -676,8 +677,10 @@ class OpenAICompatRoutesMixin:
         if not _content_has_visible_payload(user_message):
             return _invalid_request("No user message found in messages")
 
-        # X-Hermes-Session-Key scopes long-term memory per channel; independent of
-        # X-Hermes-Session-Id (the key persists across transcripts, the id rotates on /new).
+        # X-Hermes-Session-Key scopes long-term memory per channel; C9 additionally
+        # salts it into the session-id fingerprint so two channels sending identical
+        # bodies never share a session. It never REPLACES the transcript rotation:
+        # the key persists across transcripts, the id rotates on /new-style bodies.
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
@@ -713,9 +716,23 @@ class OpenAICompatRoutesMixin:
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
+        elif gateway_session_key:
+            # C9 fix, /new-compatible: the declared key is the durable memory/channel
+            # scope, not a transcript (messaging /new opens a fresh session row under
+            # the same key; responses/runs fence recovery the same way). So the id is
+            # the body fingerprint salted with the key: same first exchange = the same
+            # conversation, a different first user message = a new conversation under
+            # the same memory scope (legacy split preserved), and identical bodies
+            # under different keys stay separate (the C9 defect). History comes from
+            # the body exactly as for header-less clients.
+            first_user = next(
+                (cm.get("content", "") for cm in conversation_messages if cm.get("role") == "user"), "")
+            session_id = _derive_declared_session_id(
+                gateway_session_key, system_prompt, first_user, _api_request_profile.get())
         else:
-            # Stable id from the conversation fingerprint so Open WebUI-style clients map onto
-            # one Hermes session; namespaced by the routed profile (#123989).
+            # Legacy fallback (no declared key): stable id from the conversation fingerprint
+            # so Open WebUI-style clients map onto one Hermes session; namespaced by the
+            # routed profile (#123989).
             first_user = next(
                 (cm.get("content", "") for cm in conversation_messages if cm.get("role") == "user"), "")
             session_id = _derive_chat_session_id(system_prompt, first_user, _api_request_profile.get())

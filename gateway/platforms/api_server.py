@@ -1057,6 +1057,30 @@ def _derive_chat_session_id(system_prompt: Optional[str], first_user_message: st
     return f"api-{digest}"
 
 
+def _derive_declared_session_id(gateway_session_key: str,
+                                system_prompt: Optional[str], first_user_message: str,
+                                profile: Optional[str] = None) -> str:
+    """Stable session id for a declared X-Hermes-Session-Key (C9 fix, /new-compatible).
+
+    The declared key is a durable channel/memory scope, not a transcript: messaging
+    /new opens a fresh session row under the same key (reset fence in
+    ``find_latest_gateway_session_for_peer``) and responses/runs recover transcripts
+    the same way. Pinning one id per key would splice every later conversation into
+    the first transcript (DB rows and provider replay alike), so the id is the body
+    fingerprint salted with the key: same key + same first exchange = continuation,
+    same key + different first user message = a new conversation under the same
+    memory scope (the legacy fingerprint split is preserved), and identical bodies
+    under different keys stay separate (the C9 defect this fixes). The ``key-``
+    prefix and the ``declared-key\\0`` domain separator keep the namespace disjoint
+    from ``api-`` fingerprints; profile namespacing (#123989) is inherited from the
+    fingerprint seed.
+    """
+    fingerprint = _derive_chat_session_id(system_prompt, first_user_message, profile)
+    seed = f"declared-key\0{gateway_session_key}\0{fingerprint}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+    return f"key-{digest}"
+
+
 _CRON_AVAILABLE = False
 try:
     from cron.jobs import (
