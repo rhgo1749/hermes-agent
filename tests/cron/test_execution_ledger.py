@@ -313,7 +313,7 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         scheduler, "finish_execution",
         lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
     )
-    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "submit-fail"}])
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda **_kw: [{"id": "submit-fail"}])
     monkeypatch.setattr(scheduler, "claim_job_for_fire", lambda _job_id: True)
     monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: BrokenPool())
 

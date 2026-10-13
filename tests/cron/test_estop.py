@@ -97,7 +97,7 @@ def test_cron_tick_skips_dispatch_when_engaged(hermes_home, monkeypatch):
 
     calls = []
 
-    def _fake_get_due_jobs():
+    def _fake_get_due_jobs(**_kw):
         calls.append(1)
         return []
 
@@ -113,7 +113,7 @@ def test_cron_tick_resumes_after_disengage(hermes_home, monkeypatch):
 
     calls = []
 
-    def _fake_get_due_jobs():
+    def _fake_get_due_jobs(**_kw):
         calls.append(1)
         return []
 

@@ -488,7 +488,12 @@ class InProcessCronScheduler(CronScheduler):
             ok = False
             try:
                 if can_dispatch is not None and not can_dispatch():
-                    logger.debug("Cron dispatch paused while gateway drains existing work")
+                    # INFO + stamp: the blackout must be durable for the successor scan
+                    # (incident 2026-10-13); this store is the process's active cron store.
+                    logger.info("Cron dispatch paused while gateway drains existing work")
+                    with contextlib.suppress(Exception):
+                        from cron.drain_windows import mark_drain_window
+                        mark_drain_window("gateway drain")
                 else:
                     cron_tick(
                         verbose=False, adapters=adapters, loop=loop, sync=False,
@@ -614,7 +619,19 @@ class InProcessCronScheduler(CronScheduler):
                 consecutive_failures = _note_tick_failure(e, consecutive_failures)
             try:
                 if can_dispatch is not None and not can_dispatch():
-                    logger.debug("Cron dispatch paused while gateway drains existing work")
+                    # INFO + per-store stamp: a multiplex drain freezes EVERY profile's scan
+                    # (incident 2026-10-13); each store needs its own blackout record. The
+                    # blackout is closed exclusively by the admitted per-home cron_tick below
+                    # (it passes close_drain_windows=True through get_due_jobs) — side callers
+                    # must never close it (see get_due_jobs docstring).
+                    logger.info("Cron dispatch paused while gateway drains existing work")
+                    from cron.drain_windows import mark_drain_window
+                    for _pname, home in cycle_homes:
+                        try:
+                            with _profile_cron_scope(home):
+                                mark_drain_window("gateway drain")
+                        except BaseException as _dw_exc:
+                            logger.debug("Drain-window stamp failed for profile %s: %s", home, _dw_exc)
                 else:
                     for _pname, home in cycle_homes:
                         try:
