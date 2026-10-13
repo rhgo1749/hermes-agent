@@ -1057,6 +1057,26 @@ def _derive_chat_session_id(system_prompt: Optional[str], first_user_message: st
     return f"api-{digest}"
 
 
+def _derive_declared_session_id(gateway_session_key: str,
+                                profile: Optional[str] = None) -> str:
+    """Stable session id for a declared X-Hermes-Session-Key (C9 contract fix).
+
+    The content-hash fallback in :func:`_derive_chat_session_id` keys off the request body,
+    so two conversations that share a long common prefix (a full-replay client with an
+    identical 64KB header) collapse onto one session. A declared key must instead pin the
+    session: distinct keys -> distinct sessions even for byte-identical bodies, same key ->
+    one stable session. The ``key-`` prefix and the ``declared-key\0`` domain separator keep
+    this namespace disjoint from fingerprint ids, and the profile seed mirrors
+    :func:`_derive_chat_session_id` so two profiles never share a declared-key session
+    (#123989).
+    """
+    seed = f"declared-key\0{gateway_session_key}"
+    if profile and profile != "default" and not _names_launch_profile(profile):
+        seed = f"{profile}\0{seed}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+    return f"key-{digest}"
+
+
 _CRON_AVAILABLE = False
 try:
     from cron.jobs import (
