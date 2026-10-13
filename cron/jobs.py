@@ -2874,7 +2874,7 @@ def _sweep_completed_oneshots(
 
 # --- Due scan ---
 
-def get_due_jobs() -> list[dict[str, Any]]:
+def get_due_jobs(close_drain_windows: bool = False) -> list[dict[str, Any]]:
     """Return all jobs due now. A recurring job more than one period stale (gateway down, or a run
     overran the interval) has its backlog collapsed — next_run_at fast-forwards so nothing
     burst-fires — but still fires ONCE now (via mark_job_run, consuming one ``repeat.times`` run),
@@ -2882,9 +2882,14 @@ def get_due_jobs() -> list[dict[str, Any]]:
 
     This prevents the perpetual-defer loop (#33315) where a job whose runtime exceeds ``interval + grace``
     would be skipped forever.
+
+    ``close_drain_windows`` ends recorded dispatch blackouts and is reserved for the SCHEDULER's
+    admitted scan (the first allowed scan IS the blackout's end). CLI/diagnostic callers must
+    leave it False: closing from a side call would split a still-live blackout and let the
+    successor tick stamp a fresh window, hiding the freeze the recovery depends on.
     """
     with _jobs_lock():
-        return _get_due_jobs_locked()
+        return _get_due_jobs_locked(close_drain_windows=close_drain_windows)
 
 
 @dataclass
@@ -3145,13 +3150,73 @@ def _fast_forward_missed_recurring(d: _DueJob, grace: int) -> bool:
     return False
 
 
+def _dispatch_attempt_exists(job: Dict[str, Any], instant: str) -> bool:
+    """True when the executions ledger holds ANY row for this occurrence — the occurrence was
+    already claimed/dispatched once, so an external effect may exist and it must not be
+    re-dispatched. Fail-closed on DB errors: no recovery, the legacy tombstone retire runs.
+    """
+    from cron.occurrences import scheduled_instant
+    canonical = scheduled_instant(instant)
+    if canonical is None:
+        return True
+    from cron.executions import _transaction
+    try:
+        with _transaction() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM executions WHERE job_id=? AND scheduled_instant=? LIMIT 1",
+                (str(job.get("id")), canonical)).fetchone()
+        return row is not None
+    except Exception:
+        logger.warning("Cannot check dispatch receipts for job %s; not recovering it",
+                       job.get("id"), exc_info=True)
+        return True
+
+
+def _drain_deferred_oneshot(d: "_DueJob") -> bool:
+    """True when a PLANNED gateway drain blackout — not scheduler-down/host-sleep/edit — is the
+    recorded reason the occurrence never dispatched: a drain window covers the stored run time
+    AND the job carries no claim AND the ledger has no row for that occurrence, making a
+    re-dispatch provably the FIRST attempt. The job stays due; the ordinary due path stamps
+    ``run_claim`` under the jobs lock and dispatches it once.
+
+    Recovery is capped at ONE per job (``drain_recoveries`` marker, persisted with the store):
+    if a restored occurrence's claim went stale with no ledger receipt, the run outcome is
+    unprovable, so we choose at-most-once — retire with the standard missed-oneshot diagnostic
+    instead of looping re-dispatch forever behind a poison dispatcher.
+    """
+    from cron.drain_windows import covering_drain_window
+    window = covering_drain_window(d.next_run, d.scan.now)
+    if window is None or _dispatch_attempt_exists(d.job, d.next_run):
+        return False
+    prior = int(d.job.get("drain_recoveries") or 0)
+    if prior >= 1:
+        logger.warning(
+            "Job '%s' (%s): already restored once from drain blackout %s and its claim then "
+            "expired with NO ledger receipt — outcome unprovable; retiring instead of "
+            "re-dispatching again (at-most-once for unprovable runs).",
+            d.label, d.job.get("id"), window.get("id"))
+        return False
+    d.job["drain_recoveries"] = prior + 1
+    d.scan.persist(d.job["id"], drain_recoveries=prior + 1)
+    logger.warning(
+        "Job '%s' (%s): run time %s fell inside planned drain blackout %s (stamped %s); "
+        "restoring it as due instead of retiring — never claimed, never dispatched.",
+        d.label, d.job.get("id"), d.next_run, window.get("id"), window.get("started_at"))
+    return True
+
+
 def _retire_expired_oneshot(d: _DueJob) -> bool:
     """One-shot grace gate; True when the job must not fire this tick.
 
     A one-shot beyond the grace window must never fire (create/update/resume reject such schedules
     and recovery never revives them; only the due scan used to dispatch them hours late). With no
     claim stamped, retire it with a diagnostic (never silently delete). A claim may mean a run is
-    still in flight elsewhere — skip but keep the record so its mark_job_run can land."""
+    still in flight elsewhere — skip but keep the record so its mark_job_run can land.
+
+    Planned-drain exception: a run time swallowed by a recorded dispatch blackout (gateway drain)
+    is restored as due instead, but ONLY while receipts prove the occurrence was never claimed or
+    dispatched (see ``_drain_deferred_oneshot``); anything with a claim or a ledger row keeps the
+    legacy retire/skip behavior."""
     if _elapsed_seconds(d.scan.now, d.next_run_dt) <= ONESHOT_GRACE_SECONDS:
         return False
     # Due during an outage of its store: it was skipped, not missed; fire it once on recovery.
@@ -3162,6 +3227,8 @@ def _retire_expired_oneshot(d: _DueJob) -> bool:
     if isinstance(claim, dict) and claim.get("outage") and not d.job.get("fire_claim"):
         return False
     if not (claim or d.job.get("fire_claim")):
+        if _drain_deferred_oneshot(d):
+            return False
         _write_missed_oneshot_diagnostic(d.job, d.next_run)
         d.scan.retire(d.job["id"])
         d.scan.on_saved.append(lambda job=d.job: record_cron_missed(job))
@@ -3316,7 +3383,7 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     return True
 
 
-def _get_due_jobs_locked() -> list[dict[str, Any]]:
+def _get_due_jobs_locked(close_drain_windows: bool = False) -> list[dict[str, Any]]:
     """Inner implementation of get_due_jobs(); must be called with _jobs_lock held."""
     raw_jobs = load_jobs()
     scan = _DueScan(raw_jobs, _hermes_now())
@@ -3358,6 +3425,17 @@ def _get_due_jobs_locked() -> list[dict[str, Any]]:
             return due
     # Only now is a skipped one-shot claimed or durably due on disk: normal grace applies again.
     store_health.end_recovery_window(_current_cron_store().cron_dir)
+    # The admitted SCHEDULER scan ran with dispatch allowed, so any recorded blackout ended
+    # here: close AFTER evaluation so this scan still evaluates jobs against the window it ends
+    # (cron/drain_windows). Side callers (CLI/diagnostics) never close — see get_due_jobs. On
+    # the unwritable early-return above the blackout stays open: an un-persisted scan has not
+    # proven dispatch is possible again.
+    if close_drain_windows:
+        try:
+            from cron.drain_windows import close_open_drain_windows
+            close_open_drain_windows(scan.now)
+        except Exception:
+            logger.debug("Drain-window close failed", exc_info=True)
     for emit in scan.on_saved:
         emit()
     return due

@@ -47,7 +47,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
 def test_tick_skips_job_when_durable_fire_claim_is_lost(monkeypatch):
     """A manual/external fire that wins the shared CAS must exclude ticker."""
     calls = _patch_pipeline(monkeypatch)
-    monkeypatch.setattr(s, "get_due_jobs", lambda: [{"id": "j1", "name": "t"}])
+    monkeypatch.setattr(s, "get_due_jobs", lambda **_kw: [{"id": "j1", "name": "t"}])
     monkeypatch.setattr(s, "claim_job_for_fire", lambda _job_id: False)
 
     assert s.tick(verbose=False, sync=True) == 0

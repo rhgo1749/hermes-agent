@@ -97,7 +97,13 @@ def _tick_admitted(
                 return 0
 
         if can_dispatch is not None and not can_dispatch():
-            _sched.logger.debug("Cron dispatch paused while gateway drains existing work")
+            # INFO, not debug: the blackout was invisible in the 2026-10-13 incident (a one-shot
+            # died inside a 19-minute drain with zero log lines). The stamp records the freeze so
+            # the successor scan can tell a drain-deferred one-shot from an expired one.
+            _sched.logger.info("Cron dispatch paused while gateway drains existing work")
+            with contextlib.suppress(Exception):
+                from cron.drain_windows import mark_drain_window
+                mark_drain_window("gateway drain")
             return 0
 
         from cron.bot_chat_delivery import drain, drain_in_background
@@ -112,7 +118,7 @@ def _tick_admitted(
         except Exception as _wt_exc:
             _sched.logger.debug("Worktree maintenance dispatch failed: %s", _wt_exc)
 
-        due_jobs = _sched.get_due_jobs()
+        due_jobs = _sched.get_due_jobs(close_drain_windows=True)
         _sched._sweep_stale_inflight_for_tick(due_jobs)
 
         if not due_jobs:
