@@ -34,6 +34,15 @@ _MAX_WINDOWS = 20
 # than the ordinary late-fire window.
 _PRE_FREEZE_WINDOW_SECONDS = 90
 
+# How long an OPEN blackout may be trusted at all. A real drain lasts as long as the operator's
+# drain timeout plus process restart time (19.6 minutes on 2026-10-13); a window still open
+# after 4 hours has never been seen by any allowed scan, i.e. the store was simply offline on
+# its own — expiries there belong to the legacy grace policy, not to a recovery from a
+# blackout no process is running any more. Refusals get an explicit diagnostic in
+# ``jobs._retire_expired_oneshot``; ``close_open_drain_windows`` also marks such a window
+# ``stale`` so it stays untrusted after the close.
+_OPEN_WINDOW_MAX_AGE_SECONDS = 4 * 3600
+
 
 def _windows_file() -> Path:
     from cron.jobs import _current_cron_store
@@ -89,41 +98,108 @@ def mark_drain_window(reason: str) -> Optional[Dict[str, Any]]:
 
 def covering_drain_window(instant: str, now: datetime) -> Optional[Dict[str, Any]]:
     """Return the blackout window that could have swallowed ``instant`` (an overdue
-    one-shot's stored run time), or None.
+    one-shot's stored run time) AND is still trusted, or None.
 
     Coverage starts ``_PRE_FREEZE_WINDOW_SECONDS`` before the stamp (see that constant: it is
     what a healthy ticker could still have fired, NOT the full grace window) and ends at the
-    close stamp, or ``now`` while open (the blackout lasts until the first allowed scan, which
-    is this scan). A CLOSED window only counts within ``ONESHOT_GRACE_SECONDS`` of its own
-    close: the recovery scan itself, plus the crash-before-save retry immediately after it.
-    Without that recency cap a weeks-old window would keep reviving manually-edited or
-    host-sleep-stale one-shots whose timestamps happen to land inside it — those must stay
+    close stamp, or ``now`` while open. A CLOSED window only counts within
+    ``ONESHOT_GRACE_SECONDS`` of its own close (the recovery scan itself plus the
+    crash-before-save retry still count); an OPEN window only counts while its age is under
+    ``_OPEN_WINDOW_MAX_AGE_SECONDS``. Without those caps a weeks-old or abandoned window would
+    keep reviving manually-edited, host-sleep-stale, or long-dead one-shots — those must stay
     retired under the legacy policy.
     """
+    return _matching_drain_windows(instant, now)[0]
+
+
+def stale_covering_drain_window(instant: str, now: datetime) -> Optional[Dict[str, Any]]:
+    """A window that WOULD cover ``instant`` but matches only after failing its own
+    staleness cap. The missed-oneshot retire calls this to make an abandoned-blackout refusal
+    explicit (log + diagnostic note) instead of leaving it as plain silent expiry."""
+    return _matching_drain_windows(instant, now)[1]
+
+
+def _matching_drain_windows(instant: str, now: datetime):
+    """Return ``(fresh, stale)`` windows matching ``instant``, each or None."""
     from cron.jobs import ONESHOT_GRACE_SECONDS
     try:
         due = datetime.fromisoformat(instant)
     except (TypeError, ValueError):
-        return None
+        return None, None
     if due.tzinfo is None:
-        return None
+        return None, None
+    fresh = stale = None
     for window in _load_windows():
-        try:
-            start = datetime.fromisoformat(window["started_at"])
-        except ValueError:
+        bounds = _window_bounds(window, now)
+        if bounds is None:
             continue
-        if start.tzinfo is None:
+        start, end, ended_raw = bounds
+        if not (start - timedelta(seconds=_PRE_FREEZE_WINDOW_SECONDS) <= due <= min(end, now)):
             continue
-        ended = window.get("ended_at")
+        too_old = bool(window.get("stale"))
+        if ended_raw is None:
+            too_old = too_old or (now - start).total_seconds() > _OPEN_WINDOW_MAX_AGE_SECONDS
+        else:
+            too_old = too_old or (now > end + timedelta(seconds=ONESHOT_GRACE_SECONDS))
+        if too_old:
+            stale = stale or window
+        else:
+            fresh = fresh or window
+    return fresh, stale
+
+
+def _window_bounds(window: Dict[str, Any], now: datetime):
+    """Parse a record to ``(start, end, ended_raw)``; None when malformed. An open window's
+    ``end`` is ``now`` (the blackout lasts until the first allowed scan, which is the scan
+    asking)."""
+    try:
+        start = datetime.fromisoformat(window["started_at"])
+    except (ValueError, TypeError):
+        return None
+    if start.tzinfo is None:
+        return None
+    ended = window.get("ended_at")
+    try:
+        end = datetime.fromisoformat(ended) if isinstance(ended, str) else now
+    except ValueError:
+        end = now
+    return start, end, (ended if isinstance(ended, str) else None)
+
+
+def mark_drain_windows_for_drain(reason: str, profile_homes: Optional[List[Any]] = None) -> int:
+    """Stamp the blackout for every store the ticker serves AT THE MOMENT a drain is requested,
+    not at the first gated cron tick.
+
+    A process that dies before its next cron tick never reaches the gated tick's stamp, and a
+    one-shot due inside that unrecorded gap falls back to silent legacy expiry (the
+    2026-10-13 incident shape). Stamping at drain start closes that gap. ``profile_homes``
+    mirrors the gateway's multiplex ticker list (``(name, home)`` pairs); None or empty stamps
+    this process' active store only. Idempotent per store (the gated tick's own stamp then
+    no-ops), and never raises into the shutdown path. Returns how many stores were stamped.
+    """
+    from cron.jobs import use_cron_store
+    entries: List[Any] = list(profile_homes) if profile_homes else [None]
+    marked = 0
+    for entry in entries:
+        if isinstance(entry, (tuple, list)) and len(entry) == 2:
+            raw = entry[1]
+        elif entry is None or isinstance(entry, (str, Path)):
+            raw = entry
+        else:
+            continue
+        home = None if raw is None else str(raw)
         try:
-            end = datetime.fromisoformat(ended) if isinstance(ended, str) else now
-        except ValueError:
-            end = now
-        if isinstance(ended, str) and now > end + timedelta(seconds=ONESHOT_GRACE_SECONDS):
-            continue  # stale record; the blackout it describes is long over
-        if start - timedelta(seconds=_PRE_FREEZE_WINDOW_SECONDS) <= due <= min(end, now):
-            return window
-    return None
+            if home is None:
+                window = mark_drain_window(reason)
+            else:
+                with use_cron_store(home):
+                    window = mark_drain_window(reason)
+            if window is not None:
+                marked += 1
+        except Exception:
+            logger.debug("cron.drain_windows: drain-start stamp failed for %s", home,
+                         exc_info=True)
+    return marked
 
 
 def close_open_drain_windows(now: datetime) -> int:
@@ -132,7 +208,9 @@ def close_open_drain_windows(now: datetime) -> int:
     The close is what bounds the window: a successor that crashes mid-drain simply leaves the
     window open until some scan runs, and that scan IS the end of the blackout. A cancellation
     (drain ends without restart) closes on that process's next allowed tick — no gateway-side
-    close hook to miss.
+    close hook to miss. A window that was still open past the trust cap is additionally marked
+    ``stale`` so it cannot revive jobs even inside the post-close recency grace (e.g. a job
+    whose run time is edited backwards into the abandoned window right after the close).
     """
     from cron.jobs import _jobs_lock
     with _jobs_lock():
@@ -140,6 +218,9 @@ def close_open_drain_windows(now: datetime) -> int:
         closed = 0
         for window in windows:
             if not window.get("ended_at"):
+                bounds = _window_bounds(window, now)
+                if bounds is not None and (now - bounds[0]).total_seconds() > _OPEN_WINDOW_MAX_AGE_SECONDS:
+                    window["stale"] = True
                 window["ended_at"] = now.isoformat()
                 closed += 1
         if closed:

@@ -292,3 +292,67 @@ def test_pre_freeze_offset_is_bounded_below_grace(store, tmp_path):
     assert "pre-late" not in {j["id"] for j in cj.load_jobs()}
     diags = list((tmp_path / "cron" / "output" / "pre-late").glob("*.md"))
     assert diags and "outside grace window" in diags[0].read_text(encoding="utf-8")
+
+
+# --- Pre-merge safety review round 3 (2026-10-14): abandoned blackout + pre-tick exit ---
+
+
+def test_abandoned_open_window_does_not_revive_ancient_job(store, tmp_path, caplog):
+    """Drain starts, the process dies, the window never closes. Days later a scan must NOT
+    revive the one-shot due inside that abandoned blackout: an OPEN window is only trusted up
+    to a safety cap, and the refusal must be an explicit missed-job diagnostic naming the
+    stale window — not a plain silent expiry."""
+    import logging
+    clock = store
+    from cron.drain_windows import mark_drain_window
+    mark_drain_window("gateway drain")  # open since T0, never closed
+    cj.save_jobs([_oneshot("abandoned", T0 + timedelta(seconds=120))])
+    clock["v"] = T0 + timedelta(days=3)
+    with caplog.at_level(logging.WARNING, logger="cron.jobs"):
+        assert [d["id"] for d in _scan()] == [], "a 3-day-old blackout must not auto-recover"
+    assert "abandoned" not in {j["id"] for j in cj.load_jobs()}
+    diags = list((tmp_path / "cron" / "output" / "abandoned").glob("*.md"))
+    assert diags and "outside grace window" in diags[0].read_text(encoding="utf-8")
+    assert any("drain window" in r.getMessage().lower() and "stale" in r.getMessage().lower()
+               for r in caplog.records), "the recovery refusal must be explicit"
+
+
+def test_two_hour_drain_still_recovers_under_open_window_cap(store, tmp_path):
+    """The cap must keep the real thing: ~20-minute drains (the 2026-10-13 shape) and even a
+    2-hour planned blackout are legitimate while the process comes back — far under the
+    abandoned-window cap, so recovery still applies."""
+    clock = store
+    run_at = T0 + timedelta(seconds=539)
+    cj.save_jobs([_oneshot("slow-drain", run_at)])
+    from cron.drain_windows import mark_drain_window
+    mark_drain_window("gateway drain")
+    clock["v"] = T0 + timedelta(hours=2)
+    assert [d["id"] for d in _scan()] == ["slow-drain"]
+
+
+def test_drain_start_stamps_before_any_cron_tick(store, tmp_path):
+    """Process exits right after request_restart(), before the next cron tick ever runs: the
+    gated tick's stamp never happened, so the drain START itself must stamp eagerly — the
+    occurrence due inside that gap is recovered by the successor scan. The gated tick's own
+    stamp is idempotent inside the same blackout (one window per drain cycle)."""
+    clock = store
+    from cron.drain_windows import mark_drain_window, mark_drain_windows_for_drain
+    assert mark_drain_windows_for_drain("restart-requested") == 1
+    mark_drain_window("gateway drain")  # same blackout, gated tick later: no second window
+    assert len(_windows(tmp_path)) == 1
+    cj.save_jobs([_oneshot("gap-job", T0 + timedelta(seconds=60))])
+    clock["v"] = T0 + timedelta(seconds=1200)  # successor process, first scan
+    assert [d["id"] for d in _scan()] == ["gap-job"]
+    assert _windows(tmp_path)[0].get("ended_at"), "the recovery scan must close the blackout"
+
+
+def test_drain_start_marks_every_multiplexed_store(tmp_path):
+    """A multiplex ticker serves several profile stores; the drain-start stamp must record for
+    every store it visits (same (name, home) pairs the ticker gets), not just the process' own."""
+    import json
+    from cron.drain_windows import mark_drain_windows_for_drain
+    homes = [("p1", tmp_path / "p1"), ("p2", tmp_path / "p2")]
+    assert mark_drain_windows_for_drain("restart-requested", profile_homes=homes) == 2
+    for _name, home in homes:
+        data = json.loads((home / "cron" / "drain_windows.json").read_text(encoding="utf-8"))
+        assert len(data) == 1 and not data[0].get("ended_at")

@@ -2592,7 +2592,8 @@ def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
             job.get("name", job.get("id", "?")))
 
 
-def _write_missed_oneshot_diagnostic(job: Dict[str, Any], next_run: str) -> None:
+def _write_missed_oneshot_diagnostic(job: Dict[str, Any], next_run: str,
+                                     note: Optional[str] = None) -> None:
     """Trace for a never-ran one-shot retired outside the grace window (else it would just vanish).
     """
     _write_oneshot_diagnostic(
@@ -2608,7 +2609,8 @@ def _write_missed_oneshot_diagnostic(job: Dict[str, Any], next_run: str) -> None
         "edited), which is outside the 'will never fire' contract "
         "enforced at create/update/resume time. The job was removed "
         "without running; recreate it (or use the Run button) to "
-        "schedule it again.\n",
+        "schedule it again.\n"
+        + (f"\n{note}\n" if note else ""),
         "missed-oneshot")
 
 
@@ -3245,7 +3247,29 @@ def _retire_expired_oneshot(d: _DueJob) -> bool:
     if not (d.job.get("run_claim") or d.job.get("fire_claim")):
         if _drain_deferred_oneshot(d):
             return False
-        _write_missed_oneshot_diagnostic(d.job, d.next_run)
+        note = None
+        try:
+            from cron.drain_windows import stale_covering_drain_window
+            stale = stale_covering_drain_window(d.next_run, d.scan.now)
+        except Exception:
+            stale = None
+        if stale is not None:
+            # The blackout that swallowed this run time was never closed within the trust cap
+            # (drain started, process died, nobody came back). Recovery is refused on purpose —
+            # say so in the record instead of leaving it as plain silent expiry.
+            note = (
+                f"NOTE: this run time falls inside drain window {stale.get('id')} stamped at "
+                f"{stale.get('started_at')}, but that blackout record is stale beyond the "
+                "recovery safety cap (it was never closed by a returning process). Drain "
+                "recovery was REJECTED; the ordinary expiry policy removed this job. Recreate "
+                "it (or use the Run button) to schedule it again."
+            )
+            logger.warning(
+                "Job '%s' (%s): run time %s lies inside drain window %s (stamped %s), but the "
+                "window record is stale beyond the recovery cap — drain recovery refused; "
+                "retiring under the legacy grace policy.",
+                d.label, d.job.get("id"), d.next_run, stale.get("id"), stale.get("started_at"))
+        _write_missed_oneshot_diagnostic(d.job, d.next_run, note=note)
         d.scan.retire(d.job["id"])
         record_cron_missed(d.job)
     return True
