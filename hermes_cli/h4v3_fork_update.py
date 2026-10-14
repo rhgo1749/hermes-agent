@@ -1,8 +1,10 @@
-"""Fork-first update hook for the local H4V3 Hermes installation.
+"""H4V3 fork identity and optional, separate upstream integration.
 
-The stock updater still owns dependency selection, backups, restart and health
-checks. This module only prepares an immutable, squash-integrated commit on the
-fork's production branch BEFORE the stock updater fetches that branch.
+Normal hermes update uses the official Hermes source updater to pull
+origin/production without merging upstream or rewriting fork history.
+An explicit python -m hermes_cli.h4v3_fork_update sync prepares the existing
+conflict-safe upstream squash for a subsequent native update. The stock updater
+owns dependency selection, backups, restart and health checks.
 """
 from __future__ import annotations
 
@@ -86,6 +88,29 @@ def _last_synced(root: Path, production_sha: str) -> str | None:
                    production_sha)
     rows = re.findall(r"^H4V3-Upstream-SHA:\s*([0-9a-f]{40})$", message, re.M)
     return rows[-1] if rows else None
+
+
+def fork_banner_identity(root: Path) -> dict[str, str] | None:
+    """Identify the activated production fork and its recorded upstream baseline.
+
+    An upstream squash is not a Git ancestor of the fork HEAD; neither git
+    describe nor origin/main reliably identifies its code version. Do not
+    claim a release version from a squash commit; surface exact SHAs.
+    """
+    if not _enabled(root):
+        return None
+    try:
+        if (_url(_out(root, "remote", "get-url", "origin")) != _url(FORK_URL)
+                or _url(_out(root, "remote", "get-url", "upstream")) != _url(UPSTREAM_URL)
+                or _out(root, "branch", "--show-current") != PRODUCTION):
+            return None
+        local = _sha(root, "HEAD")
+        synced = _last_synced(root, local)
+    except ForkUpdateError:
+        return None
+    if not (SHA_RE.fullmatch(local) and synced and SHA_RE.fullmatch(synced)):
+        return None
+    return {"upstream": synced, "local": local}
 
 
 def _candidate(root: Path) -> Path:
@@ -213,7 +238,11 @@ def prepare_update(root: Path) -> bool:
 
 
 def check_fork_updates(root: Path) -> dict | None:
-    """Read-only dashboard status for the same upstream/fork refs Update uses."""
+    """Report only changes the native updater can install from origin/production.
+
+    Upstream drift is informational until an explicit reviewed sync publishes
+    it to the fork. An unknown commit distance must not be called 1 commit.
+    """
     if not _enabled(root):
         return None
     if (_url(_out(root, "remote", "get-url", "origin")) != _url(FORK_URL)
@@ -234,32 +263,40 @@ def check_fork_updates(root: Path) -> dict | None:
     remote_production = remote_head("origin", PRODUCTION)
     upstream = remote_head("upstream", "main")
     previous = _last_synced(root, local)
-    needs_upstream = (previous != upstream if previous else
-                      _git(root, "merge-base", "--is-ancestor", upstream, local,
-                           check=False).returncode != 0)
-    behind = int(local != remote_production or needs_upstream)
-    return {"behind": behind, "updateAvailable": bool(behind),
-            "targetSha": upstream if needs_upstream else remote_production,
-            "commits": []}
+    upstream_pending = previous != upstream if previous else True
+    # SOURCE_CHECK.UPDATE_AVAILABLE_NO_COUNT = -1; remote SHA alone does not
+    # prove the number of reachable commits without fetching.
+    behind = -1 if local != remote_production else 0
+    return {"behind": behind, "updateAvailable": behind != 0,
+            "targetSha": remote_production, "commits": [],
+            "upstreamPending": upstream_pending,
+            "upstreamSyncedSha": previous,
+            "upstreamTargetSha": upstream}
 
 
 def maybe_prepare_update(args, root: Path) -> None:
-    """Hook for the normal Hermes update button/CLI, before the stock fetch."""
+    """Route an activated fork through the official origin/production updater.
+
+    No upstream fetch, squash, push or checkout mutation occurs in this hook.
+    The H4V3 upstream integration is an explicit, separately reviewable step.
+    """
     if not _enabled(root):
         return
     if getattr(args, "branch", None) or getattr(args, "channel", None):
         raise SystemExit("H4V3 fork update uses the production branch; omit --branch/--channel")
     try:
-        prepare_update(root)
+        _verify(root)
     except ForkUpdateError as exc:
-        print(f"✗ H4V3 upstream update stopped safely: {exc}")
+        print(f"✗ H4V3 fork update stopped safely: {exc}")
         raise SystemExit(1) from exc
     args.branch = PRODUCTION
+    print("✓ H4V3 fork: using Hermes native update from origin/production.")
+    print("  To integrate upstream/main into the fork, run h4v3_fork_update sync separately.")
 
 
 def _main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("status", "abort", "continue"))
+    parser.add_argument("action", choices=("status", "sync", "abort", "continue"))
     parser.add_argument("--discard", action="store_true", help="Discard ONLY the isolated candidate worktree")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
@@ -267,8 +304,19 @@ def _main() -> int:
         print("H4V3 fork mode is not enabled")
         return 2
     if args.action == "status":
-        print("Production:", _sha(root, PRODUCTION)[:12])
-        print("Integration:", _candidate(root) if _pending(root) else "none")
+        local = _sha(root, PRODUCTION)
+        print("Production:", local[:12])
+        print("Synced upstream:", (_last_synced(root, local) or "unrecorded")[:12])
+        print("Pending integration:", _candidate(root) if _pending(root) else "none")
+        print("Native update: origin/production only; upstream merge: explicit sync.")
+        return 0
+    if args.action == "sync":
+        try:
+            prepare_update(root)
+        except ForkUpdateError as exc:
+            print(f"✗ H4V3 upstream integration stopped safely: {exc}")
+            return 1
+        print("Upstream integration prepared. Run hermes update to install fork production.")
         return 0
     candidate = _candidate(root)
     if not candidate.is_dir():
