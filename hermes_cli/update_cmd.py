@@ -1826,9 +1826,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
     print("☤ Updating Hermes Agent...")
     print()
 
-    # Opt-in, fork-owned deployment flow: squash upstream changes in an
-    # isolated worktree and publish to fork production BEFORE the stock
-    # source updater begins its transactional fetch/verify/restart pipeline.
+    # Opt-in H4V3 fork routing: select origin/production for the stock
+    # Hermes updater. Upstream integration is a separate explicit operation;
+    # nothing is squashed or pushed before backup/restart admission.
     from hermes_cli.h4v3_fork_update import maybe_prepare_update
     maybe_prepare_update(args, _m().PROJECT_ROOT)
 
