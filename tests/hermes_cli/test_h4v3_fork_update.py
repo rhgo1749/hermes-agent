@@ -273,7 +273,7 @@ def test_explicit_cli_sync_publishes_upstream_only_after_request(forks, monkeypa
     assert run(f.root, "rev-parse", "HEAD") == old
     new = run(f.fork, "rev-parse", "refs/heads/production")
     assert new != old
-    assert run(f.fork, "log", "-1", "--format=%B").endswith(
+    assert run(f.fork, "log", "-1", "--format=%B", "refs/heads/production").endswith(
         f"H4V3-Upstream-SHA: {upstream_sha}"
     )
 
