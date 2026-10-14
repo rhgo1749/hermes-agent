@@ -313,6 +313,25 @@ def test_fork_banner_prints_recorded_hashes_not_stale_semver(forks, monkeypatch)
     assert "v0.21" not in label
 
 
+def test_version_status_distinguishes_fork_from_upstream(capsys, monkeypatch):
+    from hermes_cli import _startup_fast, banner, source_check
+
+    monkeypatch.setattr(banner, "format_banner_version_label", lambda: "Hermes Agent · H4V3 source fork")
+    monkeypatch.setattr(_startup_fast, "project_root_str", lambda: "/tmp/h4v3-fork")
+    monkeypatch.setattr(_startup_fast, "read_openai_version", lambda: "2.24.0")
+    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda *_: "git")
+    monkeypatch.setattr("hermes_cli.config.recommended_update_command", lambda: "hermes update")
+    monkeypatch.setattr(source_check, "check_for_updates", lambda **_: {
+        "behind": 0, "upstreamSyncedSha": "a" * 40, "upstreamPending": True,
+    })
+    _startup_fast.print_fast_version_info()
+    result = capsys.readouterr().out
+    assert "Fork production up to date" in result
+    assert "Official upstream/main has newer code" in result
+    assert "h4v3_fork_update sync" in result
+    assert "1 commit behind" not in result
+
+
 def test_disabled_install_keeps_stock_update_unchanged(tmp_path):
     local = tmp_path / "checkout"
     local.mkdir()
