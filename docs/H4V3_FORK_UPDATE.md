@@ -1,4 +1,4 @@
-# H4V3 fork-first Hermes updates
+# H4V3 fork: native Hermes updates and explicit upstream integration
 
 ## Authority and update-button contract
 
@@ -6,10 +6,13 @@
 - **`origin`:** `rhgo1749/hermes-agent` (the owner's fork, source of truth).
 - **`upstream`:** `NousResearch/hermes-agent` (fetch-only).
 - Fork `main` remains a separate PR/development branch; **fork `production` is the deployed branch**.
-- Normal **Hermes Update**, including the Gateway's update action, checks `upstream/main`, prepares a squash commit in a separate Git worktree, publishes that commit via **non-force** push to `origin/production`, then delegates to the **existing Hermes update pipeline** for fetch, checkout, PM, gateway draining, restart, and health verification.
+- Normal **Hermes Update**, including the Gateway's update action, uses the **official Hermes source update pipeline** against `origin/production` only. It preserves the fork branch and runs stock fetch, checkout, PM, gateway draining, restart and health verification. It never implicitly squashes or pushes upstream.
+- `upstream/main` is integrated **separately and explicitly** with `python3 -m hermes_cli.h4v3_fork_update sync` only after review. That command uses the existing isolated squash candidate and non-force publish to `origin/production`. Run normal `hermes update` afterward to install the reviewed commit.
+- Official Hermes fork auto-sync cannot replace the separate integration: it fast-forwards upstream only if the fork has no independent commits; for this divergent fork it intentionally skips the merge rather than silently discard local changes.
 - Prior production commit SHAs are not rewritten: each upstream advance is represented by one new commit with `H4V3-Upstream-SHA:` trailer. Only the difference since the preceding upstream revision is applied on subsequent updates; repeated clicks do not reapply an old upstream patch.
-- A conflict (including upstream history rewrites, unexpected local changes, concurrent fork pushes, staging errors, or invalid Python source) **aborts before changing local production or its fork ref**. The isolated candidate stays for inspection. No conflict is auto-resolved. `rerere` remembers manual resolutions but does not automatically stage them.
-- A successful squash *publication* precedes the regular Hermes update; if the latter fails, the fork is ahead but the existing running checkout remains available. **Click Update again** after addressing the stock updater's reported failure.
+- During explicit upstream `sync`, a conflict (including upstream history rewrites, unexpected local changes, concurrent fork pushes, staging errors, or invalid Python source) **aborts before changing local production or its fork ref**. The isolated candidate stays for inspection. No conflict is auto-resolved. `rerere` remembers manual resolutions but does not automatically stage them.
+- A successful explicit squash *publication* precedes the regular Hermes update; if the latter fails, the fork is ahead but the existing running checkout remains available. **Click Update again** after addressing the stock updater's reported failure.
+- For this fork, `hermes --version` reports **synced upstream SHA** plus local fork SHA; release tags on squashed ancestry do **not** prove the fork runs a particular upstream semver tag. A published upstream change alone is not an available native update until merged into `origin/production`.
 
 ## One-time installation (host user)
 
@@ -26,14 +29,20 @@ It is idempotent once the production branch and remotes are initialized. The act
 
 ## Day-to-day usage
 
-Use the ordinary Hermes Update button or `hermes update`. Avoid `git pull upstream main`, forced pushes or direct `hermes update --branch main` in the production checkout. Any unexpected local edits must first be reviewed and committed.
+Use the ordinary Hermes Update button or `hermes update` to install changes **already merged into the fork's `origin/production`**, using the official Hermes update implementation. The update notification reports fork-origin drift only; upstream drift is informational until integration is reviewed and published. Avoid `git pull upstream main`, forced pushes or direct `hermes update --branch main` in the production checkout. Unexpected tracked local edits must first be reviewed and committed.
 
-For quick status:
+For status and separate, reviewed upstream integration:
 
 ```bash
 cd /home/gonus/hermes-cloudcli/HermesWorkspace/hermes-agent
 python3 -m hermes_cli.h4v3_fork_update status
+# After reviewing an upstream delta and checking expected H4V3 lifecycle behavior:
+python3 -m hermes_cli.h4v3_fork_update sync
+# Only after sync successfully publishes the fork production commit:
+hermes update
 ```
+
+The `sync` command is an explicit mutation: it may publish a new fork commit after its syntax/conflict preflight, **not** after a full runtime E2E. Prefer integrating via a separately reviewed GitHub PR when changes touch Kanban, ACP, cron, or session lifecycle; then `hermes update` installs that PR after merge.
 
 ## When a conflict happens
 
@@ -56,4 +65,4 @@ hermes update
 
 ## Notes
 
-The hook is intentionally narrow and opt-in. It runs only if the marker exists and the checkout is `production` with the exact expected remotes; explicit alternate update channels are rejected to avoid silently bypassing the fork. The stock Hermes update system continues to own restart policy, package management, receipts, and rollback. Git history and a tree-level conflict test cannot prove the application will run with a newer dependency graph: review the existing updater's health and PM results.
+The opt-in hook now **only routes** normal updates to `origin/production` and refuses an unexpected branch, remote or dirty tracked tree. It does not fetch, squash, or push upstream. Stock Hermes continues to own restart policy, package management, receipts, and rollback. The explicit upstream-sync function remains available for this divergent fork. Git history and a tree-level conflict test cannot prove the application will run with a newer dependency graph: review updater health and PM results.
