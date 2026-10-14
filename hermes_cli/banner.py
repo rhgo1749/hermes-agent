@@ -179,6 +179,17 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
     repo_dir = repo_dir or _resolve_repo_dir()
     if repo_dir is None:
         return _baked_banner_state()
+    # The H4V3 fork synchronizes upstream by squashing: the official upstream
+    # commit is not an ancestor of HEAD. A stale origin/main would misreport
+    # both the upstream revision and a meaningless "carried commits" count.
+    try:
+        from hermes_cli.h4v3_fork_update import fork_banner_identity
+        fork = fork_banner_identity(repo_dir)
+    except (OSError, ValueError, RuntimeError):
+        fork = None
+    if fork:
+        return {"upstream": fork["upstream"][:8], "local": fork["local"][:8],
+                "ahead": 0, "fork": True}
     upstream, local = (source_check._git_stdout(["rev-parse", "--short=8", rev], cwd=repo_dir) for rev in ("origin/main", "HEAD"))
     if not upstream or not local:
         # Live-git lookup failed (e.g. shallow clone without origin/main).
@@ -234,6 +245,9 @@ def format_banner_version_label() -> str:
     state = get_git_banner_state()
     if not state:
         return base
+    if state.get("fork"):
+        return ("Hermes Agent · H4V3 source fork"
+                f" · synced upstream/main {state['upstream']} · local {state['local']}")
     upstream, local = state["upstream"], state["local"]
     ahead = int(state.get("ahead") or 0)
     if ahead <= 0 or upstream == local:
