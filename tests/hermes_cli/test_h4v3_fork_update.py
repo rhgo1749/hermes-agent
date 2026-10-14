@@ -98,18 +98,29 @@ def test_squash_initial_and_incremental_preserves_all_local_commits(forks):
     assert len(run(f.root, "log", "--format=%s", "--grep=chore(h4v3)").splitlines()) == 2
 
 
-def test_update_button_status_uses_upstream_and_production(forks):
+def test_update_button_status_uses_native_fork_only(forks):
     f = forks
-    assert flow.check_fork_updates(f.root)["behind"] == 0
-    commit(f.writer, "upstream.txt", "new version\n")
+    initial = flow.check_fork_updates(f.root)
+    assert initial["behind"] == 0
+    assert initial["upstreamPending"] is True  # no recorded squash yet
+    upstream_sha = commit(f.writer, "upstream.txt", "new version\n")
     run(f.writer, "push", "origin", "main")
-    assert flow.check_fork_updates(f.root)["behind"] == 1
-    flow.prepare_update(f.root)
-    assert flow.check_fork_updates(f.root)["behind"] == 1  # not applied locally yet
-    advance(f)
+    # Upstream changes do not masquerade as a native origin/production update.
     status = flow.check_fork_updates(f.root)
     assert status["behind"] == 0
     assert status["updateAvailable"] is False
+    assert status["upstreamPending"] is True
+    assert status["upstreamTargetSha"] == upstream_sha
+    flow.prepare_update(f.root)  # explicit upstream sync
+    status = flow.check_fork_updates(f.root)
+    assert status["behind"] == -1  # exact count unknown until fetch
+    assert status["targetSha"] == run(f.fork, "rev-parse", "refs/heads/production")
+    assert status["upstreamPending"] is True  # checkout not yet updated
+    advance(f)  # native Hermes updater's fast-forward effect
+    status = flow.check_fork_updates(f.root)
+    assert status["behind"] == 0
+    assert status["upstreamPending"] is False
+    assert status["upstreamSyncedSha"] == upstream_sha
 
 
 def test_conflict_leaves_both_fork_and_running_checkout_unmodified(forks):
@@ -234,6 +245,56 @@ def test_one_time_bootstrap_preserves_local_history_and_fork_main(tmp_path, monk
     first = run(local, "rev-parse", "HEAD")
     bootstrap.activate()  # no extra commit or forced push on repeated execution
     assert run(local, "rev-parse", "HEAD") == first
+
+
+def test_normal_update_uses_official_updater_without_mutating_upstream(forks, monkeypatch):
+    f = forks
+    advance_sha = commit(f.writer, "upstream.txt", "upstream advanced\n")
+    run(f.writer, "push", "origin", "main")
+    original = run(f.root, "rev-parse", "HEAD")
+    fork_before = run(f.fork, "rev-parse", "refs/heads/production")
+    monkeypatch.setattr(flow, "prepare_update", lambda *_: pytest.fail("implicit sync is forbidden"))
+    args = SimpleNamespace(branch=None, channel=None)
+    flow.maybe_prepare_update(args, f.root)
+    assert args.branch == "production"
+    assert run(f.root, "rev-parse", "HEAD") == original
+    assert run(f.fork, "rev-parse", "refs/heads/production") == fork_before
+    assert flow.check_fork_updates(f.root)["upstreamTargetSha"] == advance_sha
+
+
+def test_fork_banner_identity_refuses_stale_origin_main(forks):
+    f = forks
+    upstream_sha = commit(f.writer, "upstream.txt", "candidate\n")
+    run(f.writer, "push", "origin", "main")
+    flow.prepare_update(f.root)
+    advance(f)
+    fork = flow.fork_banner_identity(f.root)
+    assert fork == {"upstream": upstream_sha, "local": run(f.root, "rev-parse", "HEAD")}
+
+    from hermes_cli import banner
+    assert banner._compute_git_banner_state(f.root) == {
+        "upstream": upstream_sha[:8],
+        "local": fork["local"][:8],
+        "ahead": 0,
+        "fork": True,
+    }
+
+
+def test_fork_banner_prints_recorded_hashes_not_stale_semver(forks, monkeypatch):
+    f = forks
+    upstream_sha = commit(f.writer, "upstream.txt", "candidate\n")
+    run(f.writer, "push", "origin", "main")
+    flow.prepare_update(f.root)
+    advance(f)
+    from hermes_cli import banner
+    monkeypatch.setattr("hermes_cli.config.get_project_root", lambda: f.root)
+    monkeypatch.setattr("hermes_cli.update_channel.resolve_update_channel", lambda *_: "main")
+    monkeypatch.setattr(banner, "get_git_banner_state", lambda: banner._compute_git_banner_state(f.root))
+    label = banner.format_banner_version_label()
+    assert "H4V3 source fork" in label
+    assert f"synced upstream/main {upstream_sha[:8]}" in label
+    assert f"local {run(f.root, 'rev-parse', 'HEAD')[:8]}" in label
+    assert "v0.21" not in label
 
 
 def test_disabled_install_keeps_stock_update_unchanged(tmp_path):
