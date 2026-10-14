@@ -262,6 +262,22 @@ def test_normal_update_uses_official_updater_without_mutating_upstream(forks, mo
     assert flow.check_fork_updates(f.root)["upstreamTargetSha"] == advance_sha
 
 
+def test_explicit_cli_sync_publishes_upstream_only_after_request(forks, monkeypatch):
+    f = forks
+    upstream_sha = commit(f.writer, "upstream.txt", "new bits\n")
+    run(f.writer, "push", "origin", "main")
+    old = run(f.root, "rev-parse", "HEAD")
+    monkeypatch.setattr(flow, "__file__", str(f.root / "hermes_cli" / "h4v3_fork_update.py"))
+    monkeypatch.setattr(sys, "argv", ["h4v3_fork_update", "sync"])
+    assert flow._main() == 0
+    assert run(f.root, "rev-parse", "HEAD") == old
+    new = run(f.fork, "rev-parse", "refs/heads/production")
+    assert new != old
+    assert run(f.fork, "log", "-1", "--format=%B").endswith(
+        f"H4V3-Upstream-SHA: {upstream_sha}"
+    )
+
+
 def test_fork_banner_identity_refuses_stale_origin_main(forks):
     f = forks
     upstream_sha = commit(f.writer, "upstream.txt", "candidate\n")
