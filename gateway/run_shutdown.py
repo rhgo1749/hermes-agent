@@ -1688,6 +1688,25 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         logger.info("Restart deferred wait complete — active work drained; proceeding to stop()")
         return True
 
+    def _stamp_cron_drain_windows(self, reason: str) -> None:
+        """Best-effort record of the cron dispatch blackout for every store the ticker serves,
+        at the moment draining begins (see ``cron/drain_windows``). Must never raise into the
+        shutdown path; the gated tick's own stamp remains the backstop when this is skipped."""
+        try:
+            from cron.drain_windows import mark_drain_windows_for_drain
+            try:
+                from gateway.run import _cron_tick_profile_homes
+                homes = _cron_tick_profile_homes(getattr(self, "config", None))
+            except Exception:
+                homes = []
+            marked = mark_drain_windows_for_drain(reason, profile_homes=homes)
+            if not marked and not homes:
+                marked = mark_drain_windows_for_drain(reason)
+            logger.info("Cron drain blackout stamped for %d store(s) at drain start (%s)",
+                        marked, reason)
+        except Exception:
+            logger.debug("cron drain-window stamp at drain start skipped", exc_info=True)
+
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
         if self._restart_task_started:
             return False
@@ -1700,6 +1719,10 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         # The restart's after-turn wait is a drain window too: pollers of GET /v1/runs/{id} must see
         # the boundary from the moment new turns are refused, not only once stop() begins (#115133).
         self._mark_api_runs_shutdown_requested()
+        # Record the cron blackout NOW, not at the first gated cron tick: if this process dies
+        # before the next tick, a one-shot due inside the gap would otherwise fall to silent
+        # legacy expiry (2026-10-13 incident shape). Idempotent with the gated tick's stamp.
+        self._stamp_cron_drain_windows("restart-requested")
 
         async def _run_restart() -> None:
             await self._await_active_work_before_restart()
@@ -1845,6 +1868,11 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         self._clear_plugin_message_injector()
         self._draining = True
         self._mark_api_runs_shutdown_requested()
+        # Restart teardown only: the ticker freeze from here on must be recorded even if this
+        # teardown path is entered without request_restart() (signal-driven restart). A plain
+        # stop intentionally keeps the legacy expiry contract: no successor is guaranteed.
+        if self._restart_requested:
+            self._stamp_cron_drain_windows("gateway-stop")
         # getattr-guards: shutdown-path test doubles may lack the room worker / systemd watchdog.
         stop_room_worker = getattr(self, "_stop_hosted_room_worker", None)
         if callable(stop_room_worker):
