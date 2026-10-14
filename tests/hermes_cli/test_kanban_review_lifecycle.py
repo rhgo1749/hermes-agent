@@ -704,6 +704,31 @@ def test_recent_success_guard_lifts_after_review_reopened(kanban_home: Path) -> 
         assert kbd.check_respawn_guard(conn, tid, lane="ready") is None
 
 
+def test_recent_success_guard_requeue_events_are_task_scoped(kanban_home: Path) -> None:
+    """A re-queue event lifts ONLY its own task's guard; other tasks stay held.
+
+    Pins the exception list itself: the legacy ``status`` event (what a
+    done→ready drag records) must lift the guard, and nothing may lift a
+    task that had no re-queue after its success. Upstream's ``_rows_since``
+    refactor of this helper must keep the same event-kind contract.
+    """
+    with kbc.connect() as conn:
+        dragged = kb.create_task(conn, title="dragged after success", assignee="dev")
+        untouched = kb.create_task(conn, title="held after success", assignee="dev")
+        for tid in (dragged, untouched):
+            assert kb.claim_task(conn, tid) is not None
+            kb.complete_task(conn, tid, summary="delivery evidence")
+            assert kbd.check_respawn_guard(conn, tid, lane="ready") == "recent_success"
+        # A done→ready drag records the legacy 'status' event on `dragged`
+        # only; `untouched` completed at a comparable time and must NOT be
+        # lifted by another task's event.
+        kb._append_event(conn, dragged, "status", {
+            "status": "ready", "previous_status": "done", "reason": "operator drag",
+        })
+        assert kbd.check_respawn_guard(conn, dragged, lane="ready") is None
+        assert kbd.check_respawn_guard(conn, untouched, lane="ready") == "recent_success"
+
+
 def test_active_pr_guard_lifts_for_implementer_after_changes_requested(
     kanban_home: Path,
 ) -> None:
