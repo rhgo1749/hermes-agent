@@ -143,7 +143,7 @@ class TestTickWorkdirPartition:
             {"id": "a", "name": "A", "workdir": str(workdir_a)},
             {"id": "b", "name": "B", "workdir": str(workdir_b)},
         ]
-        monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
+        monkeypatch.setattr(sched, "get_due_jobs", lambda **_kw: jobs)
         monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
         monkeypatch.setattr(sched, "_maybe_run_worktree_maintenance", lambda: None)
 

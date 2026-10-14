@@ -749,3 +749,43 @@ def test_same_job_id_wedged_in_one_profile_does_not_hide_live_run_in_another(mon
     finally:
         sched.release_running_job("daily-brief", home_a)
         sched.release_running_job("daily-brief", home_b)
+
+
+@pytest.mark.asyncio
+async def test_request_restart_stamps_cron_blackout_before_first_tick(monkeypatch):
+    """A predecessor that dies between request_restart() and the next cron tick leaves NO
+    gated-tick stamp; request_restart must stamp the blackout synchronously itself so the
+    successor scan can still classify due-inside-gap one-shots as drain-deferred."""
+    import gateway.run_shutdown as rs
+    runner, _adapter = make_restart_runner()
+    stamps: list[str] = []
+    monkeypatch.setattr(
+        rs.GatewayShutdownMixin, "_stamp_cron_drain_windows",
+        lambda self, reason: stamps.append(reason))
+
+    async def _never_returns():
+        await asyncio.Event().wait()
+
+    # Never reach the real stop(): the restart task parks in the after-turn wait and is
+    # cancelled at the end of the test.
+    monkeypatch.setattr(runner, "_await_active_work_before_restart", _never_returns)
+    assert runner.request_restart() is True
+    assert stamps == ["restart-requested"], "stamp must fire synchronously at drain start"
+    assert runner._restart_task is not None
+    runner._restart_task.cancel()
+
+
+def test_stamp_helper_records_blackout_for_every_served_store(tmp_path, monkeypatch):
+    """The shutdown helper must stamp each store the multiplex ticker visits (the same
+    (name, home) pairs the ticker gets from _cron_tick_profile_homes)."""
+    import json
+
+    import gateway.run as gateway_run
+    import gateway.run_shutdown as rs
+    homes = [("p1", tmp_path / "p1")]
+    monkeypatch.setattr(gateway_run, "_cron_tick_profile_homes", lambda config: homes)
+    runner, _adapter = make_restart_runner()
+    rs.GatewayShutdownMixin._stamp_cron_drain_windows(runner, "restart-requested")
+    data = json.loads((tmp_path / "p1" / "cron" / "drain_windows.json").read_text(
+        encoding="utf-8"))
+    assert len(data) == 1 and not data[0].get("ended_at")

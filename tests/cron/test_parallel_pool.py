@@ -34,7 +34,7 @@ class TestRunningJobGuard:
         sched._running_job_ids.add(sched._inflight_key("guard-job"))
 
         dispatched = []
-        monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
+        monkeypatch.setattr(sched, "get_due_jobs", lambda **_kw: [job])
         monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
         monkeypatch.setattr(sched, "run_job", lambda j, **_kw: dispatched.append(j["id"]) or (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
@@ -71,7 +71,7 @@ class TestRunningJobGuard:
                 submitted.append((callback, future))
                 return future
 
-        monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
+        monkeypatch.setattr(sched, "get_due_jobs", lambda **_kw: [job])
         monkeypatch.setattr(sched, "_get_parallel_pool", lambda _workers: DeferredPool())
         monkeypatch.setattr(
             sched,
@@ -131,7 +131,7 @@ class TestRunningJobGuard:
                 raise RuntimeError("execution ledger unavailable")
             return {"id": f"{job_id}-execution"}
 
-        monkeypatch.setattr(sched, "get_due_jobs", lambda: [failing_job, healthy_job])
+        monkeypatch.setattr(sched, "get_due_jobs", lambda **_kw: [failing_job, healthy_job])
         monkeypatch.setattr(sched, "advance_next_runs", lambda *_a, **_kw: 0)
         monkeypatch.setattr(sched, "create_execution", create_execution_side_effect)
         monkeypatch.setattr(sched, "run_job", lambda j, **_kw: called.append(j["id"]) or (True, "out", "resp", None))
@@ -179,7 +179,7 @@ class TestSyncMode:
             for i in range(3)
         ]
 
-        monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
+        monkeypatch.setattr(sched, "get_due_jobs", lambda **_kw: jobs)
         monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
         monkeypatch.setattr(sched, "run_job", lambda j, **_kw: (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
@@ -215,7 +215,7 @@ class TestSyncMode:
             barrier.wait()  # blocks until test thread also waits
             return True, "out", "resp", None
 
-        monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
+        monkeypatch.setattr(sched, "get_due_jobs", lambda **_kw: [job])
         monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
         monkeypatch.setattr(sched, "run_job", slow_run)
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
