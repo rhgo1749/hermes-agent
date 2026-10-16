@@ -72,6 +72,7 @@ def _run(step: dict, ctx: dict, cwd: Path | None = None, *, receipt: bool = Fals
                                      str(Path(git).parent))),
             "HOME": directory, "RUNNER_TEMP": directory, "GITHUB_OUTPUT": str(output),
             "REPLAY_PYTHON": sys.executable, "REPLAY_CALLS": str(calls),
+            "HERMES_PYTHON": sys.executable,
             **{k: gha.to_string(gha.render(v, ctx)) for k, v in step.get("env", {}).items()},
         }
         script = root / "step.sh"
@@ -136,4 +137,12 @@ def selected_files(step: dict, ctx: dict, repo: Path) -> set[str]:
                 assert candidate.stat().st_size > 0, f"empty test file: {name}"
                 files.add(name)
     assert files, "test command selected no files"
+    slice_spec = gha.render(step.get("env", {}).get("HERMES_TEST_SLICE", ""), ctx)
+    if slice_spec:
+        from scripts.run_tests_parallel import _slice_files
+
+        index, count = map(int, slice_spec.split("/"))
+        files = {path.relative_to(repo).as_posix() for path in
+                 _slice_files([repo / name for name in files], index, count, {}, repo)}
+        assert files, "test slice selected no files"
     return files
