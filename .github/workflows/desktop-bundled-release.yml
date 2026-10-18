@@ -103,9 +103,13 @@ on:
         type: string
         default: 'darwin-arm64,darwin-x64,win32-arm64,win32-x64,win32-bundle,linux-x64,linux-arm64,termux'
       skip-tests:
-        description: 'Stable candidates only: build and stage without native smokes or in-build test suites (the claim skipped tests).'
+        description: 'Stable candidates only: build and stage without native smokes or in-build test suites (the claim has no smoke lane).'
         type: boolean
         default: false
+      store:
+        description: 'Stable publish phase only: submit the Windows Store bundle (the claim built the windows lane).'
+        type: boolean
+        default: true
     outputs:
       darwin-arm64-receipt-url:
         value: ${{ jobs.stage-receipt-darwin-arm64.outputs.receipt-url }}
@@ -2406,6 +2410,7 @@ jobs:
     timeout-minutes: 90
     env:
       RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_COMMIT: ${{ needs.validate.outputs.sha }}
       HERMES_ARCHIVE_TAG: ${{ needs.validate.outputs.archive-tag }}
       CANDIDATE_MANIFEST_SHA256: ${{ inputs.manifest-sha256 }}
       CLOUDFLARE_R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
@@ -2425,12 +2430,16 @@ jobs:
   stable-store:
     name: Submit the verified Store package
     needs: [validate, stable-publish]
-    if: inputs.release-phase == 'publish'
+    if: inputs.release-phase == 'publish' && inputs.store
+    # The Store is not a release gate: a failed submission leaves the release publishable
+    # and the summary names the Store package for a manual Partner Center upload.
+    continue-on-error: true
     runs-on: windows-latest-32-core
     environment: release-signing
     timeout-minutes: 60
     env:
       RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_COMMIT: ${{ needs.validate.outputs.sha }}
       HERMES_ARCHIVE_TAG: ${{ needs.validate.outputs.archive-tag }}
       CANDIDATE_MANIFEST_SHA256: ${{ inputs.manifest-sha256 }}
       CLOUDFLARE_R2_PUBLIC_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_URL }}
@@ -2461,6 +2470,16 @@ jobs:
           # Auto-publish stays off: the submission is committed with
           # targetPublishMode Manual and is released by the publication pass.
           python -m scripts.releases.store submit "${files[0]}"
+      - name: Name the Store package for a manual upload
+        if: failure()
+        shell: bash
+        run: |
+          name=$(cd verified 2>/dev/null && ls Store-*.msixbundle 2>/dev/null | head -1)
+          base="${CLOUDFLARE_R2_PUBLIC_URL%/}/releases/tag/$HERMES_ARCHIVE_TAG"
+          url="$base/${name:-handoff-windows-universal.json}"
+          msg="Store submission failed; the release is still publishable. Upload this package in Partner Center: $url"
+          echo "::warning title=Microsoft Store::$msg"
+          { echo "## Microsoft Store: manual upload needed"; echo; echo "$msg"; } >> "$GITHUB_STEP_SUMMARY"
 
   stable-phase-result:
     name: Stable bundle phase completed

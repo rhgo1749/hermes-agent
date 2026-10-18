@@ -9,13 +9,13 @@ legacy expiry, receipts (claims / executions ledger), recurring catch-up and man
 unchanged. No dispatcher, no model: the due-scan admission decision (``get_due_jobs``) is the
 fixed surface; dispatch itself already runs behind ``run_claim``.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from cron import jobs as cj
 
-T0 = datetime(2026, 10, 13, 11, 0, 0, tzinfo=timezone.utc)  # 20:00 KST, incident shape
+T0 = datetime(2026, 10, 13, 11, 0, 0, tzinfo=UTC)  # 20:00 KST, incident shape
 
 
 def _oneshot(jid, run_at, **extra):
@@ -356,3 +356,38 @@ def test_drain_start_marks_every_multiplexed_store(tmp_path):
     for _name, home in homes:
         data = json.loads((home / "cron" / "drain_windows.json").read_text(encoding="utf-8"))
         assert len(data) == 1 and not data[0].get("ended_at")
+
+
+# --- Production integration guard: the pre-existing store-outage recovery contract
+#     (store_health.outage_covers / end_recovery_window) and the new drain-blackout
+#     recovery must coexist, each occurrence firing exactly once. ---
+
+
+def test_outage_recovery_and_drain_recovery_coexist_exactly_once(store, tmp_path):
+    """A one-shot covered by BOTH a recorded store outage and a drain blackout stays due via
+    the outage gate (checked first, untouched production semantics), takes its normal-path
+    run_claim, and the blackout path must never revive it again afterwards."""
+    import errno
+    clock = store
+    run_at = T0 + timedelta(seconds=539)
+    cj.save_jobs([_oneshot("both-covers", run_at)])
+    from cron import store_health
+    from cron.drain_windows import mark_drain_window
+    clock["v"] = T0 + timedelta(seconds=256)
+    mark_drain_window("gateway drain")
+    store_health.note_unwritable(OSError(errno.ENOSPC, "no space left"), "test", "scan",
+                                 cron_dir=tmp_path / "cron")
+    # outage_covers compares epoch seconds; align the outage with the simulated clock.
+    key = store_health._key(tmp_path / "cron")
+    with store_health._lock:
+        store_health._degraded[key].since = (T0 + timedelta(seconds=300)).timestamp()
+    clock["v"] = T0 + timedelta(seconds=1200)
+    assert [d["id"] for d in _scan()] == ["both-covers"]
+    stored = {j["id"]: j for j in cj.load_jobs()}
+    assert stored["both-covers"]["run_claim"], "normal due path must stamp the at-most-once claim"
+    assert not stored["both-covers"].get("drain_recoveries"), \
+        "the outage gate answered first; the drain marker must not also be spent"
+    # Later scans: live claim blocks every path — no double fire, no double revive.
+    assert [d["id"] for d in _scan()] == []
+    assert "both-covers" in {j["id"] for j in cj.load_jobs()}
+    store_health._degraded.pop(key, None)

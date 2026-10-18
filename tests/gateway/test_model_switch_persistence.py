@@ -320,7 +320,7 @@ class TestOneTurnNeverPersisted:
             encoding="utf-8",
         )
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
-        monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+        monkeypatch.setattr("agent.models_dev.fetch_models_dev", dict)
         monkeypatch.setattr(
             "hermes_cli.model_switch.switch_model",
             lambda **kw: ModelSwitchResult(
@@ -331,6 +331,8 @@ class TestOneTurnNeverPersisted:
                 api_key="sk-test",
                 base_url="https://openrouter.ai/api/v1",
                 api_mode="chat_completions",
+                command="antigravity-acp-mux",
+                args=["--uid="],
                 runtime_capabilities={"openai_native_compaction": True},
                 provider_label="OpenRouter",
             ),
@@ -380,6 +382,8 @@ class TestOneTurnNeverPersisted:
         assert runner._session_model_overrides[sk]["capabilities"] == {
             "openai_native_compaction": True
         }
+        assert runner._session_model_overrides[sk]["command"] == "antigravity-acp-mux"
+        assert runner._session_model_overrides[sk]["args"] == ["--uid="]
         assert sk in runner._pending_one_turn_model_restores
         # ...but NEVER written through to the persistent session store.
         runner.async_session_store.set_model_override.assert_not_awaited()

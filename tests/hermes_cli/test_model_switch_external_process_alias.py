@@ -21,7 +21,8 @@ def _switch(raw_input, profile):
          patch("hermes_cli.model_switch.get_model_info", return_value=None), \
          patch("hermes_cli.model_switch.get_model_capabilities", return_value=None), \
          patch("hermes_cli.runtime_provider.resolve_runtime_provider",
-               return_value={"api_key": "external-process", "base_url": profile.base_url, "api_mode": "chat_completions"}):
+               return_value={"api_key": "external-process", "base_url": profile.base_url, "api_mode": "chat_completions",
+                             "command": "proc-mux", "args": ["--uid="]}):
         return switch_model(raw_input=raw_input, current_provider=profile.name,
                             current_model="claude-sonnet-5[1m]", current_base_url=profile.base_url,
                             user_providers={}, custom_providers=[])
@@ -38,6 +39,7 @@ def test_alias_and_model_id_stay_on_external_process_provider():
         result = _switch(typed, profile)
         assert result.success, result.error_message
         assert (result.target_provider, result.new_model) == (profile.name, expected), typed
+        assert (result.command, result.args) == ("proc-mux", ["--uid="])
 
 
 def test_declared_process_model_validates_without_endpoint_warning():

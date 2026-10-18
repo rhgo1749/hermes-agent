@@ -435,7 +435,7 @@ def test_block_happy_path(worker_env):
 def test_schedule_parks_current_worker_with_reason(worker_env):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
-    from tools import kanban_tools  # noqa: F401 — ensure registration
+    from tools import kanban_tools
     from tools.registry import registry
 
     reason = "SCHEDULED_UNTIL=2026-09-13T00:00:00Z waiting for reconnect"
@@ -818,6 +818,149 @@ def test_unblock_happy_path(monkeypatch, worker_env):
         assert kb.get_task(conn, tid).status == "ready"
     finally:
         conn.close()
+
+
+def test_conditional_unblock_uses_public_event_id_and_registry_dispatch(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools
+    from tools.registry import registry
+
+    assert kanban_tools.registry is registry
+    tid = worker_env
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.current_run_id is not None
+        assert kb.block_task(
+            conn, tid, reason="fixed validation request", kind="capability",
+            expected_run_id=task.current_run_id,
+        )
+        event_id = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"][-1].id
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    shown_result = registry.dispatch("kanban_show", {"task_id": tid})
+    assert isinstance(shown_result, str)
+    shown = json.loads(shown_result)
+    assert shown["events"][-1]["id"] == event_id
+    unblock_entry = registry.get_entry("kanban_unblock")
+    assert unblock_entry is not None
+    unblock_schema = unblock_entry.schema["parameters"]["properties"]
+    assert "expected_block_event_id" in unblock_schema
+
+    landed_result = registry.dispatch(
+        "kanban_unblock", {"task_id": tid, "expected_block_event_id": event_id},
+    )
+    assert isinstance(landed_result, str)
+    landed = json.loads(landed_result)
+    assert landed["ok"] is True
+    assert landed["status"] == "ready"
+
+
+def test_conditional_unblock_rejects_null_event_id_without_falling_back(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools
+    from tools.registry import registry
+
+    assert kanban_tools.registry is registry
+    tid = worker_env
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        assert kb.block_task(
+            conn, tid, reason="validation request", kind="capability",
+            expected_run_id=task.current_run_id,
+        )
+        before = (
+            tuple(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()),
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,),
+            )],
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (tid,),
+            )],
+        )
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    result_value = registry.dispatch(
+        "kanban_unblock", {"task_id": tid, "expected_block_event_id": None},
+    )
+    assert isinstance(result_value, str)
+    result = json.loads(result_value)
+    assert "expected_block_event_id" in result.get("error", "")
+
+    with kbc.connect_closing() as conn:
+        after = (
+            tuple(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()),
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,),
+            )],
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (tid,),
+            )],
+        )
+        assert after == before
+
+
+def test_conditional_unblock_registry_dispatch_preserves_newer_human_hold(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools
+    from tools.registry import registry
+
+    assert kanban_tools.registry is registry
+    tid = worker_env
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.current_run_id is not None
+        assert kb.block_task(
+            conn, tid, reason="validation request", kind="capability",
+            expected_run_id=task.current_run_id,
+        )
+        original_event_id = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"][-1].id
+        assert kb.unblock_task(conn, tid)
+        claimed = kb.claim_task(conn, tid, claimer="worker")
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.block_task(
+            conn, tid, reason="human decision required", kind="needs_input",
+            expected_run_id=claimed.current_run_id,
+        )
+        before = (
+            tuple(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()),
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,),
+            )],
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (tid,),
+            )],
+        )
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    result_value = registry.dispatch(
+        "kanban_unblock", {"task_id": tid, "expected_block_event_id": original_event_id},
+    )
+    assert isinstance(result_value, str)
+    result = json.loads(result_value)
+    assert result.get("ok") is not True
+
+    with kbc.connect_closing() as conn:
+        after = (
+            tuple(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()),
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,),
+            )],
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (tid,),
+            )],
+        )
+        assert after == before
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "blocked"
 
 
 def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):

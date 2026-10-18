@@ -20,7 +20,7 @@ import logging
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +49,10 @@ def _windows_file() -> Path:
     return _current_cron_store().cron_dir / "drain_windows.json"
 
 
-def _load_windows() -> List[Dict[str, Any]]:
+def _load_windows() -> list[dict[str, Any]]:
     path = _windows_file()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
         return []
     except (OSError, ValueError):
@@ -63,7 +63,7 @@ def _load_windows() -> List[Dict[str, Any]]:
     return [w for w in data if isinstance(w, dict) and isinstance(w.get("started_at"), str)]
 
 
-def _save_windows(windows: List[Dict[str, Any]]) -> None:
+def _save_windows(windows: list[dict[str, Any]]) -> None:
     from utils import atomic_write_text
     path = _windows_file()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -71,7 +71,7 @@ def _save_windows(windows: List[Dict[str, Any]]) -> None:
     atomic_write_text(path, json.dumps(windows[-_MAX_WINDOWS:]), tmp_prefix=".drain_windows_", mode=0o600)
 
 
-def mark_drain_window(reason: str) -> Optional[Dict[str, Any]]:
+def mark_drain_window(reason: str) -> Optional[dict[str, Any]]:
     """Stamp an open blackout for the ACTIVE cron store, once per blackout (idempotent).
 
     Called from the gated tick sites, which already run inside the store's context, so every
@@ -96,7 +96,7 @@ def mark_drain_window(reason: str) -> Optional[Dict[str, Any]]:
         return entry
 
 
-def covering_drain_window(instant: str, now: datetime) -> Optional[Dict[str, Any]]:
+def covering_drain_window(instant: str, now: datetime) -> Optional[dict[str, Any]]:
     """Return the blackout window that could have swallowed ``instant`` (an overdue
     one-shot's stored run time) AND is still trusted, or None.
 
@@ -112,7 +112,7 @@ def covering_drain_window(instant: str, now: datetime) -> Optional[Dict[str, Any
     return _matching_drain_windows(instant, now)[0]
 
 
-def stale_covering_drain_window(instant: str, now: datetime) -> Optional[Dict[str, Any]]:
+def stale_covering_drain_window(instant: str, now: datetime) -> Optional[dict[str, Any]]:
     """A window that WOULD cover ``instant`` but matches only after failing its own
     staleness cap. The missed-oneshot retire calls this to make an abandoned-blackout refusal
     explicit (log + diagnostic note) instead of leaving it as plain silent expiry."""
@@ -148,7 +148,7 @@ def _matching_drain_windows(instant: str, now: datetime):
     return fresh, stale
 
 
-def _window_bounds(window: Dict[str, Any], now: datetime):
+def _window_bounds(window: dict[str, Any], now: datetime):
     """Parse a record to ``(start, end, ended_raw)``; None when malformed. An open window's
     ``end`` is ``now`` (the blackout lasts until the first allowed scan, which is the scan
     asking)."""
@@ -166,7 +166,7 @@ def _window_bounds(window: Dict[str, Any], now: datetime):
     return start, end, (ended if isinstance(ended, str) else None)
 
 
-def mark_drain_windows_for_drain(reason: str, profile_homes: Optional[List[Any]] = None) -> int:
+def mark_drain_windows_for_drain(reason: str, profile_homes: Optional[list[Any]] = None) -> int:
     """Stamp the blackout for every store the ticker serves AT THE MOMENT a drain is requested,
     not at the first gated cron tick.
 
@@ -178,7 +178,7 @@ def mark_drain_windows_for_drain(reason: str, profile_homes: Optional[List[Any]]
     no-ops), and never raises into the shutdown path. Returns how many stores were stamped.
     """
     from cron.jobs import use_cron_store
-    entries: List[Any] = list(profile_homes) if profile_homes else [None]
+    entries: list[Any] = list(profile_homes) if profile_homes else [None]
     marked = 0
     for entry in entries:
         if isinstance(entry, (tuple, list)) and len(entry) == 2:

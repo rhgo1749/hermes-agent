@@ -199,6 +199,8 @@ async def test_status_command_uses_most_recent_persisted_model_route(tmp_path):
 @pytest.mark.asyncio
 async def test_status_command_prefers_rehydrated_session_model_override(tmp_path):
     """A committed /model switch is current before the selected model records usage."""
+    from hermes_cli.model_switch import ModelSwitchResult
+
     source = _make_source()
     store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
     session_entry = store.get_or_create_session(source)
@@ -216,13 +218,13 @@ async def test_status_command_prefers_rehydrated_session_model_override(tmp_path
             input_tokens=480,
             api_call_count=48,
         )
-        result = SimpleNamespace(
+        result = ModelSwitchResult(
+            success=True,
             new_model="model-b",
             target_provider="provider-b",
             provider_label="Provider B",
             api_key="secret",
             base_url="https://b.example/v1",
-            api_mode=None,
             request_overrides={},
             runtime_capabilities={},
         )

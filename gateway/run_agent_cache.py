@@ -21,15 +21,16 @@ from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 from hermes_cli.local_runtime.endpoint import LLAMACPP_ALIASES
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
-    from gateway.run import GatewayRunner  # noqa: F401
-    from gateway.run_turn_runner import TurnRunner  # noqa: F401
+    from gateway.run import GatewayRunner
+    from gateway.run_turn_runner import TurnRunner
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
 # Override fields layered onto runtime kwargs when non-None (partial overrides don't clobber defaults).
 _OVERRIDE_APPLY_KEYS = (
-    "provider", "requested_provider", "api_key", "base_url", "api_mode", "credential_pool", "capabilities", "max_tokens",
+    "provider", "requested_provider", "api_key", "base_url", "api_mode", "command", "args",
+    "credential_pool", "capabilities", "max_tokens",
 )
 
 
@@ -53,7 +54,7 @@ class GatewayAgentCacheMixin:
         DEFAULT_CONFIG value — what the agent was actually built with — while an explicit ``null`` stays
         None so opting out of a non-None default still rebuilds. Includes the live tool registry
         generation: MCP reloads mutate the registry without touching config.yaml."""
-        out: Dict[str, Any] = {}
+        out: dict[str, Any] = {}
         cfg = user_config if isinstance(user_config, dict) else {}
         for section, key in cls._CACHE_BUSTING_CONFIG_KEYS:
             default = cfg_get(DEFAULT_CONFIG, section, key)
@@ -160,7 +161,7 @@ class GatewayAgentCacheMixin:
             return
         if not persisted:
             return
-        override: Dict[str, Any] = {k: persisted.get(k) for k in ("model", "provider", "base_url")}
+        override: dict[str, Any] = {k: persisted.get(k) for k in ("model", "provider", "base_url")}
         provider = persisted.get("provider")
         from hermes_cli.runtime_provider import is_foreign_provider_endpoint
         if is_foreign_provider_endpoint(provider, override.get("base_url")):
@@ -171,8 +172,9 @@ class GatewayAgentCacheMixin:
             # retries the resolution for that provider on each turn (default route + notice meanwhile).
             try:
                 runtime = _resolve_runtime_agent_kwargs_for_provider(provider, target_model=persisted.get("model") or None)
-                for k in ("api_key", "api_mode", "credential_pool", "requested_provider", "max_tokens"):
+                for k in ("api_key", "api_mode", "command", "credential_pool", "requested_provider", "max_tokens"):
                     override[k] = runtime.get(k)
+                override["args"] = list(runtime.get("args") or [])
                 override["request_overrides"] = dict(runtime.get("request_overrides") or {})
                 override["capabilities"] = dict(runtime.get("capabilities") or {})
                 if not override.get("base_url") or provider.strip().lower() in LLAMACPP_ALIASES:
@@ -206,7 +208,7 @@ class GatewayAgentCacheMixin:
         for key in _OVERRIDE_APPLY_KEYS:
             val = override.get(key)
             if val is not None:
-                runtime_kwargs[key] = val
+                runtime_kwargs[key] = list(val) if key == "args" and isinstance(val, (list, tuple)) else val
         # request_overrides reflects the switched-to provider; apply whenever the override recorded
         # it (even as None) so switching to a provider without configured overrides clears a stale
         # value left by the default provider's runtime resolution.
@@ -433,6 +435,14 @@ class GatewayAgentCacheMixin:
                 clear(session_key)
             except Exception as e:
                 logger.debug("Failed to clear %s state for session boundary %s: %s", what, session_key, e)
+        # The persisted /yolo copy dies with the in-memory one, or the next turn's restore revives it.
+        store = getattr(self, "session_store", None)
+        if store is not None:
+            try:
+                store.set_session_yolo(session_key, False)
+            except Exception:
+                # Never fails the boundary itself, but a surviving ON would come back after a restart.
+                logger.warning("Failed to clear persisted yolo for session boundary %s", session_key, exc_info=True)
 
     def _begin_session_run_generation(self, session_key: str) -> int:
         """Claim a fresh, monotonically increasing run generation token (NEVER reset): a late result
@@ -617,13 +627,13 @@ class GatewayAgentCacheMixin:
             # Legacy 3-tuple keeps its 3-element shape for callers indexing ``cached[2]``.
             _cache[session_key] = (cached[0], cached[1], _live) + (() if _snapshot_sid is None else (_snapshot_sid,))
 
-    def _set_pending_turn_sidecar_notes(self, session_key: str, notes: List[str]) -> None:
+    def _set_pending_turn_sidecar_notes(self, session_key: str, notes: list[str]) -> None:
         """Stage per-turn must-deliver notes for the next agent run (one-shot)."""
         if not session_key or not notes:
             return
         self._session_state(session_key).conversation.sidecar_notes = list(notes)
 
-    def _consume_pending_turn_sidecar_notes(self, session_key: str) -> List[str]:
+    def _consume_pending_turn_sidecar_notes(self, session_key: str) -> list[str]:
         state = self._peek_session_state(session_key) if session_key else None
         if state is None:
             return []
@@ -794,7 +804,7 @@ class GatewayAgentCacheMixin:
         )
         return hashlib.sha256(repr(key_tuple).encode("utf-8")).hexdigest()
 
-    def _evict_cached_agent(self, session_key: str) -> None:
+    def _evict_cached_agent(self, session_key: str, *, commit_memory: bool = False) -> None:
         """Remove a cached agent (/new, /model, ...) and soft-release its LLM client pool (AIAgent
         holds reference cycles; without it RSS grows across /new). Soft = frees clients and child
         subagents but PRESERVES terminal sandbox / browser / bg processes since the session may
@@ -829,10 +839,18 @@ class GatewayAgentCacheMixin:
         # Never tear down an agent that's mid-turn — its client, sandbox and child subagents are in use.
         if agent is None or agent is _AGENT_PENDING_SENTINEL or id(agent) in self._running_agent_ids():
             return
+        if commit_memory:
+            target, args = self._commit_then_release_soft, (agent, session_key, True)
+        else:
+            target, args = self._release_evicted_agent_soft, (agent,)
         self._spawn_release_thread(
-            self._release_evicted_agent_soft, (agent,), f"agent-evict-{str(session_key)[:24]}", inline_fallback=True,
+            target, args, f"agent-evict-{str(session_key)[:24]}", inline_fallback=True,
             session_key=session_key,
         )
+
+    def _evict_cached_agent_at_boundary(self, session_key: str) -> None:
+        """Session reset/compression/viewer-close commits memory and context engine first."""
+        self._evict_cached_agent(session_key, commit_memory=True)
 
     def _spawn_release_thread(self, target, args: tuple, name: str, *, inline_fallback: bool,
                               session_key: Optional[str] = None) -> None:
@@ -879,10 +897,13 @@ class GatewayAgentCacheMixin:
         with scope:
             target(*args)
 
-    def _commit_memory_before_soft_evict(self, agent: Any, key: str) -> None:
-        """Commit the live transcript to memory providers before resource-only eviction."""
-        # No external memory provider (``_memory_manager`` None) — nothing to commit.
-        if agent is None or not hasattr(agent, "commit_memory_session") or getattr(agent, "_memory_manager", None) is None:
+    def _commit_memory_before_soft_evict(self, agent: Any, key: str, boundary: bool = False) -> None:
+        """Commit provider memory on resource eviction and context-engine state at session boundaries."""
+        if agent is None or not hasattr(agent, "commit_memory_session"):
+            return
+        has_provider = getattr(agent, "_memory_manager", None) is not None
+        has_engine = boundary and getattr(agent, "context_compressor", None) is not None
+        if not has_provider and not has_engine:
             return
         try:
             messages = getattr(agent, "_session_messages", None)
@@ -894,10 +915,10 @@ class GatewayAgentCacheMixin:
         except Exception as _e:
             logger.debug("Pre-evict memory commit failed for %s: %s", key, _e)
 
-    def _commit_then_release_soft(self, agent: Any, key: str) -> None:
+    def _commit_then_release_soft(self, agent: Any, key: str, boundary: bool = False) -> None:
         """Commit end-of-session memory (if warranted), then soft-release — on the daemon eviction
         thread. Order matters: commit needs the live memory manager before ``release_clients``."""
-        self._commit_memory_before_soft_evict(agent, key)
+        self._commit_memory_before_soft_evict(agent, key, boundary)
         self._release_evicted_agent_soft(agent)
 
     def _release_evicted_agent_soft(self, agent: Any) -> None:
@@ -1025,7 +1046,7 @@ class GatewayAgentCacheMixin:
         # refs) — len(plan) is 0 once the daemon thread finishes, hence the pre-captured count.
         return evicted_count
 
-    def _release_pressure_batch(self, plan: List[tuple]) -> None:
+    def _release_pressure_batch(self, plan: list[tuple]) -> None:
         """Release a pressure-evicted batch sequentially on one daemon thread, then ``malloc_trim`` so
         RSS actually falls. The plan is drained (``pop`` + ``del``), not iterated, so no local
         reference pins evicted agents during ``gc.collect`` + trim (else the valve over-evicts)."""
@@ -1085,7 +1106,7 @@ class GatewayAgentCacheMixin:
             return 0
         now = time.time()
         idle_ttl = self._agent_cache_idle_ttl()
-        to_evict: List[tuple] = []
+        to_evict: list[tuple] = []
         running_ids = self._running_agent_ids()
         with _lock:
             for key, entry in list(_cache.items()):
