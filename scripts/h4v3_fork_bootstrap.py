@@ -6,7 +6,7 @@ reset, rebase or restart the gateway. Requires normal host-user Git write access
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 import json
 import subprocess
@@ -32,7 +32,7 @@ MARKER = "h4v3-fork-update.json"
 
 def git(*args: str, check=True):
     p = subprocess.run(["git", "-C", str(ROOT), *args],
-                       text=True, capture_output=True)
+                       text=True, capture_output=True, check=False)
     if check and p.returncode:
         raise RuntimeError(f"git {args[0]}: {p.stderr.strip()[-800:]}")
     return p
@@ -56,7 +56,7 @@ def activate():
             raise RuntimeError("production has uncommitted tracked changes")
         git("push", "-u", "origin", "production:production")
         marker = Path(out("rev-parse", "--absolute-git-dir")) / MARKER
-        marker.write_text(json.dumps({"mode": "fork-first-squash-v1"}) + "\n")
+        marker.write_text(json.dumps({"mode": "fork-first-squash-v1"}) + "\n", encoding="utf-8")
         print("✓ production branch tracking fork; one-click updates enabled.")
         return
 
@@ -90,7 +90,7 @@ def activate():
     # The upstream-sync candidate is built later in an isolated worktree.
     # The live checkout is not reset or rebased here.
     # Offline runtime validation was done while developing this carry.
-    if "_kanban_terminal_tool_required" not in (ROOT / FILES[0]).read_text():
+    if "_kanban_terminal_tool_required" not in (ROOT / FILES[0]).read_text(encoding="utf-8-sig"):
         raise RuntimeError("missing live Core stop-guard patch")
     git("fetch", "--no-tags", "h4v3",
         "+refs/heads/main:refs/remotes/h4v3/main")
@@ -98,7 +98,7 @@ def activate():
         # Divergence is normal here. We retain ALL local commits by branching
         # at exactly the operational HEAD rather than resetting to fork main.
         print("ℹ Existing local commits differ from fork main; preserving them unchanged.")
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     git("branch", f"backup/h4v3-before-production-{stamp}", "HEAD")
     git("switch", "-c", "production")
     if rows:
@@ -120,7 +120,7 @@ def activate():
     git("config", "--local", "branch.production.merge", "refs/heads/production")
     git("push", "-u", "origin", "production:production")
     marker = Path(out("rev-parse", "--absolute-git-dir")) / MARKER
-    marker.write_text(json.dumps({"mode": "fork-first-squash-v1"}) + "\n")
+    marker.write_text(json.dumps({"mode": "fork-first-squash-v1"}) + "\n", encoding="utf-8")
     print("✓ Docker production has a stable Git branch on the H4V3 fork.")
     print("✓ origin = H4V3 fork; upstream = NousResearch (push blocked).")
     print("✓ From now on, normal Hermes Update automatically prepares upstream squashes.")

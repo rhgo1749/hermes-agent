@@ -14,7 +14,7 @@ from hermes_cli import h4v3_fork_update as flow
 
 def run(cwd: Path, *args: str) -> str:
     p = subprocess.run(["git", "-C", str(cwd), *args], text=True,
-                       capture_output=True)
+                       capture_output=True, check=False)
     assert p.returncode == 0, f"{args}: {p.stderr}"
     return p.stdout.strip()
 
@@ -57,6 +57,7 @@ def forks(tmp_path, monkeypatch):
     monkeypatch.setattr(flow, "_verify_candidate", lambda *_: None)
     monkeypatch.setattr(flow, "FORK_URL", str(fork))
     monkeypatch.setattr(flow, "UPSTREAM_URL", str(upstream))
+    monkeypatch.setattr(flow, "FORK_BRANCH", "production")  # Legacy-topology test fixture.
     return SimpleNamespace(root=local, writer=writer, upstream=upstream,
                            fork=fork, initial=initial, retained=retained)
 
@@ -326,10 +327,25 @@ def test_version_status_distinguishes_fork_from_upstream(capsys, monkeypatch):
     })
     _startup_fast.print_fast_version_info()
     result = capsys.readouterr().out
-    assert "Fork production up to date" in result
+    assert "Fork main up to date" in result
     assert "Official upstream/main has newer code" in result
     assert "h4v3_fork_update sync" in result
     assert "1 commit behind" not in result
+
+
+def test_main_only_route_uses_fork_main_not_legacy_production(forks, monkeypatch):
+    f = forks
+    monkeypatch.setattr(flow, "FORK_BRANCH", "main")
+    with pytest.raises(flow.ForkUpdateError, match="main branch"):
+        flow._verify(f.root)  # Legacy production checkout is rejected after cutover.
+    run(f.root, "switch", "main")
+    args = SimpleNamespace(branch=None, channel=None)
+    flow.maybe_prepare_update(args, f.root)
+    assert args.branch == "main"
+    state = flow.check_fork_updates(f.root)
+    assert state["behind"] == 0
+    assert state["targetSha"] == run(f.fork, "rev-parse", "refs/heads/main")
+    assert run(f.root, "branch", "--show-current") == "main"
 
 
 def test_disabled_install_keeps_stock_update_unchanged(tmp_path):
@@ -343,5 +359,5 @@ def test_disabled_install_keeps_stock_update_unchanged(tmp_path):
 
 def test_explicit_other_update_channel_is_rejected_in_fork_mode(forks):
     args = SimpleNamespace(branch=None, channel="stable")
-    with pytest.raises(SystemExit, match="production"):
+    with pytest.raises(SystemExit, match="main"):
         flow.maybe_prepare_update(args, forks.root)

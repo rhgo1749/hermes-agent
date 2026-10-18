@@ -236,7 +236,7 @@ def print_fast_version_info(*, check_updates: bool = True) -> None:
             commits_word = "commit" if behind == 1 else "commits"
             print(f"Update available: {behind} {commits_word} behind — run '{recommended_update_command()}'")
         elif behind == 0:
-            print("Fork production up to date" if status.get("upstreamSyncedSha") else "Up to date")
+            print("Fork main up to date" if status.get("upstreamSyncedSha") else "Up to date")
         if status.get("upstreamPending") is True:
             print("Official upstream/main has newer code — review and integrate separately "
                   "with 'python3 -m hermes_cli.h4v3_fork_update sync'")

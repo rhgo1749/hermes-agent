@@ -440,7 +440,7 @@ def check_for_updates(*, install_root: Path | None = None, home: Path | None = N
             return result
         if fork_status is not None:
             result.update(fork_status)
-            result["branch"] = "production"
+            result["branch"] = "main"
             _write_cache(cache_file, identity, now, result)
             return result
     source_target = None

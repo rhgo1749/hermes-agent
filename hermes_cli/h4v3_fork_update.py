@@ -1,7 +1,7 @@
 """H4V3 fork identity and optional, separate upstream integration.
 
 Normal hermes update uses the official Hermes source updater to pull
-origin/production without merging upstream or rewriting fork history.
+origin/main without merging upstream or rewriting fork history.
 An explicit python -m hermes_cli.h4v3_fork_update sync prepares the existing
 conflict-safe upstream squash for a subsequent native update. The stock updater
 owns dependency selection, backups, restart and health checks.
@@ -18,7 +18,7 @@ import sys
 
 FORK_URL = "https://github.com/rhgo1749/hermes-agent.git"
 UPSTREAM_URL = "https://github.com/NousResearch/hermes-agent.git"
-PRODUCTION = "production"
+FORK_BRANCH = "main"
 CANDIDATE_BRANCH = "h4v3/upstream-squash-candidate"
 CANDIDATE_DIR = ".worktrees/h4v3-upstream-squash"
 MARKER = "h4v3-fork-update.json"
@@ -27,7 +27,7 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 class ForkUpdateError(RuntimeError):
-    """Refuse publication without disturbing the production checkout."""
+    """Refuse publication without disturbing the main checkout."""
 
 
 def _git(root: Path, *args: str, cwd: Path | None = None, input_bytes: bytes | None = None,
@@ -77,21 +77,21 @@ def _verify(root: Path) -> None:
         raise ForkUpdateError("origin must be the H4V3 fork")
     if _url(_out(root, "remote", "get-url", "upstream")) != _url(UPSTREAM_URL):
         raise ForkUpdateError("upstream must be NousResearch/hermes-agent")
-    if _out(root, "symbolic-ref", "--short", "HEAD") != PRODUCTION:
-        raise ForkUpdateError("running checkout must be on production branch")
+    if _out(root, "symbolic-ref", "--short", "HEAD") != FORK_BRANCH:
+        raise ForkUpdateError("running checkout must be on main branch")
     if _out(root, "status", "--porcelain=v1", "--untracked-files=no"):
-        raise ForkUpdateError("production has uncommitted changes; commit them before updating")
+        raise ForkUpdateError("main has uncommitted changes; commit them before updating")
 
 
-def _last_synced(root: Path, production_sha: str) -> str | None:
+def _last_synced(root: Path, main_sha: str) -> str | None:
     message = _out(root, "log", "-1", "--format=%B", "--grep=H4V3-Upstream-SHA:",
-                   production_sha)
-    rows = re.findall(r"^H4V3-Upstream-SHA:\s*([0-9a-f]{40})$", message, re.M)
+                   main_sha)
+    rows = re.findall(r"^H4V3-Upstream-SHA:\s*([0-9a-f]{40})$", message, re.MULTILINE)
     return rows[-1] if rows else None
 
 
 def fork_banner_identity(root: Path) -> dict[str, str] | None:
-    """Identify the activated production fork and its recorded upstream baseline.
+    """Identify the activated main fork and its recorded upstream baseline.
 
     An upstream squash is not a Git ancestor of the fork HEAD; neither git
     describe nor origin/main reliably identifies its code version. Do not
@@ -102,7 +102,7 @@ def fork_banner_identity(root: Path) -> dict[str, str] | None:
     try:
         if (_url(_out(root, "remote", "get-url", "origin")) != _url(FORK_URL)
                 or _url(_out(root, "remote", "get-url", "upstream")) != _url(UPSTREAM_URL)
-                or _out(root, "branch", "--show-current") != PRODUCTION):
+                or _out(root, "branch", "--show-current") != FORK_BRANCH):
             return None
         local = _sha(root, "HEAD")
         synced = _last_synced(root, local)
@@ -134,26 +134,26 @@ def _apply_delta(root: Path, candidate: Path, previous: str | None, upstream: st
             result = _git(root, "apply", "--3way", "--binary", "-", cwd=candidate,
                           input_bytes=patch, check=False)
             if result.returncode:
-                raise ForkUpdateError("upstream delta conflicts with H4V3 production")
+                raise ForkUpdateError("upstream delta conflicts with H4V3 main")
     else:
         result = _git(root, "merge", "--squash", upstream, cwd=candidate, check=False)
         if result.returncode:
-            raise ForkUpdateError("initial upstream squash conflicts with H4V3 production")
+            raise ForkUpdateError("initial upstream squash conflicts with H4V3 main")
 
 
-def _resolve_upstream(root: Path, production_sha: str) -> tuple[str, str | None, str]:
+def _resolve_upstream(root: Path, main_sha: str) -> tuple[str, str | None, str]:
     # Only fetch the two branch heads, not thousands of task branches.
     _git(root, "fetch", "--no-tags", "origin",
-         "+refs/heads/production:refs/remotes/origin/production")
+         f"+refs/heads/{FORK_BRANCH}:refs/remotes/origin/{FORK_BRANCH}")
     _git(root, "fetch", "--no-tags", "upstream",
          "+refs/heads/main:refs/remotes/upstream/main")
-    fork_sha = _sha(root, "refs/remotes/origin/production")
-    if production_sha != fork_sha and _git(
-        root, "merge-base", "--is-ancestor", production_sha, fork_sha,
+    fork_sha = _sha(root, f"refs/remotes/origin/{FORK_BRANCH}")
+    if main_sha != fork_sha and _git(
+        root, "merge-base", "--is-ancestor", main_sha, fork_sha,
         check=False).returncode:
-        raise ForkUpdateError("fork production diverged; reconcile before update")
+        raise ForkUpdateError("fork main diverged; reconcile before update")
     upstream = _sha(root, "refs/remotes/upstream/main")
-    previous = _last_synced(root, production_sha)
+    previous = _last_synced(root, main_sha)
     if previous:
         if _git(root, "merge-base", "--is-ancestor", previous, upstream, check=False).returncode:
             raise ForkUpdateError("upstream history was rewritten; rebase/reconcile manually")
@@ -181,7 +181,7 @@ def _verify_candidate(root: Path, candidate: Path) -> None:
 
 
 def _publish_candidate(root: Path, candidate: Path, upstream_sha: str,
-                       production_sha: str, *, validate: bool) -> None:
+                       main_sha: str, *, validate: bool) -> None:
     if validate:
         _verify_candidate(root, candidate)
     # A marked commit may have no tree delta (upstream already merged
@@ -190,46 +190,46 @@ def _publish_candidate(root: Path, candidate: Path, upstream_sha: str,
     _git(root, "commit", "--allow-empty", "-m",
          f"chore(h4v3): squash upstream {upstream_sha[:12]}",
          "-m", f"{TRAILER}{upstream_sha}", cwd=candidate)
-    if _git(root, "merge-base", "--is-ancestor", production_sha,
+    if _git(root, "merge-base", "--is-ancestor", main_sha,
             _sha(root, CANDIDATE_BRANCH), check=False).returncode:
-        raise ForkUpdateError("candidate no longer preserves production commits")
+        raise ForkUpdateError("candidate no longer preserves main commits")
     # Never force push. A concurrent fork push must reject this update.
-    _git(root, "push", "origin", f"{CANDIDATE_BRANCH}:refs/heads/{PRODUCTION}")
-    print("✓ Upstream changes squash-published to fork production.")
-    print("  Existing production commits preserved; stock Hermes updater will now apply the new commit.")
+    _git(root, "push", "origin", f"{CANDIDATE_BRANCH}:refs/heads/{FORK_BRANCH}")
+    print("✓ Upstream changes squash-published to fork main.")
+    print("  Existing main commits preserved; stock Hermes updater will now apply the new commit.")
 
 
 def prepare_update(root: Path) -> bool:
-    """Return True only for an enabled fork. Refuse before stock updater mutates production."""
+    """Return True only for an enabled fork. Refuse before stock updater mutates main."""
     if not _enabled(root):
         return False
     _verify(root)
     if _pending(root):
         raise ForkUpdateError(f"Previous integration pending at {_candidate(root)}; "
                               "resolve/abort it before another update")
-    production_sha = _sha(root, PRODUCTION)
-    upstream, previous, fork_sha = _resolve_upstream(root, production_sha)
-    if fork_sha != production_sha:
-        print("✓ Fork production already has a newer commit; letting the stock updater fast-forward it.")
+    main_sha = _sha(root, FORK_BRANCH)
+    upstream, previous, fork_sha = _resolve_upstream(root, main_sha)
+    if fork_sha != main_sha:
+        print("✓ Fork main already has a newer commit; letting the stock updater fast-forward it.")
         return True
     if previous == upstream or (not previous and
                                _git(root, "merge-base", "--is-ancestor", upstream,
-                                    production_sha, check=False).returncode == 0):
+                                    main_sha, check=False).returncode == 0):
         print("✓ H4V3 fork already includes this upstream revision.")
         return True
 
     worktree = _candidate(root)
     worktree.parent.mkdir(parents=True, exist_ok=True)
     _git(root, "worktree", "add", "-b", CANDIDATE_BRANCH,
-         str(worktree), production_sha)
-    _pending_file(root).write_text(json.dumps({"base": production_sha, "upstream": upstream}) + "\n")
+         str(worktree), main_sha)
+    _pending_file(root).write_text(json.dumps({"base": main_sha, "upstream": upstream}) + "\n", encoding="utf-8")
     try:
         _apply_delta(root, worktree, previous, upstream)
-        _publish_candidate(root, worktree, upstream, production_sha, validate=True)
+        _publish_candidate(root, worktree, upstream, main_sha, validate=True)
     except ForkUpdateError:
-        print(f"⚠ Stopped: production and fork left unchanged. Candidate: {worktree}")
+        print(f"⚠ Stopped: main and fork left unchanged. Candidate: {worktree}")
         print("  Resolve conflicts in the candidate or run:")
-        print(f"  python -m hermes_cli.h4v3_fork_update abort")
+        print("  python -m hermes_cli.h4v3_fork_update abort")
         raise
     _git(root, "worktree", "remove", str(worktree))
     _git(root, "branch", "-D", CANDIDATE_BRANCH)
@@ -238,7 +238,7 @@ def prepare_update(root: Path) -> bool:
 
 
 def check_fork_updates(root: Path) -> dict | None:
-    """Report only changes the native updater can install from origin/production.
+    """Report only changes the native updater can install from origin/main.
 
     Upstream drift is informational until an explicit reviewed sync publishes
     it to the fork. An unknown commit distance must not be called 1 commit.
@@ -247,8 +247,8 @@ def check_fork_updates(root: Path) -> dict | None:
         return None
     if (_url(_out(root, "remote", "get-url", "origin")) != _url(FORK_URL)
             or _url(_out(root, "remote", "get-url", "upstream")) != _url(UPSTREAM_URL)
-            or _out(root, "branch", "--show-current") != PRODUCTION):
-        raise ForkUpdateError("fork update check requires the configured production checkout")
+            or _out(root, "branch", "--show-current") != FORK_BRANCH):
+        raise ForkUpdateError("fork update check requires the configured main checkout")
 
     def remote_head(remote: str, branch: str) -> str:
         lines = _out(root, "ls-remote", "--heads", remote, branch).splitlines()
@@ -259,23 +259,23 @@ def check_fork_updates(root: Path) -> dict | None:
             raise ForkUpdateError(f"invalid {remote}/{branch} revision")
         return rev
 
-    local = _sha(root, PRODUCTION)
-    remote_production = remote_head("origin", PRODUCTION)
+    local = _sha(root, FORK_BRANCH)
+    remote_main = remote_head("origin", FORK_BRANCH)
     upstream = remote_head("upstream", "main")
     previous = _last_synced(root, local)
     upstream_pending = previous != upstream if previous else True
     # SOURCE_CHECK.UPDATE_AVAILABLE_NO_COUNT = -1; remote SHA alone does not
     # prove the number of reachable commits without fetching.
-    behind = -1 if local != remote_production else 0
+    behind = -1 if local != remote_main else 0
     return {"behind": behind, "updateAvailable": behind != 0,
-            "targetSha": remote_production, "commits": [],
+            "targetSha": remote_main, "commits": [],
             "upstreamPending": upstream_pending,
             "upstreamSyncedSha": previous,
             "upstreamTargetSha": upstream}
 
 
 def maybe_prepare_update(args, root: Path) -> None:
-    """Route an activated fork through the official origin/production updater.
+    """Route an activated fork through the official origin/main updater.
 
     No upstream fetch, squash, push or checkout mutation occurs in this hook.
     The H4V3 upstream integration is an explicit, separately reviewable step.
@@ -283,14 +283,14 @@ def maybe_prepare_update(args, root: Path) -> None:
     if not _enabled(root):
         return
     if getattr(args, "branch", None) or getattr(args, "channel", None):
-        raise SystemExit("H4V3 fork update uses the production branch; omit --branch/--channel")
+        raise SystemExit("H4V3 fork update uses the main branch; omit --branch/--channel")
     try:
         _verify(root)
     except ForkUpdateError as exc:
         print(f"✗ H4V3 fork update stopped safely: {exc}")
         raise SystemExit(1) from exc
-    args.branch = PRODUCTION
-    print("✓ H4V3 fork: using Hermes native update from origin/production.")
+    args.branch = FORK_BRANCH
+    print("✓ H4V3 fork: using Hermes native update from origin/main.")
     print("  To integrate upstream/main into the fork, run h4v3_fork_update sync separately.")
 
 
@@ -304,11 +304,11 @@ def _main() -> int:
         print("H4V3 fork mode is not enabled")
         return 2
     if args.action == "status":
-        local = _sha(root, PRODUCTION)
-        print("Production:", local[:12])
+        local = _sha(root, FORK_BRANCH)
+        print("Fork main:", local[:12])
         print("Synced upstream:", (_last_synced(root, local) or "unrecorded")[:12])
         print("Pending integration:", _candidate(root) if _pending(root) else "none")
-        print("Native update: origin/production only; upstream merge: explicit sync.")
+        print("Native update: origin/main only; upstream merge: explicit sync.")
         return 0
     if args.action == "sync":
         try:
@@ -316,7 +316,7 @@ def _main() -> int:
         except ForkUpdateError as exc:
             print(f"✗ H4V3 upstream integration stopped safely: {exc}")
             return 1
-        print("Upstream integration prepared. Run hermes update to install fork production.")
+        print("Upstream integration prepared. Run hermes update to install fork main.")
         return 0
     candidate = _candidate(root)
     if not candidate.is_dir():
@@ -329,14 +329,14 @@ def _main() -> int:
         _git(root, "worktree", "remove", "--force", str(candidate))
         _git(root, "branch", "-D", CANDIDATE_BRANCH)
         _pending_file(root).unlink(missing_ok=True)
-        print("Isolated candidate discarded; production and fork unchanged.")
+        print("Isolated candidate discarded; main and fork unchanged.")
         return 0
     _verify(root)
-    metadata = json.loads(_pending_file(root).read_text())
-    if (_sha(root, PRODUCTION) != metadata["base"] or
-            _sha(root, "refs/remotes/origin/production") != metadata["base"] or
+    metadata = json.loads(_pending_file(root).read_text(encoding="utf-8-sig"))
+    if (_sha(root, FORK_BRANCH) != metadata["base"] or
+            _sha(root, f"refs/remotes/origin/{FORK_BRANCH}") != metadata["base"] or
             _sha(root, CANDIDATE_BRANCH) != metadata["base"]):
-        raise ForkUpdateError("production or candidate changed during conflict resolution")
+        raise ForkUpdateError("main or candidate changed during conflict resolution")
     if _out(root, "status", "--porcelain=v1", "--untracked-files=no", cwd=candidate).splitlines():
         # All conflict resolution must be staged. A staged-only change has
         # porcelain's second column blank; only the unstaged column blocks.
