@@ -54,6 +54,27 @@ def kanban_home(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_same_key_rechecked_after_competing_creator_commits(kanban_home, monkeypatch):
+    """A creator landing before our write lock must win, not create a second root."""
+    from contextlib import contextmanager
+
+    key = "same-authority-root"
+    original_txn = kb.write_txn
+    raced = []
+    with kbc.connect() as first, kbc.connect() as other:
+        @contextmanager
+        def insert_before_lock(conn, *args, **kwargs):
+            if conn is first and not raced:
+                raced.append(kb.create_task(other, title="winner", idempotency_key=key))
+            with original_txn(conn, *args, **kwargs):
+                yield
+
+        monkeypatch.setattr(kb, "write_txn", insert_before_lock)
+        result = kb.create_task(first, title="contender", idempotency_key=key)
+        rows = first.execute("SELECT id FROM tasks WHERE idempotency_key = ?", (key,)).fetchall()
+        assert result == raced[0]
+        assert [row["id"] for row in rows] == raced
+
 
 # ---------------------------------------------------------------------------
 # Spawn-failure circuit breaker
@@ -1374,6 +1395,7 @@ def test_dead_worker_reap_reads_the_log_of_the_dispatching_board(kanban_home):
     from hermes_cli import kanban_db_dispatch as kbd
     assert kb.get_current_board() == "default"
     board = "other-board"
+    kb.create_board(board)  # explicit creation; connect() must not create boards (#43243)
     conn = kbc.connect(board=board)
     try:
         tid = kb.create_task(conn, title="handoff", assignee="worker")

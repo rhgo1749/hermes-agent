@@ -33,6 +33,8 @@ OVERRIDE = {
     "api_key": "sk-SUPER-SECRET-do-not-persist",
     "base_url": "https://api.openai.example/v1",
     "api_mode": "responses",
+    "command": "/tmp/should-not-persist",
+    "args": ["--stale"],
 }
 
 
@@ -114,6 +116,8 @@ def test_runner_rehydrates_override_after_restart(store_factory):
             "requested_provider": "custom:chatgpt-tier",
             "capabilities": {"openai_native_compaction": True},
             "max_tokens": 32_768,
+            "command": "antigravity-acp-mux",
+            "args": ["--uid="],
         },
     ):
         runner._rehydrate_session_model_override(session_key)
@@ -128,6 +132,8 @@ def test_runner_rehydrates_override_after_restart(store_factory):
     assert override["requested_provider"] == "custom:chatgpt-tier"
     assert override["capabilities"] == {"openai_native_compaction": True}
     assert override["max_tokens"] == 32_768
+    assert override["command"] == "antigravity-acp-mux"
+    assert override["args"] == ["--uid="]
 
     model, runtime = runner._resolve_session_agent_runtime(
         session_key=session_key,
@@ -137,8 +143,12 @@ def test_runner_rehydrates_override_after_restart(store_factory):
     assert runtime["requested_provider"] == "custom:chatgpt-tier"
     assert runtime["capabilities"] == {"openai_native_compaction": True}
     assert runtime["max_tokens"] == 32_768
+    assert runtime["command"] == "antigravity-acp-mux"
+    assert runtime["args"] == ["--uid="]
     route = runner._resolve_turn_agent_config("", model, runtime)
     assert route["runtime"]["capabilities"] == {"openai_native_compaction": True}
+    assert route["runtime"]["command"] == "antigravity-acp-mux"
+    assert route["runtime"]["args"] == ["--uid="]
 
 
 def test_rehydrate_llamacpp_override_follows_live_managed_port(store_factory):

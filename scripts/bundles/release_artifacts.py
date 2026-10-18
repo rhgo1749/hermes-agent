@@ -14,6 +14,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path, PureWindowsPath
 
+from scripts.releases import lanes as lane_set
 from scripts.releases.stable import read_admitted_candidate, accepted_smoke_results, validate_candidates
 
 
@@ -104,7 +105,7 @@ def record(platform: str, arch: str, root: Path, tag: str, commit: str, out: Pat
         app = single(root.glob("mac*/*.app"))
         subprocess.run(["codesign", "--verify", "--strict", str(app)], check=True)
         signature = subprocess.run(["codesign", "-dv", "--verbose=4", str(app)], check=True, capture_output=True, text=True, encoding="utf-8")
-        team = re.search(r"^TeamIdentifier=([A-Z0-9]{10})$", signature.stderr, re.M)
+        team = re.search(r"^TeamIdentifier=([A-Z0-9]{10})$", signature.stderr, re.MULTILINE)
         if not team:
             raise ValueError("Signed app has no Developer ID team")
         with zipfile.ZipFile(package) as archive:
@@ -159,17 +160,31 @@ def validate_windows_bundle(bundle: Path, windows: list[dict]) -> None:
         raise ValueError("Universal bundle must cover both architectures")
 
 
+ALL_HANDOFFS = ("win32-x64", "win32-arm64", "darwin-x64", "darwin-arm64", "termux", "windows-universal")
+WINDOWS_HANDOFFS = frozenset({"win32-x64", "win32-arm64", "windows-universal"})
+
+
 def assemble(root: Path, tag: str, commit: str, public_base: str, out: Path,
-             *, smoke_results: dict, release_epoch: int, archive: str) -> dict:
+             *, smoke_results: dict, release_epoch: int, archive: str,
+             handoffs: tuple[str, ...] = ALL_HANDOFFS) -> dict:
     """Bind the native metadata to files already staged by their build jobs.
 
     `tag` stays the plain payload identity; `archive` is the attempt ref the
-    manifest and every artifact URL are keyed under."""
+    manifest and every artifact URL are keyed under. `handoffs` names the
+    groups this release built; a group left out must have no target in the
+    manifest. The three Windows groups build together or not at all: the
+    universal and Store bundles are assembled from both architectures."""
     from scripts.releases.handoff import receipt_name, validate_receipt
     from scripts.releases.r2 import put, staging_key_for
 
-    smoke_results = accepted_smoke_results(smoke_results)
-    expected = ("win32-x64", "win32-arm64", "darwin-x64", "darwin-arm64", "termux", "windows-universal")
+    expected = tuple(handoffs)
+    windows = WINDOWS_HANDOFFS & set(expected)
+    if (not expected or len(set(expected)) != len(expected) or not set(expected) <= set(ALL_HANDOFFS)
+            or windows not in (set(), WINDOWS_HANDOFFS)):
+        raise ValueError(f"Invalid candidate handoff set: {', '.join(expected)}")
+    absent = frozenset(t for t in lane_set.TARGET_LANE if lane_set.TARGET_LANE[t] not in
+                       {lane_set.HANDOFF_LANE[name] for name in expected})
+    smoke_results = accepted_smoke_results(smoke_results, absent=absent)
     by_name = {}
     for name in expected:
         file = root / receipt_name(name)
@@ -191,16 +206,19 @@ def assemble(root: Path, tag: str, commit: str, public_base: str, out: Path,
                 raise ValueError(f"Candidate local digest mismatch: {name}")
             if name.startswith("metadata-"):
                 rows.append(json.loads(file.read_text(encoding="utf-8-sig")))
-    universal_name = single(name for name in by_name if name.endswith(".msixbundle") and not name.startswith("Store-"))
-    single(name for name in by_name if name.endswith(".msixbundle") and name.startswith("Store-"))
-    windows = [r for r in rows if r["platform"] == "windows"]
-    validate_windows_bundle(root / universal_name, windows)
+    universal_name = None
+    if windows:
+        universal_name = single(name for name in by_name if name.endswith(".msixbundle") and not name.startswith("Store-"))
+        single(name for name in by_name if name.endswith(".msixbundle") and name.startswith("Store-"))
+        validate_windows_bundle(root / universal_name, [r for r in rows if r["platform"] == "windows"])
     files = [{**row, "url": f"{public_base.rstrip('/')}/{staging_key_for(archive, name)}"}
              for name, row in sorted(by_name.items()) if not name.startswith("metadata-")]
     by_name = {item["path"]: item for item in files}
     packages = []
     for row in rows:
-        stamp_matches(row, tag, commit)
+        # record() verified each package's own stamp; a row is metadata and carries no baseVersion.
+        if row.get("commit") != commit or row.get("tag") != tag:
+            raise ValueError("Built package provenance does not match the release")
         filename = universal_name if row["platform"] == "windows" else row["filename"]
         item = by_name[filename]
         packages.append({k: v for k, v in {**row, "artifact": {"url": item["url"], "sha256": item["sha256"]}}.items() if k != "filename"})
@@ -208,14 +226,20 @@ def assemble(root: Path, tag: str, commit: str, public_base: str, out: Path,
               "archive": archive,
               "packages": packages, "files": files, "smoke_results": smoke_results}
     validate_candidates(result, tag, commit, public_base, release_epoch, archive=archive)
-    if not any(row["platform"] == "termux" for row in packages):
-        raise ValueError("Missing Termux candidate")
+    present = {f"{row['platform']}/{row['arch']}" for row in packages}
+    if present != set(lane_set.TARGET_LANE) - absent:
+        raise ValueError("Candidate package rows differ from the built handoffs")
     out.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     put(tag=archive, key="release-candidates.json", file=out, immutable=True)
     return result
 
 
-def materialize(manifest: dict, root: Path, *, public_base: str, store_only: bool = False) -> None:
+# Package payloads: receipt-bound by sha256, never needed on disk to write feeds.
+PACKAGE_SUFFIXES = (".dmg", ".zip", ".blockmap", ".msix", ".msixbundle", ".deb")
+
+
+def materialize(manifest: dict, root: Path, *, public_base: str, store_only: bool = False,
+                metadata_only: bool = False) -> None:
     validate_candidates(manifest, manifest["tag"], manifest["commit"], public_base,
                         archive=manifest["archive"])
     files = manifest.get("files", [])
@@ -225,9 +249,16 @@ def materialize(manifest: dict, root: Path, *, public_base: str, store_only: boo
     if any(by_url.get(row["artifact"]["url"]) != row["artifact"]["sha256"] for row in manifest["packages"]):
         raise ValueError("Package receipts differ from candidate file receipts")
     selected = [item for item in files if item["path"].startswith("Store-") and item["path"].endswith(".msixbundle")] if store_only else files
+    if metadata_only:
+        selected = [item for item in selected if not item["path"].endswith(PACKAGE_SUFFIXES)]
     if store_only and len(selected) != 1:
         raise ValueError("Expected one Store candidate")
-    for item in selected:
+    from scripts.releases.progress import log
+
+    total = sum(item.get("size", 0) for item in selected)
+    log(f"Materializing {len(selected)} candidate files ({total / 1e9:.1f} GB) into {root}")
+    for number, item in enumerate(selected, start=1):
+        log(f"  [{number}/{len(selected)}] {item['path']} ({item.get('size', 0) / 1e6:.0f} MB)")
         relative = Path(item["path"])
         if relative.is_absolute() or ".." in relative.parts or any(c in item["path"] for c in "\\:%?#") or item["path"].startswith("/") or "//" in item["path"]:
             raise ValueError("Invalid artifact path")
@@ -309,7 +340,9 @@ def publish_canary_appinstaller(root: Path, *, tag: str, variant: str, bundle: P
 def promote(manifest: dict, root: Path, public_base: str) -> None:
     from scripts.releases.r2 import put, finalize
 
-    materialize(manifest, root, public_base=public_base)
+    # Feeds need the per-arch feed legs and APT indexes, not the packages: those are
+    # bound by the accepted candidate's sha256 receipts.
+    materialize(manifest, root, public_base=public_base, metadata_only=True)
     windows = next(r for r in manifest["packages"] if r["platform"] == "windows")
     uri = f"{public_base.rstrip('/')}/releases/win32/stable/stable.appinstaller"
     appinstaller = root / "stable.appinstaller"
@@ -318,11 +351,19 @@ def promote(manifest: dict, root: Path, public_base: str) -> None:
     apt = root / "apt"
     indexes = sorted(p for p in apt.rglob("*") if p.is_file() and not p.relative_to(apt).as_posix().startswith("pool/") and "/by-hash/" not in p.relative_to(apt).as_posix())
     indexes.sort(key=lambda p: p.name == "InRelease")
-    if not any(p.name == "InRelease" for p in indexes):
+    # Termux is opt-in: a release that did not build it leaves the APT channel
+    # on the previous Termux release, and ships no indexes to publish.
+    termux = any(row["platform"] == "termux" for row in manifest["packages"])
+    if termux and not any(p.name == "InRelease" for p in indexes):
         raise ValueError("Missing signed APT index")
+    if not termux and indexes:
+        raise ValueError("APT indexes staged for a release without a Termux candidate")
     # Every package and index must exist before the first channel write.
     # The merged feed points at the attempt archive; the version stays plain.
-    finalize(tag=manifest["tag"], dir=root, archive=manifest["archive"])
+    # macOS Intel is opt-in: without it the feed carries the arm64 leg alone.
+    arches = tuple(arch for arch in ("arm64", "x64")
+                   if any(row["platform"] == "macos" and row["arch"] == arch for row in manifest["packages"]))
+    finalize(tag=manifest["tag"], dir=root, archive=manifest["archive"], arches=arches, verify_bytes=False)
     def publish_pointer(key, file):
         put(tag=manifest["tag"], key=key, file=file, key_is_full=True)
         digest = hashlib.sha256()
@@ -349,7 +390,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--tag", default=os.environ.get("RELEASE_TAG"))
     parser.add_argument("--archive", default=os.environ.get("HERMES_ARCHIVE_TAG"),
                         help="Attempt ref the release archive is keyed under when the payload tag is plain vX.Y.Z")
-    parser.add_argument("--commit", default=os.environ.get("GITHUB_SHA"))
+    # A stable run dispatches from the default branch, so GITHUB_SHA is not the admitted claim commit.
+    parser.add_argument("--commit", default=os.environ.get("RELEASE_COMMIT") or os.environ.get("GITHUB_SHA"))
     parser.add_argument("--public-base", default=os.environ.get("CLOUDFLARE_R2_PUBLIC_URL"))
     parser.add_argument("--release-epoch", type=int, default=os.environ.get("HERMES_RELEASE_EPOCH"))
     parser.add_argument("--store-only", action="store_true")

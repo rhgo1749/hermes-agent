@@ -45,6 +45,88 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
+def _existing_task(conn, tid):
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    return task
+
+
+def test_internal_done_park_preserves_ended_history_and_reopen_implementer(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="external PR awaiting human review", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        rid = _existing_task(conn, tid).current_run_id
+        assert kb.complete_task(conn, tid, summary="original delivery", expected_run_id=rid)
+        before_run = dict(conn.execute("SELECT * FROM task_runs WHERE id = ?", (rid,)).fetchone())
+        before_events = [dict(row) for row in conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,))]
+        assert kb.request_review(conn, tid, park=True, expected_status="done",
+            expected_run_id=rid, summary="current HEAD proof\nhuman-readable detail")
+        parked = _existing_task(conn, tid)
+        assert parked.status == "review" and parked.assignee is None and parked.current_run_id is None
+        assert parked.completed_at is None
+        assert dict(conn.execute("SELECT * FROM task_runs WHERE id = ?", (rid,)).fetchone()) == before_run
+        after_events = [dict(row) for row in conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,))]
+        assert after_events[:len(before_events)] == before_events
+        payload = json.loads(after_events[-1]["payload"])
+        assert payload["parked"] is True and payload["implementer"] == "worker"
+        assert payload["summary"] == "current HEAD proof"
+        assert after_events[-1]["run_id"] != rid
+        assert not kb.request_review(conn, tid, park=True, expected_status="done", expected_run_id=rid)
+        assert kb.reopen_review_task(conn, tid, reason="new trusted rework", author="reviewer")
+        assert _existing_task(conn, tid).status == "ready"
+        assert _existing_task(conn, tid).assignee == "worker"
+
+
+@pytest.mark.parametrize("bad_run", [None, True, False, 0, -1, "1", 1.0, 999999])
+def test_internal_done_park_missing_or_stale_run_is_unchanged(kanban_home, bad_run):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="done proof required", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        rid = _existing_task(conn, tid).current_run_id
+        assert kb.complete_task(conn, tid, summary="delivery", expected_run_id=rid)
+        before = conn.total_changes
+        assert not kb.request_review(conn, tid, park=True, expected_status="done",
+            expected_run_id=bad_run, summary="must not mutate", force=True)
+        assert conn.total_changes == before and _existing_task(conn, tid).status == "done"
+
+
+@pytest.mark.parametrize("field,value", [("worker_pid", 12345), ("claim_lock", "live"),
+                                          ("claim_expires", 9999999999), ("current_run_id", 1)])
+def test_internal_done_park_refuses_live_fields_even_with_matching_history(kanban_home, field, value):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="live field refusal", assignee="worker")
+        kb.claim_task(conn, tid)
+        rid = _existing_task(conn, tid).current_run_id
+        assert kb.complete_task(conn, tid, summary="delivery", expected_run_id=rid)
+        with kb.write_txn(conn):
+            conn.execute(f"UPDATE tasks SET {field} = ? WHERE id = ?", (value, tid))
+        before = conn.total_changes
+        assert not kb.request_review(conn, tid, park=True, expected_status="done", expected_run_id=rid)
+        assert conn.total_changes == before
+
+
+def test_internal_done_park_old_completion_cannot_cross_new_run_or_aba(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="ABA completion", assignee="worker")
+        kb.claim_task(conn, tid)
+        old = _existing_task(conn, tid).current_run_id
+        assert kb.complete_task(conn, tid, summary="first", expected_run_id=old)
+        assert kb.request_review(conn, tid, park=True, expected_status="done", expected_run_id=old, summary="park")
+        assert kb.reopen_review_task(conn, tid, reason="rework", author="reviewer")
+        assert kb.claim_task(conn, tid) is not None
+        new = _existing_task(conn, tid).current_run_id
+        assert new != old
+        assert not kb.request_review(conn, tid, park=True, expected_status="done", expected_run_id=old)
+        assert _existing_task(conn, tid).current_run_id == new
+        assert kb.complete_task(conn, tid, summary="new delivery", expected_run_id=new)
+        before = conn.total_changes
+        assert not kb.request_review(conn, tid, park=True, expected_status="done", expected_run_id=old)
+        assert conn.total_changes == before
+        assert kb.request_review(conn, tid, park=True, expected_status="done", expected_run_id=new, summary="new park")
+
+
 def _row(conn, tid):
     return conn.execute(
         "SELECT status, block_kind, block_recurrences, current_run_id "
@@ -186,6 +268,28 @@ def test_request_review_expected_run_id_mismatch_is_noop(kanban_home: Path) -> N
 def test_request_review_unknown_task_returns_false(kanban_home: Path) -> None:
     with kbc.connect() as conn:
         assert kb.request_review(conn, "t_deadbeefcafe") is False
+
+
+def test_parked_completion_refuses_late_reviewer_without_writes(kanban_home: Path) -> None:
+    """The parked handoff remains atomic and completion rechecks its authority."""
+    with kbc.connect() as conn, kbc.connect() as other:
+        tid = kb.create_task(conn, title="parked handoff", assignee="worker")
+        assert kb.request_review(conn, tid, park=True, expected_status="ready") is True
+        parked = kb.get_task(conn, tid)
+        assert parked is not None
+        assert parked.status == "review" and parked.assignee is None
+        assert parked.current_run_id is None
+        payload = _events(conn, tid, kind="review_requested")[-1][1]
+        assert payload is not None and payload["parked"] is True
+        assert kb.assign_task(other, tid, "reviewer") is True
+        before = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
+        events = _events(conn, tid)
+        runs = conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0]
+        with pytest.raises(kb.ParkedReviewGuardError, match="assignee"):
+            kb.complete_task(conn, tid, summary="stale approval", require_parked=True)
+        assert dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()) == before
+        assert _events(conn, tid) == events
+        assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0] == runs
 
 
 def test_request_review_refuses_to_clear_live_claim_without_ownership(
@@ -573,6 +677,58 @@ def test_active_pr_guard_holds_through_same_profile_reassign_and_unassign(
         assert kbd.check_respawn_guard(conn, tid) is None
 
 
+def test_recent_success_guard_lifts_after_review_reopened(kanban_home: Path) -> None:
+    """An explicit review rework is a deliberate re-queue after success."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rework after success", assignee="dev")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        kb.add_comment(
+            conn, tid, author="dev",
+            body="Opened https://github.com/example/repo/pull/44 for review.",
+        )
+        _backdate_comments(conn, tid)
+        assert kb.complete_task(conn, tid, summary="PR delivery", expected_run_id=run_id)
+        assert kbd.check_respawn_guard(conn, tid, lane="ready") == "recent_success"
+
+        assert kb.request_review(
+            conn, tid, park=True, expected_status="done", expected_run_id=run_id,
+            summary="park open PR for review",
+        )
+        assert kbd.check_respawn_guard(conn, tid, lane="ready") == "recent_success"
+
+        assert kb.reopen_review_task(conn, tid, reason="fix review feedback", author="reviewer")
+        reopened = kb.get_task(conn, tid)
+        assert reopened is not None and reopened.status == "ready"
+        assert kbd.check_respawn_guard(conn, tid, lane="ready") is None
+
+
+def test_recent_success_guard_requeue_events_are_task_scoped(kanban_home: Path) -> None:
+    """A re-queue event lifts ONLY its own task's guard; other tasks stay held.
+
+    Pins the exception list itself: the legacy ``status`` event (what a
+    done→ready drag records) must lift the guard, and nothing may lift a
+    task that had no re-queue after its success. Upstream's ``_rows_since``
+    refactor of this helper must keep the same event-kind contract.
+    """
+    with kbc.connect() as conn:
+        dragged = kb.create_task(conn, title="dragged after success", assignee="dev")
+        untouched = kb.create_task(conn, title="held after success", assignee="dev")
+        for tid in (dragged, untouched):
+            assert kb.claim_task(conn, tid) is not None
+            kb.complete_task(conn, tid, summary="delivery evidence")
+            assert kbd.check_respawn_guard(conn, tid, lane="ready") == "recent_success"
+        # A done→ready drag records the legacy 'status' event on `dragged`
+        # only; `untouched` completed at a comparable time and must NOT be
+        # lifted by another task's event.
+        kb._append_event(conn, dragged, "status", {
+            "status": "ready", "previous_status": "done", "reason": "operator drag",
+        })
+        assert kbd.check_respawn_guard(conn, dragged, lane="ready") is None
+        assert kbd.check_respawn_guard(conn, untouched, lane="ready") == "recent_success"
+
+
 def test_active_pr_guard_lifts_for_implementer_after_changes_requested(
     kanban_home: Path,
 ) -> None:
@@ -649,7 +805,6 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
 
     def spawn(task, workspace):
         captured.append(list(task.skills or []))
-        return None
 
     with kbc.connect() as conn:
         task_id = kb.create_task(
