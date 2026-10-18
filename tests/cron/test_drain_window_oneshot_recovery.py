@@ -9,13 +9,13 @@ legacy expiry, receipts (claims / executions ledger), recurring catch-up and man
 unchanged. No dispatcher, no model: the due-scan admission decision (``get_due_jobs``) is the
 fixed surface; dispatch itself already runs behind ``run_claim``.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from cron import jobs as cj
 
-T0 = datetime(2026, 10, 13, 11, 0, 0, tzinfo=timezone.utc)  # 20:00 KST, incident shape
+T0 = datetime(2026, 10, 13, 11, 0, 0, tzinfo=UTC)  # 20:00 KST, incident shape
 
 
 def _oneshot(jid, run_at, **extra):

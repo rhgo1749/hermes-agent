@@ -3152,7 +3152,7 @@ def _fast_forward_missed_recurring(d: _DueJob, grace: int) -> bool:
     return False
 
 
-def _dispatch_attempt_exists(job: Dict[str, Any], instant: str) -> bool:
+def _dispatch_attempt_exists(job: dict[str, Any], instant: str) -> bool:
     """True when the executions ledger holds ANY row for this occurrence — the occurrence was
     already claimed/dispatched once, so an external effect may exist and it must not be
     re-dispatched. Fail-closed on DB errors: no recovery, the legacy tombstone retire runs.
