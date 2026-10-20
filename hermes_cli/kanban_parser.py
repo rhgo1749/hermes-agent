@@ -54,6 +54,17 @@ def _nonnegative_int(value: str) -> int:
     return parsed
 
 
+def _positive_int(value: str) -> int:
+    """argparse type for immutable event/run identities."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def _run_state_args(type_help: str):
     return (
         _arg("--state-type", choices=("status", "outcome"), help=f"With --state-name: {type_help}"),
@@ -332,6 +343,19 @@ _SPECS = [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    _cmd("recover-triage", [
+        _TASK_ID,
+        _arg("--expected-board", required=True, help="Exact board slug; must match explicit --board."),
+        _arg("--expected-status", choices=("triage",), required=True),
+        _arg("--expected-block-loop-event-id", type=_positive_int, required=True),
+        _arg("--expected-latest-event-id", type=_positive_int, required=True),
+        _arg("--expected-run-id", type=_positive_int, required=True),
+        _arg("--expected-parent-ids", dest="expected_parent_ids_json", required=True,
+             help="JSON array of the exact sorted parent Task IDs."),
+        _arg("--expected-landing-status", choices=("ready", "todo"), required=True),
+        _arg("--reason", required=True, help="Operator audit reason (recorded in triage_recovered)."),
+        _json_flag(),
+    ], help="Operator-only CAS recovery for one exact block-loop triage event"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),
