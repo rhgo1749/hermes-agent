@@ -107,8 +107,12 @@ def recover_triage_task(
             return False, "task_status_changed"
         if task["block_kind"] != "capability":
             return False, "task_is_not_capability_triage"
+        # worker_started_at deliberately NOT required NULL: a reclaimed run
+        # leaves its forensic "session:pid|boot" fingerprint behind (same
+        # semantics upstream's --from-triage accepts). Real activity is
+        # enforced by the task_runs ended/active checks below.
         if any(task[field] is not None for field in (
-            "current_run_id", "claim_lock", "claim_expires", "worker_pid", "worker_started_at",
+            "current_run_id", "claim_lock", "claim_expires", "worker_pid",
         )):
             return False, "active_task_ownership_present"
 
@@ -176,7 +180,7 @@ def recover_triage_task(
         updated = conn.execute(
             "UPDATE tasks SET status = ? WHERE id = ? AND status = 'triage' "
             "AND current_run_id IS NULL AND claim_lock IS NULL "
-            "AND claim_expires IS NULL AND worker_pid IS NULL AND worker_started_at IS NULL",
+            "AND claim_expires IS NULL AND worker_pid IS NULL",
             (landing_status, task_id),
         )
         if updated.rowcount != 1:

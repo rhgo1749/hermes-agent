@@ -222,7 +222,6 @@ def test_triage_cas_rejects_active_task_or_run_ownership_without_mutation(kanban
         ("claim_expires", 2_000_000_000),
         ("current_run_id", 999),
         ("worker_pid", 4242),
-        ("worker_started_at", 1),
     )
     for field, value in task_fields:
         with kbc.connect_closing() as conn:
@@ -245,6 +244,26 @@ def test_triage_cas_rejects_active_task_or_run_ownership_without_mutation(kanban
             ok, reason = _recover(conn, evidence)
             assert ok is False and isinstance(reason, str)
             assert _snapshot(conn, evidence["task_id"]) == before
+
+
+def test_triage_cas_recovers_despite_reclaimed_worker_fingerprint_residue(kanban_home):
+    # Live incident shape: a reclaimed run leaves the forensic worker_started_at
+    # fingerprint ("session:pid|boot") on the triage row while worker_pid, claim
+    # and current_run_id are NULL. Residue is not active ownership; the ended/
+    # active task_runs checks carry that load instead.
+    with kbc.connect_closing() as conn:
+        evidence = _looped_task(conn)
+        conn.execute(
+            "UPDATE tasks SET worker_started_at=? WHERE id=?",
+            ("897bfc55-040b-49b2-b12c-e7df5bdb0fa4:2343|5351661", evidence["task_id"]),
+        )
+        ok, result = _recover(conn, evidence)
+        assert ok is True
+        assert result["status"] == "ready"
+        residue = conn.execute(
+            "SELECT worker_started_at FROM tasks WHERE id=?", (evidence["task_id"],)
+        ).fetchone()[0]
+        assert residue == "897bfc55-040b-49b2-b12c-e7df5bdb0fa4:2343|5351661"
 
 
 def test_triage_cas_race_allows_only_one_recovery_and_replay_is_noop(kanban_home):
