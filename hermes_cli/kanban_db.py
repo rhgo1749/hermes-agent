@@ -2048,7 +2048,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
+        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'triage_recovered'"
         ") ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
     payload = _json_dict(_row_get(row, "payload"))
@@ -3561,11 +3561,43 @@ def unblock_task(
     *,
     expected_block_event_id: Optional[int] = None,
 ) -> bool:
-    """Resume a blocked/scheduled task; optionally CAS a specific capability hold."""
+    """Resume a blocked/scheduled task, optionally bound to one capability hold."""
     from hermes_cli.kanban_db_unblock import unblock_task as _unblock_task
 
     return _unblock_task(
         conn, task_id, expected_block_event_id=expected_block_event_id,
+    )
+
+
+def recover_triage_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_board: str,
+    expected_status: str,
+    expected_block_loop_event_id: int,
+    expected_latest_event_id: int,
+    expected_run_id: int,
+    expected_parent_ids: list[str],
+    expected_landing_status: str,
+    reason: str,
+    actor: str,
+) -> tuple[bool, dict[str, Any] | str]:
+    """CAS one explicit operator decision to recover a matching triage hold."""
+    from hermes_cli.kanban_db_triage_recovery import recover_triage_task as _recover_triage_task
+
+    return _recover_triage_task(
+        conn,
+        task_id,
+        expected_board=expected_board,
+        expected_status=expected_status,
+        expected_block_loop_event_id=expected_block_loop_event_id,
+        expected_latest_event_id=expected_latest_event_id,
+        expected_run_id=expected_run_id,
+        expected_parent_ids=expected_parent_ids,
+        expected_landing_status=expected_landing_status,
+        reason=reason,
+        actor=actor,
     )
 
 

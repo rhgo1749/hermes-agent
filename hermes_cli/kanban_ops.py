@@ -40,6 +40,74 @@ def _poll_loop(interval: float, tick) -> int:
         return 0
 
 
+def _cmd_recover_triage(args: argparse.Namespace) -> int:
+    """Operator-only, event-bound exit from one block-loop triage state."""
+    if any(os.environ.get(name) for name in (
+        "HERMES_KANBAN_TASK", "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_CRON_SESSION",
+    )):
+        return _err("kanban recover-triage is operator-only; workers/delegated/cron contexts are denied")
+
+    selected_board = getattr(args, "board", None)
+    expected_board = getattr(args, "expected_board", None)
+    if not isinstance(selected_board, str) or not selected_board:
+        return _err("kanban recover-triage requires explicit --board", 2)
+    if not isinstance(expected_board, str) or selected_board != expected_board:
+        return _err("kanban recover-triage expected board must exactly match --board", 2)
+    try:
+        normalized = kb._normalize_board_slug(selected_board)
+    except ValueError as exc:
+        return _err(f"kanban recover-triage: {exc}", 2)
+    if normalized != selected_board:
+        return _err("kanban recover-triage requires a canonical board slug", 2)
+    if normalized != kb.DEFAULT_BOARD and not kb.board_exists(normalized):
+        return _err(f"kanban recover-triage board {normalized!r} does not exist", 2)
+
+    raw_parent_ids = getattr(args, "expected_parent_ids_json", None)
+    if not isinstance(raw_parent_ids, str):
+        return _err("kanban recover-triage --expected-parent-ids must be a JSON array", 2)
+    try:
+        parent_ids = json.loads(raw_parent_ids)
+    except json.JSONDecodeError as exc:
+        return _err(f"kanban recover-triage --expected-parent-ids must be a JSON array: {exc}", 2)
+    if (not isinstance(parent_ids, list)
+            or any(not isinstance(parent_id, str) or not parent_id for parent_id in parent_ids)
+            or len(set(parent_ids)) != len(parent_ids)):
+        return _err("kanban recover-triage --expected-parent-ids must contain unique nonempty Task IDs", 2)
+
+    try:
+        from hermes_cli.profiles import current_profile_name
+        actor = current_profile_name("user") or "operator"
+    except Exception:
+        actor = "operator"
+    with kbc.connect_closing(board=normalized) as conn:
+        ok, result = kb.recover_triage_task(
+            conn,
+            args.task_id,
+            expected_board=normalized,
+            expected_status=args.expected_status,
+            expected_block_loop_event_id=args.expected_block_loop_event_id,
+            expected_latest_event_id=args.expected_latest_event_id,
+            expected_run_id=args.expected_run_id,
+            expected_parent_ids=parent_ids,
+            expected_landing_status=args.expected_landing_status,
+            reason=args.reason,
+            actor=actor,
+        )
+    if not ok:
+        return _err(f"kanban recover-triage refused without mutation: {result}")
+    if not isinstance(result, dict):
+        return _err("kanban recover-triage returned an invalid CAS result")
+    if getattr(args, "json", False):
+        _print_json(result, ascii=True)
+    else:
+        print(
+            f"Recovered {result['task_id']} on {result['board']}: "
+            f"triage → {result['status']} (audit event {result['event_id']}; "
+            f"run {result['run_id']} preserved)"
+        )
+    return 0
+
+
 def _cmd_tail(args: argparse.Namespace) -> int:
     last_id = 0
     print(f"Tailing events for {args.task_id}. Ctrl-C to stop.")
