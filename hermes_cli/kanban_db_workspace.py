@@ -686,23 +686,212 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+_FETCH_TIMEOUT_SECONDS = 90
+_LS_REMOTE_TIMEOUT_SECONDS = 30
+
+
+def _remote_default_branch(repo_root: Path, remote: str) -> str:
+    """The *remote*'s default branch name: the locally cached
+    ``refs/remotes/<remote>/HEAD`` symbolic ref when it resolves to a fetched
+    commit, else one bounded ``ls-remote --symref`` probe (authoritative).
+    ``""`` when neither answers; the caller fails closed rather than guessing."""
+    sym = _git(repo_root, "symbolic-ref", "--quiet", f"refs/remotes/{remote}/HEAD", timeout=10)
+    prefix = f"refs/remotes/{remote}/"
+    if sym.returncode == 0:
+        ref = (sym.stdout or "").strip()
+        branch = ref[len(prefix):] if ref.startswith(prefix) else ""
+        # A dangling cached HEAD (branch deleted locally) must not pin a
+        # branch the remote no longer names; fall through to the live probe.
+        if branch and _git(repo_root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", timeout=10).returncode == 0:
+            return branch
+    try:
+        probe = _git(repo_root, "ls-remote", "--symref", remote, "HEAD", timeout=_LS_REMOTE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"git ls-remote --symref {remote} HEAD timed out for {repo_root} while resolving the "
+            "target branch for a new task worktree; refusing to start on an unproven base."
+        )
+    if probe.returncode == 0:
+        for line in (probe.stdout or "").splitlines():
+            target_ref, _, label = line.partition("\t")
+            if label.strip() == "HEAD" and target_ref.startswith("ref: refs/heads/"):
+                return target_ref[len("ref: refs/heads/"):].strip()
+    return ""
+
+
+def _fetch_remote_branch(
+    repo_root: Path, remote: str, branch: str, *, refspec: Optional[str] = None, prune: bool = True
+) -> tuple[Optional[str], Optional[str]]:
+    """One strict fetch of *branch* from *remote* -> ``(FETCH_HEAD sha, refs/remotes/<remote>/<branch> sha)``,
+    either ``None`` when that rev is unresolvable. Raises ``RuntimeError`` on
+    fetch failure: a remote-backed task branch is never derived from a
+    possibly stale local HEAD. Credentials follow the canonical internal-git
+    path (anonymous first, then a stored user credential only when the remote
+    refuses), attached as a process-local header — never in the URL or config."""
+    from hermes_cli._subprocess_compat import noninteractive_repo_git_env
+    from hermes_cli.git_credentials import run_git_with_credential_fallback
+
+    env = noninteractive_repo_git_env(repo_root)
+    if env is None:
+        raise RuntimeError(
+            f"cannot read/neutralize {repo_root}'s git filter config; refusing the unattended "
+            "base fetch (a repo-local fsmonitor/filter/hook config could not be isolated)."
+        )
+    url = _git(repo_root, "remote", "get-url", remote, timeout=10)
+    auth_url = (url.stdout or "").strip() if url.returncode == 0 else ""
+    args = ["git", "-C", str(repo_root), "fetch"] + (["--prune"] if prune else []) + [remote, refspec or branch]
+    try:
+        result = run_git_with_credential_fallback(
+            args, auth_url, env=env, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=_FETCH_TIMEOUT_SECONDS, check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"git fetch {remote} {branch} for {repo_root} timed out after {_FETCH_TIMEOUT_SECONDS}s; "
+            "refusing to base a new task branch on a possibly stale local HEAD. Check "
+            "network/remote health and re-dispatch."
+        ) from exc
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"git fetch {remote} {branch} failed for {repo_root}: {stderr}. Refusing to base a new "
+            f"task branch on the local HEAD, which may lag {remote}/{branch}; restore access to "
+            "the remote and re-dispatch."
+        )
+
+    def _rev(ref: str) -> Optional[str]:
+        got = _git(repo_root, "rev-parse", "--verify", "--quiet", ref, timeout=10)
+        return (got.stdout or "").strip() if got.returncode == 0 else None
+
+    return _rev("FETCH_HEAD"), _rev(f"refs/remotes/{remote}/{branch}")
+
+
+def _fresh_remote_base(repo_root: Path) -> Optional[tuple[str, str, str]]:
+    """Fetch the remote trunk and return ``(remote, branch, sha)`` for a NEW
+    task branch to start from; ``None`` only when the repo has no remote at
+    all, which keeps the legacy local-HEAD base for genuinely local tasks.
+
+    Fail-closed (``RuntimeError``) whenever the repo IS remote-backed but the
+    fresh base cannot be proven: ambiguous remotes, unresolvable default
+    branch, fetch failure, or a target ref that stays missing/stale. Silent
+    HEAD fallback is exactly what let a GitHub-backed task branch off nine
+    commits behind main while the PR adding its required file had already
+    merged (ACP harness Issue #45). Only ``refs/remotes/<remote>/<branch>``
+    moves — the board's working checkout, its dirty state and local-only
+    commits are never checked out, pulled, or reset.
+
+    Stricter than ``worktree_ops._resolve_worktree_base`` (interactive ``-w``
+    lanes, best-effort with cached/HEAD fallback on purpose): no freshness
+    window skip, and an unproven base blocks the run instead of proceeding.
+    """
+    from hermes_cli.update_cmd_check import tracking_refspec
+
+    listing = _git(repo_root, "remote", timeout=10)
+    if listing.returncode != 0:
+        raise RuntimeError(
+            f"cannot list git remotes for {repo_root}: {(listing.stderr or listing.stdout or '').strip()}"
+        )
+    names = [line.strip() for line in (listing.stdout or "").splitlines() if line.strip()]
+    if not names:
+        return None
+    if "origin" in names:
+        remote = "origin"
+    elif len(names) == 1:
+        remote = names[0]
+    else:
+        raise RuntimeError(
+            f"{repo_root} has multiple remotes {sorted(names)} and no 'origin'; refusing to guess "
+            "which remote new task branches derive from. Name the canonical remote 'origin'."
+        )
+    branch = _remote_default_branch(repo_root, remote)
+    if not branch:
+        raise RuntimeError(
+            f"cannot resolve the default branch of remote '{remote}' for {repo_root}; run "
+            f"`git -C {repo_root} remote set-head {remote} --auto` and re-dispatch."
+        )
+    fetched_sha, ref_sha = _fetch_remote_branch(repo_root, remote, branch)
+    if ref_sha is None or (fetched_sha is not None and ref_sha != fetched_sha):
+        # Narrow fetch refspecs (tag-pinned --single-branch, #125112 class):
+        # a by-name fetch writes only FETCH_HEAD. Retry once with the
+        # explicit tracking refspec, without --prune: a mapping refspec plus
+        # --prune would delete the remote's other remote-tracking refs.
+        fetched_sha, ref_sha = _fetch_remote_branch(
+            repo_root, remote, branch, refspec=tracking_refspec(remote, branch), prune=False,
+        )
+    if ref_sha is None:
+        raise RuntimeError(
+            f"after fetching {remote}/{branch}, refs/remotes/{remote}/{branch} is still missing in "
+            f"{repo_root}; refusing to derive a remote-backed task branch from the local HEAD. "
+            "Fix the remote's fetch refspec (so the branch is tracked) and re-dispatch."
+        )
+    if fetched_sha is not None and fetched_sha != ref_sha:
+        raise RuntimeError(
+            f"after fetching {remote}/{branch}, its remote-tracking ref is stale (fetched "
+            f"{fetched_sha} but {ref_sha} on disk); refusing to derive a remote-backed task "
+            f"branch from an unproven base. Fix {remote}'s fetch refspec and re-dispatch."
+        )
+    return remote, branch, ref_sha
+
+
+def _add_new_branch_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
+    """Create a worktree for a task branch that does not exist yet.
+
+    A remote-backed repo branches from the freshly fetched remote trunk SHA
+    (``_fresh_remote_base``); only a repo with no remote at all keeps the
+    legacy HEAD start-point. The worktree HEAD is then re-read and must equal
+    the fetched SHA, so a task never starts on an unproven base.
+    """
+    fresh = _fresh_remote_base(repo_root)
+    start_point = "HEAD" if fresh is None else fresh[2]
+    result = _git(repo_root, "worktree", "add", "-b", branch_name, str(target), start_point, timeout=60)
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
+        )
+    if fresh is None:
+        return
+    remote, branch, sha = fresh
+    head = _git(target, "rev-parse", "HEAD", timeout=10)
+    got = (head.stdout or "").strip() if head.returncode == 0 else ""
+    if got != sha:
+        # Undo the just-created tree/branch (it cannot hold work yet) instead
+        # of leaving a wrong-base worktree that a later dispatch would reuse.
+        _git(repo_root, "worktree", "remove", str(target), timeout=60)
+        _git(repo_root, "branch", "-D", branch_name, timeout=30)
+        raise RuntimeError(
+            f"worktree {target} starts at {got or '<unknown>'} but the freshly fetched "
+            f"{remote}/{branch} is {sha}; refusing to run on an unproven base"
+        )
+    _kb._log.debug(
+        "kanban worktree %s: new branch %s based on fetched %s/%s @ %s",
+        target, branch_name, remote, branch, sha,
+    )
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+    """Materialize ``target`` as a linked git worktree under ``repo_root``.
+
+    An EXISTING task branch is resumed exactly where it left off (rework /
+    retry continuation contract). A NEW task branch in a remote-backed repo
+    must derive from the freshly fetched remote trunk — branching local
+    ``HEAD`` silently roots the task on a stale base when the board's
+    checkout lags the remote (see ``_fresh_remote_base``).
+    """
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
-        args = ["worktree", "add", str(target), branch_name]
-    else:
-        args = ["worktree", "add", "-b", branch_name, str(target), "HEAD"]
-    result = _git(repo_root, *args, timeout=60)
-    if result.returncode != 0:
-        stderr = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(
-            f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
-        )
+        result = _git(repo_root, "worktree", "add", str(target), branch_name, timeout=60)
+        if result.returncode != 0:
+            stderr = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
+            )
+        return
+    _add_new_branch_worktree(repo_root, target, branch_name)
 
 
 def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:
