@@ -29,7 +29,8 @@ logger = logging.getLogger("gateway.run")
 
 # Override fields layered onto runtime kwargs when non-None (partial overrides don't clobber defaults).
 _OVERRIDE_APPLY_KEYS = (
-    "provider", "requested_provider", "api_key", "base_url", "api_mode", "credential_pool", "capabilities", "max_tokens",
+    "provider", "requested_provider", "api_key", "base_url", "api_mode", "command", "args",
+    "credential_pool", "capabilities", "max_tokens",
 )
 
 
@@ -171,8 +172,9 @@ class GatewayAgentCacheMixin:
             # retries the resolution for that provider on each turn (default route + notice meanwhile).
             try:
                 runtime = _resolve_runtime_agent_kwargs_for_provider(provider, target_model=persisted.get("model") or None)
-                for k in ("api_key", "api_mode", "credential_pool", "requested_provider", "max_tokens"):
+                for k in ("api_key", "api_mode", "command", "credential_pool", "requested_provider", "max_tokens"):
                     override[k] = runtime.get(k)
+                override["args"] = list(runtime.get("args") or [])
                 override["request_overrides"] = dict(runtime.get("request_overrides") or {})
                 override["capabilities"] = dict(runtime.get("capabilities") or {})
                 if not override.get("base_url") or provider.strip().lower() in LLAMACPP_ALIASES:
@@ -206,7 +208,7 @@ class GatewayAgentCacheMixin:
         for key in _OVERRIDE_APPLY_KEYS:
             val = override.get(key)
             if val is not None:
-                runtime_kwargs[key] = val
+                runtime_kwargs[key] = list(val) if key == "args" and isinstance(val, (list, tuple)) else val
         # request_overrides reflects the switched-to provider; apply whenever the override recorded
         # it (even as None) so switching to a provider without configured overrides clears a stale
         # value left by the default provider's runtime resolution.

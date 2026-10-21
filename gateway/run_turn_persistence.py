@@ -164,7 +164,8 @@ class GatewayTurnPersistenceMixin:
                 default=bool(getattr(self, "_show_reasoning", False)), platform=source.platform,
                 require_platform_override_for={Platform.MATTERMOST},
             )
-        except Exception:
+        except Exception:  # health: allow BLE001 -- optional display config must not suppress the final response.
+            logger.debug("reasoning display config unavailable", exc_info=True)
             _show_reasoning_effective = (
                 False if source.platform == Platform.MATTERMOST else getattr(self, "_show_reasoning", False)
             )
@@ -184,7 +185,8 @@ class GatewayTurnPersistenceMixin:
             _reasoning_style = resolve_display_setting(
                 _load_gateway_config(), _platform_config_key(source.platform), "reasoning_style", "code",
             )
-        except Exception:
+        except Exception:  # health: allow BLE001 -- unknown style config falls back to the safe code-block format.
+            logger.debug("reasoning style config unavailable; using code block", exc_info=True)
             _reasoning_style = "code"
         _quote = self._REASONING_QUOTE_STYLES.get(_reasoning_style)
         if _quote:
@@ -214,8 +216,8 @@ class GatewayTurnPersistenceMixin:
                 requested_model=agent_result.get("requested_model"),
                 served_model=agent_result.get("served_model"),
             )
-        except Exception as _footer_err:
-            logger.debug("runtime_footer build failed: %s", _footer_err)
+        except Exception as _footer_err:  # health: allow BLE001 -- footer metadata is optional; never block delivery.
+            logger.debug("runtime_footer build failed: %s", _footer_err, exc_info=True)
             return ""
 
     async def _hmwa_post_turn_hooks(self, hook_ctx, agent_result, response):

@@ -1385,7 +1385,7 @@ def _apply_parked_branch_guard(
 
 def _prepare_checkout_for_update(
     git_cmd, branch, current_branch, *, is_fork, assume_yes, gateway_mode, gw_input_fn,
-    switch_branch, target_ref=None, _windows_gateway_resume):
+    switch_branch, target_ref=None, skip_upstream_sync=False, _windows_gateway_resume):
     """Parked-branch guard, land on the target, stash, count new commits. Exits when the
     checkout is unsafe to move or the target is missing. ``commit_count`` is 0 when up to
     date, -1 when tips differ but the shallow count is unrecoverable."""
@@ -1471,7 +1471,7 @@ def _prepare_checkout_for_update(
     # "Already up to date!" and verified nothing). Non-fork checkouts have no upstream question: origin IS
     # the official repo, so "Already up to date!" is fully verified there.
     upstream_checked = True
-    if commit_count == 0 and is_fork and branch == "main" and not release_tag:
+    if commit_count == 0 and is_fork and branch == "main" and not release_tag and not skip_upstream_sync:
         pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
         try:
             upstream_checked = _m()._sync_with_upstream_if_needed(
@@ -1835,7 +1835,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # Hermes updater. Upstream integration is a separate explicit operation;
     # nothing is squashed or pushed before backup/restart admission.
     from hermes_cli.h4v3_fork_update import maybe_prepare_update
-    maybe_prepare_update(args, _m().PROJECT_ROOT)
+    h4v3_fork_mode = maybe_prepare_update(args, _m().PROJECT_ROOT)
 
     _pre_update_plan = _begin_update_receipt_and_plan(args)
 
@@ -1934,7 +1934,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _plan = _prepare_checkout_for_update(
             git_cmd, branch, current_branch, is_fork=is_fork, assume_yes=assume_yes,
             gateway_mode=gateway_mode, gw_input_fn=gw_input_fn, switch_branch=opts.switch_branch,
-            target_ref=target_ref, _windows_gateway_resume=_windows_gateway_resume)
+            target_ref=target_ref, skip_upstream_sync=h4v3_fork_mode,
+            _windows_gateway_resume=_windows_gateway_resume)
         commit_count = _plan.commit_count
 
         if commit_count == 0:
@@ -1959,7 +1960,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             gw_input_fn=gw_input_fn, discard_local_changes=opts.discard_local_changes,
             keep_stash=opts.keep_stash, target_ref=target_ref, pre_sync_sha=_plan.pre_sync_sha,
             rollback_branch=_plan.rollback_branch,
-            sync_upstream=is_fork and branch == "main" and not release_sha, assume_yes=assume_yes,
+            sync_upstream=is_fork and branch == "main" and not release_sha and not h4v3_fork_mode, assume_yes=assume_yes,
             in_place_update=_plan.in_place_update, _windows_gateway_resume=_windows_gateway_resume,
             expected_sha=completion_request.get("expected_sha"))
         _apply_pulled_update(

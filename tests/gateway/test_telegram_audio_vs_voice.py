@@ -12,6 +12,8 @@ These tests confirm that:
   3. Mixed media lists (voice + audio) split correctly.
 """
 
+import os
+import threading
 from unittest.mock import patch
 
 import pytest
@@ -112,6 +114,36 @@ async def test_audio_attachment_context_note_format():
 # ---------------------------------------------------------------------------
 # 3. STT disabled still results in no transcription for audio file attachments
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stt_disabled_voice_note_probes_duration_off_loop(monkeypatch):
+    runner = _make_runner(stt_enabled=False)
+    main_thread_id = threading.get_ident()
+    abspath_thread_ids = []
+    original_abspath = os.path.abspath
+
+    def capture_abspath_thread(path):
+        abspath_thread_ids.append(threading.get_ident())
+        return original_abspath(path)
+
+    probed_paths = []
+
+    async def probe_duration(path):
+        probed_paths.append(path)
+        return "0:07"
+
+    from gateway import run as gateway_run
+    monkeypatch.setattr(gateway_run, "_probe_audio_duration", probe_duration)
+    monkeypatch.setattr(os.path, "abspath", capture_abspath_thread)
+
+    result, transcripts = await runner._enrich_message_with_transcription("caption", ["voice.ogg"])
+
+    assert abspath_thread_ids and all(thread_id != main_thread_id for thread_id in abspath_thread_ids)
+    assert probed_paths == [original_abspath("voice.ogg")]
+    assert "voice.ogg" in result
+    assert "(duration: 0:07)" in result
+    assert transcripts == []
 
 
 # ---------------------------------------------------------------------------

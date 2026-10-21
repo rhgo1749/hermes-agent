@@ -32,8 +32,22 @@ class ForkUpdateError(RuntimeError):
 
 def _git(root: Path, *args: str, cwd: Path | None = None, input_bytes: bytes | None = None,
          check: bool = True) -> subprocess.CompletedProcess:
-    proc = subprocess.run(["git", "-C", str(cwd or root), *args],
-                          input=input_bytes, capture_output=True, check=False)
+    git_cwd = cwd or root
+    if args and args[0] in {"fetch", "push", "ls-remote"}:
+        # Reuse the native updater's bounded, no-prompt network path and its
+        # process-tree custody. The explicit sync must not leave a remote helper
+        # running after the operator believes a timed-out publish was refused.
+        from hermes_cli.update_cmd import _git_run
+        result = _git_run(["git"], list(args), cwd=git_cwd, network=True)
+        proc = subprocess.CompletedProcess(
+            result.args, result.returncode,
+            (result.stdout or "").encode("utf-8"), (result.stderr or "").encode("utf-8"))
+    else:
+        try:
+            proc = subprocess.run(["git", *args], cwd=git_cwd, input=input_bytes,
+                                  capture_output=True, check=False, timeout=300)
+        except subprocess.TimeoutExpired as exc:
+            raise ForkUpdateError(f"git {args[0]} timed out after 300s") from exc
     if check and proc.returncode:
         message = proc.stderr.decode("utf-8", "replace").strip()
         raise ForkUpdateError(f"git {args[0]} failed: {message[-800:]}")
@@ -164,6 +178,9 @@ def _verify_candidate(root: Path, candidate: Path) -> None:
     unmerged = _out(root, "ls-files", "-u", cwd=candidate)
     if unmerged:
         raise ForkUpdateError("unresolved conflicts in isolated integration worktree")
+    status = _out(root, "status", "--porcelain=v1", "--untracked-files=all", cwd=candidate)
+    if any(row.startswith("?? ") for row in status.splitlines()):
+        raise ForkUpdateError("untracked files in isolated integration worktree; stage or remove them")
     _git(root, "diff", "--cached", "--check", cwd=candidate)
     _git(root, "diff", "--check", cwd=candidate)
     # The normal updater validates the new PM environment *after* fetching.
@@ -274,14 +291,15 @@ def check_fork_updates(root: Path) -> dict | None:
             "upstreamTargetSha": upstream}
 
 
-def maybe_prepare_update(args, root: Path) -> None:
+def maybe_prepare_update(args, root: Path) -> bool:
     """Route an activated fork through the official origin/main updater.
 
+    Return whether this is the H4V3 fork mode, so the native updater can keep its
+    automatic upstream synchronization disabled for this explicitly managed fork.
     No upstream fetch, squash, push or checkout mutation occurs in this hook.
-    The H4V3 upstream integration is an explicit, separately reviewable step.
     """
     if not _enabled(root):
-        return
+        return False
     if getattr(args, "branch", None) or getattr(args, "channel", None):
         raise SystemExit("H4V3 fork update uses the main branch; omit --branch/--channel")
     try:
@@ -292,6 +310,7 @@ def maybe_prepare_update(args, root: Path) -> None:
     args.branch = FORK_BRANCH
     print("✓ H4V3 fork: using Hermes native update from origin/main.")
     print("  To integrate upstream/main into the fork, run h4v3_fork_update sync separately.")
+    return True
 
 
 def _main() -> int:
@@ -337,12 +356,13 @@ def _main() -> int:
             _sha(root, f"refs/remotes/origin/{FORK_BRANCH}") != metadata["base"] or
             _sha(root, CANDIDATE_BRANCH) != metadata["base"]):
         raise ForkUpdateError("main or candidate changed during conflict resolution")
-    if _out(root, "status", "--porcelain=v1", "--untracked-files=no", cwd=candidate).splitlines():
+    status = _out(root, "status", "--porcelain=v1", "--untracked-files=all", cwd=candidate)
+    if any(row.startswith("?? ") for row in status.splitlines()):
+        raise ForkUpdateError("untracked candidate files must be staged or removed before continue")
+    if any(row[1] != " " for row in status.splitlines()):
         # All conflict resolution must be staged. A staged-only change has
-        # porcelain's second column blank; only the unstaged column blocks.
-        status = _out(root, "status", "--porcelain=v1", "--untracked-files=no", cwd=candidate)
-        if any(row[1] != " " for row in status.splitlines()):
-            raise ForkUpdateError("stage all conflict resolutions before continue")
+        # porcelain's second column blank.
+        raise ForkUpdateError("stage all conflict resolutions before continue")
     _publish_candidate(root, candidate, metadata["upstream"], metadata["base"], validate=True)
     _git(root, "worktree", "remove", str(candidate))
     _git(root, "branch", "-D", CANDIDATE_BRANCH)
