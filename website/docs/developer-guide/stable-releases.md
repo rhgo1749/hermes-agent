@@ -113,8 +113,12 @@ default set and edits it:
 ```sh
 # The default: everything except macOS Intel and Termux
 python scripts/release.py release --commit "$(git rev-parse origin/main)" --remote origin
-# Only the Windows bundles (and the Store bundle) and the Docker image, no tests
+# Only the signed Windows bundles and the Docker image, no tests
 python scripts/release.py release --commit "$(git rev-parse origin/main)" --only windows,docker --remote origin
+# Everything except the signed Windows pipeline (the Store bundle still builds and is submitted)
+python scripts/release.py release --commit "$(git rev-parse origin/main)" --without windows --remote origin
+# Only the Store bundle: no Azure signing anywhere
+python scripts/release.py release --commit "$(git rev-parse origin/main)" --only windows-store --remote origin
 # Everything, plus macOS Intel, without the install/update E2E
 python scripts/release.py release --commit "$(git rev-parse origin/main)" --with macos-intel --without install-e2e --remote origin
 ```
@@ -126,7 +130,8 @@ lists every lane.
 | Lane | Default | What it controls |
 |---|---|---|
 | `docker` | on | build and publish the Docker image |
-| `windows` | on | Windows x64 and arm64 MSIX, the universal bundle and the Store bundle (they build together) |
+| `windows` | on | signed Windows x64 and arm64 MSIX and the universal bundle, which feed the update channel |
+| `windows-store` | on | the unsigned Microsoft Store bundle, submitted to Partner Center (needs no Azure signing) |
 | `macos-arm64` | on | macOS Apple Silicon DMG and ZIP |
 | `macos-intel` | off | macOS Intel DMG and ZIP: unsupported on `main`, and its runner adds over an hour |
 | `termux` | off | Termux (Android aarch64) APT package |
@@ -152,7 +157,8 @@ requires each job they remove to report `skipped`, and every other gated job to
 report `success`. A job that ran although a lane removes it also blocks the
 release. A claim cut before lanes existed (`skipBundles`, `skipTests`,
 `includeMacosIntel`, `includeTermux`) reads as the lane set that gated the same
-jobs.
+jobs. A claim without `lanesRevision` was cut when `windows` also meant the Store
+bundle, so its `windows` reads as `windows` plus `windows-store`.
 
 What a release publishes follows what it built:
 
@@ -163,7 +169,8 @@ What a release publishes follows what it built:
 - **The desktop channel moves only for the full desktop set** (`windows` and
   `macos-arm64`). A partial set still stages its packages, records a candidate
   manifest with exactly the targets it built, and submits the Store bundle when
-  `windows` is on. The protected R2 stable head, the App Installer and macOS
+  `windows-store` is on. A Store-only release has no package rows, only the Store
+  bundle file, and moves no channel. The protected R2 stable head, the App Installer and macOS
   feeds, the APT channel, downloads page,
   `releases/stable/release-candidates.json` and the signed-package baseline stay
   on the previous full release. Source checkouts on the official repository
@@ -272,11 +279,19 @@ at `releases/tag/<attempt ref>/index.html` is not an update feed, and an
 attempt installed from it is not upgrade-safe: every attempt of a version has
 the same package version, so the published build never replaces it. The Docker
 image is pushed early under the attempt ref; the `stable` and `latest` aliases
-move with the feed in the publication pass. The Store submission is held: the
-green run submits with auto-publish off. The submission API cannot release a
-held submission, so the publication pass only checks it and prints a GitHub
-warning; once certification passes, click Publish now for that submission in
-Partner Center. A failed submission leaves the publication run red. Stable channel
+move with the feed in the publication pass. The Store build follows the same
+rule: the green run commits it held (auto-publish off), so certification runs
+before the gate, and the publication pass switches that submission to
+auto-publish. If the submission API refuses the switch, the pass warns: select
+Publish now in Partner Center once the build is certified. A submission that
+does not carry the release's Store bundle is left alone while the pass checks
+older published releases for its owner. Store reconciliation runs even when
+the feeds and aliases are already current, so interrupted publication can be
+retried without rewinding them. A held submission records its claim in the
+certification notes: a successor can replace it only after that claim has a
+matching remote abandon marker. Legacy submissions without an owner record
+need manual cleanup in Partner Center. A failed submission becomes a warning;
+the release still publishes. Stable channel
 records carry an optional `archiveRef` naming the attempt ref; `releaseTag`
 stays `vX.Y.Z` and the protected prefix falls back to it when `archiveRef` is
 absent.
@@ -299,6 +314,10 @@ cannot delay a bundle; the price is that a broken `main` still pays for signed
 candidates that `acceptance` then refuses.
 The `smoke-win32-universal` job is gone; the per-arch MSIX smokes cover each
 arch, and the Windows install arms install the `.msixbundle` on both arches.
+Stable runs those two MSIX smokes in its `win32-bundle` call, beside assembly,
+not in the per-arch calls: assembly starts as soon as both arches are built
+instead of waiting for the slower arch's smoke, and the bundle call (so
+`candidate-manifest`) still fails when either smoke fails.
 
 ## Tag namespaces and receipts
 
