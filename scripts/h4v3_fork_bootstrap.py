@@ -31,8 +31,11 @@ MARKER = "h4v3-fork-update.json"
 
 
 def git(*args: str, check=True):
-    p = subprocess.run(["git", "-C", str(ROOT), *args],
-                       text=True, capture_output=True, check=False)
+    try:
+        p = subprocess.run(["git", "-C", str(ROOT), *args],
+                           text=True, capture_output=True, check=False, timeout=300)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"git {args[0]} timed out after 300s") from exc
     if check and p.returncode:
         raise RuntimeError(f"git {args[0]}: {p.stderr.strip()[-800:]}")
     return p

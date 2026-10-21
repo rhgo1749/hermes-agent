@@ -104,7 +104,7 @@ from hermes_cli.update_cmd_git import (
     _prune_orphan_rescue_refs, _push_synced_fork, _should_skip_upstream_prompt, _sync_fork_with_upstream,
     _sync_with_upstream_if_needed, UpstreamTargetBroken)
 from hermes_cli.update_cmd_maint import (
-    _PRE_UPDATE_SNAPSHOT_KEEP, _PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE, _clear_stale_sqlite_sidecars,
+    _PRE_UPDATE_SNAPSHOT_KEEP, _PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
     _checkout_version, _ensure_acp_launcher, _ensure_fhs_path_guard, _finish_dashboard_update_cleanup,
     _format_time_ago, _post_update_sqlite_runtime_status, _print_bundled_skills_sync_report,
     _print_curator_first_run_notice, _print_curator_recent_run_notice,
@@ -1265,6 +1265,11 @@ def _refuse_before_commit_point(git_cmd, target_ref, _windows_gateway_resume) ->
     """Preconditions that used to fail AFTER the swap: refuse with the install untouched."""
     reason = _commit.preflight_refusal(git_cmd, _m().PROJECT_ROOT, target_ref, _UPDATE_CRITICAL_FILES)
     if reason is None:
+        from hermes_cli.update_downgrade_guard import downgrade_refusal
+        reason = downgrade_refusal(git_cmd, _m().PROJECT_ROOT, target_ref)
+        if reason is not None:
+            _record_stop("downgrade_refused")
+    if reason is None:
         return
     print(reason)
     print("  No update was applied; your install is unchanged.")
@@ -1380,7 +1385,7 @@ def _apply_parked_branch_guard(
 
 def _prepare_checkout_for_update(
     git_cmd, branch, current_branch, *, is_fork, assume_yes, gateway_mode, gw_input_fn,
-    switch_branch, target_ref=None, _windows_gateway_resume):
+    switch_branch, target_ref=None, skip_upstream_sync=False, _windows_gateway_resume):
     """Parked-branch guard, land on the target, stash, count new commits. Exits when the
     checkout is unsafe to move or the target is missing. ``commit_count`` is 0 when up to
     date, -1 when tips differ but the shallow count is unrecoverable."""
@@ -1466,7 +1471,7 @@ def _prepare_checkout_for_update(
     # "Already up to date!" and verified nothing). Non-fork checkouts have no upstream question: origin IS
     # the official repo, so "Already up to date!" is fully verified there.
     upstream_checked = True
-    if commit_count == 0 and is_fork and branch == "main" and not release_tag:
+    if commit_count == 0 and is_fork and branch == "main" and not release_tag and not skip_upstream_sync:
         pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
         try:
             upstream_checked = _m()._sync_with_upstream_if_needed(
@@ -1830,7 +1835,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # Hermes updater. Upstream integration is a separate explicit operation;
     # nothing is squashed or pushed before backup/restart admission.
     from hermes_cli.h4v3_fork_update import maybe_prepare_update
-    maybe_prepare_update(args, _m().PROJECT_ROOT)
+    h4v3_fork_mode = maybe_prepare_update(args, _m().PROJECT_ROOT)
 
     _pre_update_plan = _begin_update_receipt_and_plan(args)
 
@@ -1929,7 +1934,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _plan = _prepare_checkout_for_update(
             git_cmd, branch, current_branch, is_fork=is_fork, assume_yes=assume_yes,
             gateway_mode=gateway_mode, gw_input_fn=gw_input_fn, switch_branch=opts.switch_branch,
-            target_ref=target_ref, _windows_gateway_resume=_windows_gateway_resume)
+            target_ref=target_ref, skip_upstream_sync=h4v3_fork_mode,
+            _windows_gateway_resume=_windows_gateway_resume)
         commit_count = _plan.commit_count
 
         if commit_count == 0:
@@ -1954,7 +1960,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             gw_input_fn=gw_input_fn, discard_local_changes=opts.discard_local_changes,
             keep_stash=opts.keep_stash, target_ref=target_ref, pre_sync_sha=_plan.pre_sync_sha,
             rollback_branch=_plan.rollback_branch,
-            sync_upstream=is_fork and branch == "main" and not release_sha, assume_yes=assume_yes,
+            sync_upstream=is_fork and branch == "main" and not release_sha and not h4v3_fork_mode, assume_yes=assume_yes,
             in_place_update=_plan.in_place_update, _windows_gateway_resume=_windows_gateway_resume,
             expected_sha=completion_request.get("expected_sha"))
         _apply_pulled_update(

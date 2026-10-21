@@ -32,11 +32,11 @@ def checkout(tmp_path, monkeypatch):
     return root, old, tip
 
 
-def prepare(root, *, is_fork=False):
+def prepare(root, *, is_fork=False, skip_upstream_sync=False):
     return update_cmd._prepare_checkout_for_update(
         ["git"], "main", update_cmd._current_branch_name(["git"], check=True),
         is_fork=is_fork, assume_yes=True, gateway_mode=False, gw_input_fn=None,
-        switch_branch=False, _windows_gateway_resume=None,
+        switch_branch=False, skip_upstream_sync=skip_upstream_sync, _windows_gateway_resume=None,
     )
 
 
@@ -202,10 +202,11 @@ def test_fork_sync_after_stale_branch_repair(checkout, monkeypatch, upstream_res
 def test_early_fork_sync_without_push_still_completes(checkout, monkeypatch):
     root, _old, tip = checkout
     git(root, "checkout", "-q", "main")
+    git(root, "checkout", "-qb", "upstream-writer")
     git(root, "commit", "--allow-empty", "-qm", "upstream")
     upstream_tip = git(root, "rev-parse", "HEAD")
-    git(root, "checkout", "-q", "--detach", tip)
-    git(root, "branch", "-f", "main", tip)
+    git(root, "update-ref", "refs/remotes/upstream/main", upstream_tip)
+    git(root, "checkout", "-q", "main")
 
     def sync(*args, **kwargs):
         git(root, "merge", "--ff-only", upstream_tip)
@@ -219,6 +220,49 @@ def test_early_fork_sync_without_push_still_completes(checkout, monkeypatch):
     assert git(root, "rev-parse", "origin/main") == tip
     request = complete(plan, pull(plan, sync_upstream=True), monkeypatch)
     assert request["expected_sha"] == upstream_tip
+
+
+def test_h4v3_origin_only_mode_skips_early_implicit_upstream_sync(checkout, monkeypatch):
+    root, _old, tip = checkout
+    git(root, "checkout", "-q", "main")
+    git(root, "checkout", "-qb", "upstream-writer")
+    git(root, "commit", "--allow-empty", "-qm", "upstream-only")
+    upstream_tip = git(root, "rev-parse", "HEAD")
+    git(root, "update-ref", "refs/remotes/upstream/main", upstream_tip)
+    git(root, "checkout", "-q", "main")
+    monkeypatch.setattr(
+        update_cmd._m(), "_sync_with_upstream_if_needed",
+        lambda *_a, **_k: pytest.fail("H4V3 native update must not sync upstream implicitly"),
+    )
+
+    plan = prepare(root, is_fork=True, skip_upstream_sync=True)
+
+    assert plan.commit_count == 0
+    assert plan.upstream_checked is True
+    assert git(root, "rev-parse", "HEAD") == tip
+    assert git(root, "rev-parse", "refs/remotes/upstream/main") == upstream_tip
+
+
+def test_h4v3_origin_only_mode_does_not_sync_after_origin_fast_forward(checkout, monkeypatch):
+    root, old, tip = checkout
+    git(root, "checkout", "-q", "main")
+    git(root, "checkout", "-qb", "upstream-writer")
+    git(root, "commit", "--allow-empty", "-qm", "upstream-only")
+    upstream_tip = git(root, "rev-parse", "HEAD")
+    git(root, "update-ref", "refs/remotes/upstream/main", upstream_tip)
+    git(root, "checkout", "-q", "--detach", old)
+    monkeypatch.setattr(
+        update_cmd._m(), "_sync_with_upstream_if_needed",
+        lambda *_a, **_k: pytest.fail("H4V3 native update must not sync upstream implicitly"),
+    )
+
+    plan = prepare(root, is_fork=True, skip_upstream_sync=True)
+    assert plan.commit_count == 1
+    assert git(root, "rev-parse", "HEAD") == tip
+    pull(plan, sync_upstream=False)
+
+    assert git(root, "rev-parse", "HEAD") == tip
+    assert git(root, "rev-parse", "refs/remotes/upstream/main") == upstream_tip
 
 
 def test_command_hands_off_after_existing_main_switch(update_tree, monkeypatch, capsys):
@@ -236,6 +280,7 @@ def test_command_hands_off_after_existing_main_switch(update_tree, monkeypatch, 
     git(t.clone, "branch", "-f", "main", "origin/main")
     git(t.clone, "checkout", "-q", "--detach", t.base)
     t.args.channel = "main"
+    monkeypatch.setattr("hermes_cli.h4v3_fork_update.maybe_prepare_update", lambda *_: False)
     monkeypatch.setattr(update_cmd._m(), "_sync_with_upstream_if_needed", lambda *a, **k: True)
     update_cmd._m().cmd_update(t.args)
     assert git(t.clone, "rev-parse", "HEAD") == t.newer

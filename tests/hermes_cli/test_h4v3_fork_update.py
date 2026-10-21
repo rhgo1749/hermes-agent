@@ -28,6 +28,22 @@ def commit(repo: Path, name: str, contents: str) -> str:
     return run(repo, "rev-parse", "HEAD")
 
 
+def test_bootstrap_git_timeout_fails_closed(monkeypatch):
+    from scripts import h4v3_fork_bootstrap as bootstrap
+
+    class TimedOutSubprocess:
+        TimeoutExpired = subprocess.TimeoutExpired
+
+        @staticmethod
+        def run(command, **kwargs):
+            assert kwargs["timeout"] == 300
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(bootstrap, "subprocess", TimedOutSubprocess)
+    with pytest.raises(RuntimeError, match="timed out after 300s"):
+        bootstrap.git("fetch", "upstream", "main")
+
+
 @pytest.fixture
 def forks(tmp_path, monkeypatch):
     local = tmp_path / "local"
@@ -54,7 +70,6 @@ def forks(tmp_path, monkeypatch):
     run(writer, "config", "user.email", "upstream@example.invalid")
     run(writer, "config", "user.name", "Upstream")
     flow._marker(local).write_text("{}\n")
-    monkeypatch.setattr(flow, "_verify_candidate", lambda *_: None)
     monkeypatch.setattr(flow, "FORK_URL", str(fork))
     monkeypatch.setattr(flow, "UPSTREAM_URL", str(upstream))
     monkeypatch.setattr(flow, "FORK_BRANCH", "production")  # Legacy-topology test fixture.
@@ -176,6 +191,33 @@ def test_manual_conflict_resolution_publishes_squash_without_rewriting_local(for
     assert flow._last_synced(f.root, run(f.root, "rev-parse", "HEAD")) == up
 
 
+def test_continue_refuses_untracked_candidate_before_publishing(forks, monkeypatch):
+    f = forks
+    local_tip = commit(f.root, "base.txt", "operator version\n")
+    run(f.root, "push", "origin", "production")
+    commit(f.writer, "base.txt", "upstream version\n")
+    run(f.writer, "push", "origin", "main")
+    fork_tip = run(f.fork, "rev-parse", "refs/heads/production")
+    with pytest.raises(flow.ForkUpdateError, match="conflicts"):
+        flow.prepare_update(f.root)
+
+    candidate = flow._candidate(f.root)
+    (candidate / "base.txt").write_text("reviewed resolution\n")
+    run(candidate, "add", "base.txt")
+    (candidate / "new-contract.txt").write_text("must not be silently omitted\n")
+    with pytest.raises(flow.ForkUpdateError, match="untracked"):
+        flow._verify_candidate(f.root, candidate)
+    monkeypatch.setattr(flow, "__file__", str(f.root / "hermes_cli" / "h4v3_fork_update.py"))
+    monkeypatch.setattr(sys, "argv", ["h4v3_fork_update", "continue"])
+
+    with pytest.raises(flow.ForkUpdateError, match="untracked"):
+        flow._main()
+
+    assert run(f.root, "rev-parse", "HEAD") == local_tip
+    assert run(f.fork, "rev-parse", "refs/heads/production") == fork_tip
+    assert candidate.exists()
+
+
 def test_user_confirmed_abort_discards_only_candidate(forks, monkeypatch):
     f = forks
     old = commit(f.root, "base.txt", "local change\n")
@@ -256,7 +298,7 @@ def test_normal_update_uses_official_updater_without_mutating_upstream(forks, mo
     fork_before = run(f.fork, "rev-parse", "refs/heads/production")
     monkeypatch.setattr(flow, "prepare_update", lambda *_: pytest.fail("implicit sync is forbidden"))
     args = SimpleNamespace(branch=None, channel=None)
-    flow.maybe_prepare_update(args, f.root)
+    assert flow.maybe_prepare_update(args, f.root) is True
     assert args.branch == "production"
     assert run(f.root, "rev-parse", "HEAD") == original
     assert run(f.fork, "rev-parse", "refs/heads/production") == fork_before
@@ -340,7 +382,7 @@ def test_main_only_route_uses_fork_main_not_legacy_production(forks, monkeypatch
         flow._verify(f.root)  # Legacy production checkout is rejected after cutover.
     run(f.root, "switch", "main")
     args = SimpleNamespace(branch=None, channel=None)
-    flow.maybe_prepare_update(args, f.root)
+    assert flow.maybe_prepare_update(args, f.root) is True
     assert args.branch == "main"
     state = flow.check_fork_updates(f.root)
     assert state["behind"] == 0
@@ -353,7 +395,7 @@ def test_disabled_install_keeps_stock_update_unchanged(tmp_path):
     local.mkdir()
     run(local, "init", "-b", "main")
     args = SimpleNamespace(branch=None, channel=None)
-    flow.maybe_prepare_update(args, local)
+    assert flow.maybe_prepare_update(args, local) is False
     assert args.branch is None
 
 
