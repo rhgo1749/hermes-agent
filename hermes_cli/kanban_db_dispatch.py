@@ -2099,10 +2099,19 @@ def _dispatch_lane_task(
         return False
     try:
         resolved_branch_name = None
-        if claimed.workspace_kind == "worktree":
-            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
-        else:
-            workspace = _kbw.resolve_workspace(claimed, board=board)
+        # Provisioning can reach the network (a worktree's fresh-base fetch): the
+        # credential fallback reads get_secret("GITHUB_TOKEN"), which under
+        # multiplexing raises UnscopedSecretError in an unbound context and kills
+        # the spawn as "workspace: ...". Bind the ASSIGNEE's secret scope, exactly
+        # as the spawn-env build does below — the remote refuses credentials for
+        # the worker's repo, so the worker's profile owns the credential.
+        scope_home = _assignee_profile_home(claimed.assignee)
+        with (_worker_profile_scope(scope_home, bind_home=False) if scope_home
+              else contextlib.nullcontext()):
+            if claimed.workspace_kind == "worktree":
+                workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
+            else:
+                workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
@@ -2634,6 +2643,20 @@ def _worker_terminal_timeout_env(
     if existing >= desired:
         return None
     return str(desired)
+
+
+def _assignee_profile_home(assignee: Optional[str]) -> Optional[str]:
+    """The assignee profile's home for dispatch-side scope binding; None when the profile has
+    no directory (isolated fixtures; the CLI resolves those from HERMES_PROFILE), matching
+    the spawn-env build."""
+    if not assignee:
+        return None
+    try:
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+        return resolve_profile_env(normalize_profile_name(assignee))
+    except FileNotFoundError:
+        return None
 
 
 @contextlib.contextmanager
