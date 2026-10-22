@@ -9,7 +9,10 @@ sibling runs count.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
+import urllib.request
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -168,3 +171,361 @@ def test_runs_all_completed_empty_list_is_not_done():
 
 def test_runs_all_completed_missing_status_is_not_done():
     assert not _mod.runs_all_completed([{}])
+
+
+# ─── artifact name/path boundary (Issue #29 security review) ──────────
+
+# Every producer in .github/workflows uses this shape; the validation
+# must keep accepting all of them while rejecting everything else.
+ACCEPTED_ARTIFACT_NAMES = [
+    "review-status-prompt-surface",
+    "review-status-history-check",
+    "review-status-uv-lockfile",
+    "review-status-ci-timings",
+    "review-status-contributor-check",
+    "review-status-e2e-desktop",
+    "review-status-supply-chain",
+    "review-status-lockfile-diff",
+]
+
+
+@pytest.mark.parametrize("name", ACCEPTED_ARTIFACT_NAMES)
+def test_real_producer_artifact_names_pass_validation(name):
+    assert _mod.validate_artifact_name(name) == name
+
+
+@pytest.mark.parametrize("name", [
+    "",
+    "review-status-",                      # empty slug
+    "review-status-../evil",               # traversal
+    "../evil",                             # traversal, no prefix
+    "..",
+    "/review-status-x",                    # absolute
+    "review-status-a/b",                   # posix separator
+    "review-status-a\\b",                  # windows separator
+    "C:review-status-x",                   # drive path
+    "C:\\review-status-x",                 # drive path
+    "review-status-x/../y",                # traversal mid-name
+    "review-status-\u00e9vil",             # non-ASCII
+    "review-status\u2011evil",             # unicode look-alike hyphen
+    "review-status-x\n",                   # control byte (\Z blocks it)
+    "review-status-x\0",                   # NUL
+    "review-status- evil",                 # space
+    "review-status-X",                     # uppercase outside the class
+    "review-status-x.json",                # dot outside the class
+    "review-status-" + "z" * 65,           # slug over the 64-char bound
+    None,
+    5,
+    {"name": "x"},
+])
+def test_malformed_artifact_names_are_rejected(name):
+    assert _mod.validate_artifact_name(name) is None
+
+
+def test_malformed_artifact_name_never_reaches_network_or_disk(monkeypatch, tmp_path):
+    def boom(*args, **kwargs):
+        raise AssertionError("network reached for an invalid artifact name")
+
+    monkeypatch.setattr(urllib.request, "build_opener", boom)
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    dest = tmp_path / "dl"
+    dest.mkdir()
+    res = _mod._download_artifact(
+        "t", "o/r",
+        {"name": "review-status-../../pwn",
+         "archive_download_url": "https://api.example/download"},
+        dest,
+    )
+    assert res is None
+    assert list(dest.iterdir()) == []
+
+
+def _mkzip(path: Path, entries: list[tuple[str, bytes, int]]) -> None:
+    """Build a zip with explicit unix mode bits (0 = windows-style entry)."""
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, data, mode in entries:
+            info = zipfile.ZipInfo(name)
+            info.external_attr = mode << 16
+            zf.writestr(info, data)
+
+
+def _extract(tmp_path, entries):
+    zp = tmp_path / "artifact.zip"
+    ex = tmp_path / "ex"
+    ex.mkdir()
+    _mkzip(zp, entries)
+    return _mod._extract_status_file(zp, ex), ex
+
+
+REG = 0o100644
+LNK = 0o120777
+DIR = 0o040755
+SOCK = 0o140644
+CHR = 0o020644
+
+
+def test_extract_accepts_regular_top_level_status_entry(tmp_path):
+    got, ex = _extract(tmp_path, [("review-status.json", b"review_status=[]", REG)])
+    assert got == ex / "review-status.json"
+    assert got.read_bytes() == b"review_status=[]"
+
+
+def test_extract_accepts_windows_style_entry_without_mode_bits(tmp_path):
+    got, _ = _extract(tmp_path, [("review-status.json", b"x", 0)])
+    assert got is not None
+
+
+def test_extract_rejects_symlink_status_entry_and_writes_nothing(tmp_path):
+    got, ex = _extract(tmp_path, [("review-status.json", b"/etc/passwd", LNK)])
+    assert got is None
+    assert not (ex / "review-status.json").exists()
+
+
+@pytest.mark.parametrize("mode,name", [
+    (DIR, "review-status.json/"),
+    (SOCK, "review-status.json"),
+    (CHR, "review-status.json"),
+])
+def test_extract_rejects_abnormal_entry_types(tmp_path, mode, name):
+    got, ex = _extract(tmp_path, [(name, b"x", mode)])
+    assert got is None
+    assert list(ex.iterdir()) == []
+
+
+def test_extract_ignores_path_escape_and_never_writes_outside(tmp_path):
+    got, ex = _extract(tmp_path, [
+        ("../evil.json", b"pwn", REG),
+        ("/tmp/evil-abs.json", b"pwn", REG),
+        ("C:\\evil-win.json", b"pwn", REG),
+        ("..\\..\\evil-bat.json", b"pwn", REG),
+        ("sub/../../deep.json", b"pwn", REG),
+        ("review-status.json", b"review_status=[]", REG),
+    ])
+    assert got == ex / "review-status.json"
+    assert sorted(p.name for p in ex.rglob("*")) == ["review-status.json"]
+    assert not (tmp_path / "evil.json").exists()
+
+
+def test_extract_ignores_nested_status_file_without_top_level_entry(tmp_path):
+    got, ex = _extract(tmp_path, [("sub/review-status.json", b"x", REG)])
+    assert got is None
+    assert list(ex.iterdir()) == []
+
+
+def test_extract_survives_missing_and_corrupt_archives(tmp_path):
+    assert _mod._extract_status_file(tmp_path / "nope.zip", tmp_path) is None
+    bad = tmp_path / "bad.zip"
+    bad.write_bytes(b"not a zip")
+    assert _mod._extract_status_file(bad, tmp_path) is None
+
+
+def test_nonnumeric_run_id_skips_artifact_work_without_network(monkeypatch):
+    def boom(*args, **kwargs):
+        raise AssertionError("network reached for an invalid run id")
+
+    monkeypatch.setattr(_mod, "_api_get_paginated", boom)
+    assert _mod.fetch_all_review_statuses("t", "o/r", "../pwned") == []
+
+
+# ─── review-comment ownership (Issue #29 security review) ─────────────
+
+BOT = _mod.DEFAULT_BOT_LOGIN
+
+
+def _comment(cid, login=BOT, marker=True, repo="o/r", pr="33",
+             with_user=True, with_issue=True):
+    """Comment in the exact shape the Issue Comments API returns.
+
+    Mirrors the official response example
+    (docs.github.com/rest/issues/comments): ``issue_url`` present,
+    ``pull_request`` absent — PRs are issues, so the issue number is
+    the PR number.
+    """
+    c = {
+        "id": cid,
+        "node_id": f"MDEyOklzc3VlQ29tbWVudA{cid}",
+        "url": f"https://api.github.com/repos/{repo}/issues/comments/{cid}",
+        "html_url": f"https://github.com/{repo}/issues/{pr}#issuecomment-{cid}",
+        "body": (_mod.COMMENT_MARKER + " review") if marker else "plain comment",
+        "created_at": "2011-04-14T16:00:49Z",
+        "updated_at": "2011-04-14T16:00:49Z",
+        "issue_url": f"https://api.github.com/repos/{repo}/issues/{pr}",
+        "author_association": "CONTRIBUTOR",
+        "minimized": None,
+    }
+    if not with_issue:
+        del c["issue_url"]
+    if with_user:
+        c["user"] = {
+            "login": login,
+            "id": 1,
+            "node_id": "MDQ6VXNlcjE=",
+            "url": f"https://api.github.com/users/{login}",
+            "html_url": f"https://github.com/{login}",
+            "type": "Bot" if login == BOT else "User",
+            "site_admin": False,
+        }
+    return c
+
+
+def test_comment_fixture_matches_real_api_shape():
+    """The fixture must not resurrect the nonexistent ``pull_request`` key."""
+    c = _comment(1)
+    assert "issue_url" in c and "pull_request" not in c
+    assert _mod._verified_bot_comment(c, BOT, "o/r", "33") is True
+
+
+def _serve_comments(monkeypatch, comments):
+    monkeypatch.setattr(_mod, "_api_get_paginated", lambda *a, **k: comments)
+
+
+def test_find_comment_accepts_own_bot_comment(monkeypatch):
+    _serve_comments(monkeypatch, [_comment(7)])
+    assert _mod.find_comment_id("t", "o/r", "33") == 7
+
+
+def test_find_comment_ignores_foreign_marker_comment(monkeypatch):
+    """A different user pasting our marker must never be PATCHed."""
+    _serve_comments(monkeypatch, [_comment(7, login="evil-user")])
+    assert _mod.find_comment_id("t", "o/r", "33") is None
+
+
+def test_find_comment_ignores_comment_with_unknown_author(monkeypatch):
+    """No identity in the payload -> identity cannot be established -> not patchable."""
+    _serve_comments(monkeypatch, [_comment(7, with_user=False)])
+    assert _mod.find_comment_id("t", "o/r", "33") is None
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"pr": "99"},                 # marker on a comment for another PR
+    {"repo": "attacker/repo"},    # marker tied to another repository
+])
+def test_find_comment_requires_issue_url_match(monkeypatch, kwargs):
+    _serve_comments(monkeypatch, [_comment(7, **kwargs)])
+    assert _mod.find_comment_id("t", "o/r", "33") is None
+
+
+def test_find_comment_ignores_comment_without_issue_url(monkeypatch):
+    _serve_comments(monkeypatch, [_comment(7, with_issue=False)])
+    assert _mod.find_comment_id("t", "o/r", "33") is None
+
+
+def test_find_comment_skips_non_marker_comments(monkeypatch):
+    _serve_comments(monkeypatch, [_comment(7, marker=False)])
+    assert _mod.find_comment_id("t", "o/r", "33") is None
+
+
+def test_find_comment_rejects_nonnumeric_pr_number_without_api(monkeypatch):
+    def boom(*args, **kwargs):
+        raise AssertionError("API called with an invalid PR number")
+
+    monkeypatch.setattr(_mod, "_api_get_paginated", boom)
+    assert _mod.find_comment_id("t", "o/r", "33/../4") is None
+
+
+class _Resp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def read(self):
+        return json.dumps(self._payload).encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def _capture_write(monkeypatch):
+    requests = []
+
+    def fake_urlopen(req):
+        requests.append((req.full_url, req.get_method()))
+        return _Resp({"id": 9})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return requests
+
+
+def test_upsert_patches_only_the_verified_own_comment(monkeypatch):
+    reqs = _capture_write(monkeypatch)
+    _serve_comments(monkeypatch, [_comment(7)])
+    assert _mod.upsert_comment("t", "o/r", "33", "body") == 9
+    assert reqs == [("https://api.github.com/repos/o/r/issues/comments/7", "PATCH")]
+
+
+def test_upsert_posts_new_instead_of_editing_a_foreign_marker(monkeypatch):
+    reqs = _capture_write(monkeypatch)
+    _serve_comments(monkeypatch, [
+        _comment(7, login="evil-user"),      # same marker, wrong author
+        _comment(8, login="attacker", with_user=False),  # marker, unknown author
+    ])
+    assert _mod.upsert_comment("t", "o/r", "33", "body") == 9
+    assert reqs == [("https://api.github.com/repos/o/r/issues/33/comments", "POST")]
+
+
+def test_repeated_upsert_on_same_pr_posts_once_then_patches(monkeypatch):
+    """Every poll reuses the bot's own earlier comment (real-shape server).
+
+    With the pre-fix ``pull_request`` check the poller never recognized
+    its own comment (issue comments have no such key), so each poll POSTed
+    a duplicate instead of PATCHing. This test pins the dedup contract
+    against an Issue Comments API shaped server.
+    """
+    server = []  # comments stored on o/r issue 33, real API shape
+
+    def fake_list(*args, **kwargs):
+        return list(server)
+
+    def fake_urlopen(req):
+        if req.get_method() == "POST":
+            new = _comment(len(server) + 1)
+            new["body"] = json.loads(req.data)["body"]
+            server.append(new)
+            return _Resp(new)
+        cid = int(req.full_url.rsplit("/", 1)[1])
+        for c in server:
+            if c["id"] == cid:
+                c["body"] = json.loads(req.data)["body"]
+                return _Resp(c)
+        raise AssertionError(f"PATCH to unknown comment {cid}")
+
+    monkeypatch.setattr(_mod, "_api_get_paginated", fake_list)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    first = _mod.upsert_comment("t", "o/r", "33", f"{_mod.COMMENT_MARKER} status v1")
+    second = _mod.upsert_comment("t", "o/r", "33", f"{_mod.COMMENT_MARKER} status v2")
+    third = _mod.upsert_comment("t", "o/r", "33", f"{_mod.COMMENT_MARKER} status v3")
+
+    assert first == second == third == 1
+    assert len(server) == 1
+    assert server[0]["body"] == f"{_mod.COMMENT_MARKER} status v3"
+
+
+def test_upsert_rejects_nonnumeric_pr_number_without_request(monkeypatch):
+    reqs = _capture_write(monkeypatch)
+    assert _mod.upsert_comment("t", "o/r", "33; rm -rf /", "body") is None
+    assert reqs == []
+
+
+def test_upsert_accepts_custom_expected_login(monkeypatch):
+    reqs = _capture_write(monkeypatch)
+    _serve_comments(monkeypatch, [_comment(7, login="ci-bot")])
+    assert _mod.upsert_comment("t", "o/r", "33", "body", expected_login="ci-bot") == 9
+    assert reqs[0][1] == "PATCH"
+
+
+def test_commenter_workflow_pins_the_expected_bot_login():
+    """The workflow's configured login must equal the code default, so the
+    ownership check cannot drift silently."""
+    yaml = pytest.importorskip("hermes_yaml")
+    root = Path(__file__).resolve().parents[2]
+    doc = yaml.safe_load(
+        (root / ".github/workflows/ci-review-comment.yml").read_text(encoding="utf-8")
+    )
+    step = next(
+        s for s in doc["jobs"]["comment"]["steps"]
+        if "PR_NUMBER" in (s.get("env") or {})
+    )
+    assert step["env"]["CI_BOT_COMMENT_LOGIN"] == _mod.DEFAULT_BOT_LOGIN

@@ -327,6 +327,7 @@ _UPDATE_DEPENDENCIES = (
     "hermes_cli/gui_uninstall.py",
     "hermes_cli/linux_desktop_entry.py",
     "hermes_cli/github_api.py",  # source_check's release lookup
+    "hermes_cli/h4v3_fork_update.py",  # fork-aware fetch/verify run by source_check + update_cmd
     "hermes_cli/build_info.py",
     "hermes_cli/image_provenance.py",
     "hermes_cli/backup.py",  # pre-update backup

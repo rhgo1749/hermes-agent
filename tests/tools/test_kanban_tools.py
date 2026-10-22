@@ -858,6 +858,66 @@ def test_conditional_unblock_uses_public_event_id_and_registry_dispatch(monkeypa
     assert landed["status"] == "ready"
 
 
+def test_show_exposes_needs_input_recovery_resolution_to_worker(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools
+    from tools.registry import registry
+
+    assert kanban_tools.registry is registry
+    tid = worker_env
+    with kbc.connect_closing() as conn:
+        for attempt in range(2):
+            task = kb.get_task(conn, tid)
+            assert task is not None
+            claimed = task if attempt == 0 else kb.claim_task(conn, tid, claimer="retry-worker")
+            assert claimed is not None and claimed.current_run_id is not None
+            assert kb.block_task(
+                conn, tid, reason="explicit human input required", kind="needs_input",
+                expected_run_id=claimed.current_run_id,
+            )
+            if attempt == 0:
+                assert kb.unblock_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        block_event = next(event for event in reversed(events) if event.kind == "block_loop_detected")
+        latest_run = kb.latest_run(conn, tid)
+        assert latest_run is not None and latest_run.id == block_event.run_id
+        parents = [row[0] for row in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id", (tid,),
+        )]
+        landing_status = kb._landing_status_after_parents(conn, tid)
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    resolution = "Maintainer authorized bounded rework; visual approval remains pending."
+    with kbc.connect_closing() as conn:
+        ok, result = kb.recover_triage_task(
+            conn,
+            tid,
+            expected_board="default",
+            expected_status="triage",
+            expected_block_kind="needs_input",
+            expected_block_loop_event_id=block_event.id,
+            expected_latest_event_id=events[-1].id,
+            expected_run_id=latest_run.id,
+            expected_parent_ids=parents,
+            expected_landing_status=landing_status,
+            reason="operator recorded the explicit resolution",
+            actor="operator",
+            resolution=resolution,
+        )
+        assert ok is True and isinstance(result, dict)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    shown_result = registry.dispatch("kanban_show", {"task_id": tid})
+    assert isinstance(shown_result, str)
+    shown = json.loads(shown_result)
+    assert "events" in shown, shown
+    recovery = next(event for event in shown["events"] if event["kind"] == "triage_recovered")
+    assert recovery["payload"]["block_kind"] == "needs_input"
+    assert recovery["payload"]["resolution"] == resolution
+
+
 def test_conditional_unblock_rejects_null_event_id_without_falling_back(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc

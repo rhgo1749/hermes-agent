@@ -28,12 +28,45 @@ def _positive_int(value: object) -> bool:
     return type(value) is int and value > 0
 
 
+def _validated_audit_fields(
+    kb: Any,
+    expected_block_kind: str,
+    reason: str,
+    actor: str,
+    resolution: str | None,
+) -> dict[str, str] | str:
+    if not isinstance(expected_block_kind, str) or expected_block_kind not in {
+        "capability", "needs_input",
+    }:
+        return "invalid_expected_block_kind"
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
+        return "invalid_reason"
+    if not isinstance(actor, str) or not actor.strip() or len(actor) > 100:
+        return "invalid_actor"
+    if expected_block_kind == "needs_input":
+        if not isinstance(resolution, str) or not resolution.strip() or len(resolution) > 1000:
+            return "needs_input_requires_explicit_resolution"
+    elif resolution is not None:
+        return "resolution_only_applies_to_needs_input"
+
+    fields = {
+        "reason": str(kb.redact_review_value(reason.strip())).strip(),
+        "actor": str(kb.redact_review_value(actor.strip())).strip(),
+    }
+    if resolution is not None:
+        fields["resolution"] = str(kb.redact_review_value(resolution.strip())).strip()
+    if any(not value for value in fields.values()):
+        return "invalid_redacted_audit"
+    return fields
+
+
 def recover_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     expected_board: str,
     expected_status: str,
+    expected_block_kind: str = "capability",
     expected_block_loop_event_id: int,
     expected_latest_event_id: int,
     expected_run_id: int,
@@ -41,13 +74,16 @@ def recover_triage_task(
     expected_landing_status: str,
     reason: str,
     actor: str,
+    resolution: str | None = None,
 ) -> tuple[bool, dict[str, Any] | str]:
-    """CAS one explicitly reviewed capability block-loop row out of triage.
+    """CAS one explicitly reviewed block-loop row out of triage.
 
     No content, assignment, dependency, run, claim, or counter is rewritten.
     The caller must name the selected board and the exact Task/event/run/parent
-    snapshot it just read. ``ready`` versus ``todo`` is calculated under the
-    same write transaction and must match the caller's expectation.
+    snapshot it just read. ``needs_input`` additionally requires a distinct,
+    operator-attributed resolution statement. ``ready`` versus ``todo`` is
+    calculated under the same write transaction and must match the caller's
+    expectation.
     """
     from hermes_cli import kanban_db as kb
 
@@ -74,16 +110,13 @@ def recover_triage_task(
             or any(not isinstance(parent_id, str) or not parent_id for parent_id in expected_parent_ids)
             or len(set(expected_parent_ids)) != len(expected_parent_ids)):
         return False, "invalid_parent_ids"
-    if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
-        return False, "invalid_reason"
-    if not isinstance(actor, str) or not actor.strip() or len(actor) > 100:
-        return False, "invalid_actor"
-
     expected_parents = sorted(expected_parent_ids)
-    audit_reason = str(kb.redact_review_value(reason.strip())).strip()
-    audit_actor = str(kb.redact_review_value(actor.strip())).strip()
-    if not audit_reason or not audit_actor:
-        return False, "invalid_redacted_audit"
+    audit_fields = _validated_audit_fields(kb, expected_block_kind, reason, actor, resolution)
+    if isinstance(audit_fields, str):
+        return False, audit_fields
+    audit_reason = audit_fields["reason"]
+    audit_actor = audit_fields["actor"]
+    audit_resolution = audit_fields.get("resolution")
 
     with kb.write_txn(conn):
         try:
@@ -105,8 +138,8 @@ def recover_triage_task(
             return False, "task_not_found_on_board"
         if task["status"] != expected_status:
             return False, "task_status_changed"
-        if task["block_kind"] != "capability":
-            return False, "task_is_not_capability_triage"
+        if task["block_kind"] != expected_block_kind:
+            return False, "task_block_kind_changed"
         # worker_started_at deliberately NOT required NULL: a reclaimed run
         # leaves its forensic "session:pid|boot" fingerprint behind (same
         # semantics upstream's --from-triage accepts). Real activity is
@@ -130,7 +163,7 @@ def recover_triage_task(
         if block_event is None or block_event["kind"] != "block_loop_detected":
             return False, "block_loop_event_changed"
         payload = kb._json_dict(block_event["payload"])
-        if (payload.get("kind") != "capability"
+        if (payload.get("kind") != expected_block_kind
                 or payload.get("limit") != kb.BLOCK_RECURRENCE_LIMIT
                 or type(payload.get("recurrences")) is not int
                 or payload.get("recurrences") < kb.BLOCK_RECURRENCE_LIMIT
@@ -163,13 +196,16 @@ def recover_triage_task(
                 or latest_run["status"] != "blocked"
                 or latest_run["outcome"] != "blocked"):
             return False, "latest_ended_run_changed"
+        # Ended runs retain claim_lock for provenance; a lease expiry or PID
+        # still present means Core's terminal-worker reaper has not finished.
         active_run = conn.execute(
-            "SELECT 1 FROM task_runs WHERE task_id = ? "
-            "AND (ended_at IS NULL OR status = 'running') LIMIT 1",
+            "SELECT 1 FROM task_runs WHERE task_id = ? AND ("
+            "ended_at IS NULL OR status = 'running' OR claim_expires IS NOT NULL "
+            "OR worker_pid IS NOT NULL) LIMIT 1",
             (task_id,),
         ).fetchone()
         if active_run is not None:
-            return False, "active_run_present"
+            return False, "active_run_or_unreaped_worker_present"
 
         landing_status = kb._landing_status_after_parents(conn, task_id)
         if landing_status != expected_landing_status:
@@ -186,24 +222,27 @@ def recover_triage_task(
         if updated.rowcount != 1:
             return False, "task_compare_and_swap_lost"
 
+        audit_payload = {
+            "actor": audit_actor,
+            "reason": audit_reason,
+            "board": expected_board,
+            "task_id": task_id,
+            "from_status": "triage",
+            "to_status": landing_status,
+            "block_loop_event_id": expected_block_loop_event_id,
+            "expected_latest_event_id": expected_latest_event_id,
+            "run_id": expected_run_id,
+            "block_kind": expected_block_kind,
+            "block_recurrences_preserved": task["block_recurrences"],
+            "parent_ids": parents,
+        }
+        if audit_resolution is not None:
+            audit_payload["resolution"] = audit_resolution
         kb._append_event(
             conn,
             task_id,
             "triage_recovered",
-            {
-                "actor": audit_actor,
-                "reason": audit_reason,
-                "board": expected_board,
-                "task_id": task_id,
-                "from_status": "triage",
-                "to_status": landing_status,
-                "block_loop_event_id": expected_block_loop_event_id,
-                "expected_latest_event_id": expected_latest_event_id,
-                "run_id": expected_run_id,
-                "block_kind": "capability",
-                "block_recurrences_preserved": task["block_recurrences"],
-                "parent_ids": parents,
-            },
+            audit_payload,
         )
         event_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
 
@@ -215,6 +254,8 @@ def recover_triage_task(
         "block_loop_event_id": expected_block_loop_event_id,
         "run_id": expected_run_id,
         "event_id": event_id,
+        "block_kind": expected_block_kind,
         "block_recurrences_preserved": task["block_recurrences"],
         "parent_ids": parents,
+        **({"resolution": audit_resolution} if audit_resolution is not None else {}),
     }
