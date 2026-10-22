@@ -333,14 +333,46 @@ BOT = _mod.DEFAULT_BOT_LOGIN
 
 
 def _comment(cid, login=BOT, marker=True, repo="o/r", pr="33",
-             with_user=True, with_pr=True):
-    c = {"id": cid,
-         "body": (_mod.COMMENT_MARKER + " review") if marker else "plain comment"}
+             with_user=True, with_issue=True):
+    """Comment in the exact shape the Issue Comments API returns.
+
+    Mirrors the official response example
+    (docs.github.com/rest/issues/comments): ``issue_url`` present,
+    ``pull_request`` absent — PRs are issues, so the issue number is
+    the PR number.
+    """
+    c = {
+        "id": cid,
+        "node_id": f"MDEyOklzc3VlQ29tbWVudA{cid}",
+        "url": f"https://api.github.com/repos/{repo}/issues/comments/{cid}",
+        "html_url": f"https://github.com/{repo}/issues/{pr}#issuecomment-{cid}",
+        "body": (_mod.COMMENT_MARKER + " review") if marker else "plain comment",
+        "created_at": "2011-04-14T16:00:49Z",
+        "updated_at": "2011-04-14T16:00:49Z",
+        "issue_url": f"https://api.github.com/repos/{repo}/issues/{pr}",
+        "author_association": "CONTRIBUTOR",
+        "minimized": None,
+    }
+    if not with_issue:
+        del c["issue_url"]
     if with_user:
-        c["user"] = {"login": login}
-    if with_pr:
-        c["pull_request"] = {"url": f"https://api.github.com/repos/{repo}/pulls/{pr}"}
+        c["user"] = {
+            "login": login,
+            "id": 1,
+            "node_id": "MDQ6VXNlcjE=",
+            "url": f"https://api.github.com/users/{login}",
+            "html_url": f"https://github.com/{login}",
+            "type": "Bot" if login == BOT else "User",
+            "site_admin": False,
+        }
     return c
+
+
+def test_comment_fixture_matches_real_api_shape():
+    """The fixture must not resurrect the nonexistent ``pull_request`` key."""
+    c = _comment(1)
+    assert "issue_url" in c and "pull_request" not in c
+    assert _mod._verified_bot_comment(c, BOT, "o/r", "33") is True
 
 
 def _serve_comments(monkeypatch, comments):
@@ -368,13 +400,13 @@ def test_find_comment_ignores_comment_with_unknown_author(monkeypatch):
     {"pr": "99"},                 # marker on a comment for another PR
     {"repo": "attacker/repo"},    # marker tied to another repository
 ])
-def test_find_comment_requires_pr_target_match(monkeypatch, kwargs):
+def test_find_comment_requires_issue_url_match(monkeypatch, kwargs):
     _serve_comments(monkeypatch, [_comment(7, **kwargs)])
     assert _mod.find_comment_id("t", "o/r", "33") is None
 
 
-def test_find_comment_ignores_comment_without_pr_link(monkeypatch):
-    _serve_comments(monkeypatch, [_comment(7, with_pr=False)])
+def test_find_comment_ignores_comment_without_issue_url(monkeypatch):
+    _serve_comments(monkeypatch, [_comment(7, with_issue=False)])
     assert _mod.find_comment_id("t", "o/r", "33") is None
 
 
@@ -431,6 +463,44 @@ def test_upsert_posts_new_instead_of_editing_a_foreign_marker(monkeypatch):
     ])
     assert _mod.upsert_comment("t", "o/r", "33", "body") == 9
     assert reqs == [("https://api.github.com/repos/o/r/issues/33/comments", "POST")]
+
+
+def test_repeated_upsert_on_same_pr_posts_once_then_patches(monkeypatch):
+    """Every poll reuses the bot's own earlier comment (real-shape server).
+
+    With the pre-fix ``pull_request`` check the poller never recognized
+    its own comment (issue comments have no such key), so each poll POSTed
+    a duplicate instead of PATCHing. This test pins the dedup contract
+    against an Issue Comments API shaped server.
+    """
+    server = []  # comments stored on o/r issue 33, real API shape
+
+    def fake_list(*args, **kwargs):
+        return list(server)
+
+    def fake_urlopen(req):
+        if req.get_method() == "POST":
+            new = _comment(len(server) + 1)
+            new["body"] = json.loads(req.data)["body"]
+            server.append(new)
+            return _Resp(new)
+        cid = int(req.full_url.rsplit("/", 1)[1])
+        for c in server:
+            if c["id"] == cid:
+                c["body"] = json.loads(req.data)["body"]
+                return _Resp(c)
+        raise AssertionError(f"PATCH to unknown comment {cid}")
+
+    monkeypatch.setattr(_mod, "_api_get_paginated", fake_list)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    first = _mod.upsert_comment("t", "o/r", "33", f"{_mod.COMMENT_MARKER} status v1")
+    second = _mod.upsert_comment("t", "o/r", "33", f"{_mod.COMMENT_MARKER} status v2")
+    third = _mod.upsert_comment("t", "o/r", "33", f"{_mod.COMMENT_MARKER} status v3")
+
+    assert first == second == third == 1
+    assert len(server) == 1
+    assert server[0]["body"] == f"{_mod.COMMENT_MARKER} status v3"
 
 
 def test_upsert_rejects_nonnumeric_pr_number_without_request(monkeypatch):

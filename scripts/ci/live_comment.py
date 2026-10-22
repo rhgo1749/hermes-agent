@@ -317,8 +317,11 @@ def _verified_bot_comment(c: object, expected_login: str, repo: str, pr_number: 
       other user that pastes the marker is never modified, and a comment
       whose ``user`` identity cannot be established at all is not
       patchable either;
-    - the comment's ``pull_request`` link points at this exact repo and
-      PR number, so a mis-resolved target can never redirect the write.
+    - the comment's ``issue_url`` points at this exact repo and PR
+      number, so a mis-resolved target can never redirect the write.
+      Issue Comments API objects carry ``issue_url`` (they have no
+      ``pull_request`` key), and a pull request's issue number equals
+      its PR number.
     """
     if not isinstance(c, dict):
         return False
@@ -330,10 +333,9 @@ def _verified_bot_comment(c: object, expected_login: str, repo: str, pr_number: 
         return False
     if cast("dict[str, Any]", user).get("login") != expected_login:
         return False
-    pr_ref = comment.get("pull_request")
-    if not isinstance(pr_ref, dict):
+    if not str(pr_number).isdigit():
         return False
-    if str(cast("dict[str, Any]", pr_ref).get("url") or "") != f"{API_BASE}/repos/{repo}/pulls/{pr_number}":
+    if str(comment.get("issue_url") or "") != f"{API_BASE}/repos/{repo}/issues/{pr_number}":
         return False
     return isinstance(comment.get("id"), int)
 
