@@ -85,6 +85,7 @@ def _cmd_recover_triage(args: argparse.Namespace) -> int:
             args.task_id,
             expected_board=normalized,
             expected_status=args.expected_status,
+            expected_block_kind=getattr(args, "expected_block_kind", "capability"),
             expected_block_loop_event_id=args.expected_block_loop_event_id,
             expected_latest_event_id=args.expected_latest_event_id,
             expected_run_id=args.expected_run_id,
@@ -92,6 +93,7 @@ def _cmd_recover_triage(args: argparse.Namespace) -> int:
             expected_landing_status=args.expected_landing_status,
             reason=args.reason,
             actor=actor,
+            resolution=getattr(args, "resolution", None),
         )
     if not ok:
         return _err(f"kanban recover-triage refused without mutation: {result}")
