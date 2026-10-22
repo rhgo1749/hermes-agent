@@ -347,6 +347,8 @@ _SPECS = [
         _TASK_ID,
         _arg("--expected-board", required=True, help="Exact board slug; must match explicit --board."),
         _arg("--expected-status", choices=("triage",), required=True),
+        _arg("--expected-block-kind", choices=("capability", "needs_input"), default="capability",
+             help="Exact typed hold in the block-loop evidence (default: capability)."),
         _arg("--expected-block-loop-event-id", type=_positive_int, required=True),
         _arg("--expected-latest-event-id", type=_positive_int, required=True),
         _arg("--expected-run-id", type=_positive_int, required=True),
@@ -354,6 +356,7 @@ _SPECS = [
              help="JSON array of the exact sorted parent Task IDs."),
         _arg("--expected-landing-status", choices=("ready", "todo"), required=True),
         _arg("--reason", required=True, help="Operator audit reason (recorded in triage_recovered)."),
+        _arg("--resolution", help="Required for needs_input: explicit operator-recorded resolution of the hold."),
         _json_flag(),
     ], help="Operator-only CAS recovery for one exact block-loop triage event"),
     _cmd("request-review", [
