@@ -28,7 +28,7 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _looped_task(conn, *, board="default", assignee="kanban-main"):
+def _looped_task(conn, *, board="default", assignee="kanban-main", block_kind="capability"):
     parent = kb.create_task(conn, title="finished parent", assignee="setup")
     assert kb.complete_task(conn, parent, result="parent finished")
     task_id = kb.create_task(
@@ -48,7 +48,7 @@ def _looped_task(conn, *, board="default", assignee="kanban-main"):
             conn,
             task_id,
             reason="bounded-context source unavailable",
-            kind="capability",
+            kind=block_kind,
             expected_run_id=claimed.current_run_id,
         )
         if attempt == 0:
@@ -69,6 +69,7 @@ def _looped_task(conn, *, board="default", assignee="kanban-main"):
     return {
         "board": board,
         "task_id": task_id,
+        "block_kind": block_kind,
         "parent_ids": parent_ids,
         "event_id": block_event.id,
         "latest_event_id": events[-1].id,
@@ -82,6 +83,7 @@ def _recover(conn, evidence, **overrides):
         "task_id": evidence["task_id"],
         "expected_board": evidence["board"],
         "expected_status": "triage",
+        "expected_block_kind": evidence.get("block_kind", "capability"),
         "expected_block_loop_event_id": evidence["event_id"],
         "expected_latest_event_id": evidence["latest_event_id"],
         "expected_run_id": evidence["run_id"],
@@ -90,6 +92,8 @@ def _recover(conn, evidence, **overrides):
         "reason": "operator verified the repair and exact current rework proof",
         "actor": "test-operator",
     }
+    if evidence.get("resolution") is not None:
+        args["resolution"] = evidence["resolution"]
     args.update(overrides)
     return kb.recover_triage_task(conn, **args)
 
@@ -155,6 +159,104 @@ def test_exact_triage_cas_preserves_every_existing_record_and_recursions(kanban_
         assert after["runs"] == before["runs"]
         assert after["comments"] == before["comments"]
         assert after["links"] == before["links"]
+
+
+def test_needs_input_triage_requires_and_audits_explicit_resolution(kanban_home):
+    with kbc.connect_closing(board="default") as conn:
+        evidence = _looped_task(conn, block_kind="needs_input")
+        evidence["resolution"] = "Maintainer authorized bounded rework; visual approval remains pending."
+        before = _snapshot(conn, evidence["task_id"])
+        assert before["task"]["status"] == "triage"
+        assert before["task"]["block_kind"] == "needs_input"
+
+        ok, result = _recover(conn, evidence)
+
+        assert ok is True
+        assert isinstance(result, dict)
+        assert result["status"] == "ready"
+        after = _snapshot(conn, evidence["task_id"])
+        assert {k: v for k, v in after["task"].items() if k != "status"} == {
+            k: v for k, v in before["task"].items() if k != "status"
+        }
+        assert after["events"][:-1] == before["events"]
+        assert after["events"][-1]["kind"] == "triage_recovered"
+        audit = json.loads(after["events"][-1]["payload"])
+        assert audit["block_kind"] == "needs_input"
+        assert audit["resolution"] == evidence["resolution"]
+        assert audit["reason"] == "operator verified the repair and exact current rework proof"
+        assert after["runs"] == before["runs"]
+        assert after["comments"] == before["comments"]
+        assert after["links"] == before["links"]
+
+
+@pytest.mark.parametrize("resolution", [None, "", "   "])
+def test_needs_input_triage_refuses_missing_resolution_without_mutation(kanban_home, resolution):
+    with kbc.connect_closing(board="default") as conn:
+        evidence = _looped_task(conn, block_kind="needs_input")
+        before = _snapshot(conn, evidence["task_id"])
+
+        ok, reason = _recover(conn, evidence, resolution=resolution)
+
+        assert ok is False and "resolution" in reason
+        assert _snapshot(conn, evidence["task_id"]) == before
+
+
+def test_needs_input_cas_rejects_stale_snapshot_without_mutation(kanban_home):
+    with kbc.connect_closing(board="default") as conn:
+        evidence = _looped_task(conn, block_kind="needs_input")
+        evidence["resolution"] = "Maintainer authorized bounded rework."
+        before = _snapshot(conn, evidence["task_id"])
+        stale_values = (
+            {"expected_block_loop_event_id": evidence["event_id"] + 1},
+            {"expected_latest_event_id": evidence["event_id"]},
+            {"expected_run_id": evidence["run_id"] + 1},
+            {"expected_parent_ids": []},
+            {"expected_landing_status": "todo"},
+        )
+
+        for changes in stale_values:
+            ok, reason = _recover(conn, evidence, **changes)
+            assert ok is False and isinstance(reason, str)
+            assert _snapshot(conn, evidence["task_id"]) == before
+
+
+def test_needs_input_cas_rejects_active_claim_without_mutation(kanban_home):
+    with kbc.connect_closing(board="default") as conn:
+        evidence = _looped_task(conn, block_kind="needs_input")
+        evidence["resolution"] = "Maintainer authorized bounded rework."
+        conn.execute(
+            "UPDATE tasks SET claim_lock='live-claim' WHERE id=?",
+            (evidence["task_id"],),
+        )
+        before = _snapshot(conn, evidence["task_id"])
+
+        ok, reason = _recover(conn, evidence)
+
+        assert ok is False and "ownership" in reason
+        assert _snapshot(conn, evidence["task_id"]) == before
+
+
+def test_triage_cas_rejects_block_kind_mismatch_without_mutation(kanban_home):
+    with kbc.connect_closing(board="default") as conn:
+        evidence = _looped_task(conn, block_kind="needs_input")
+        evidence["resolution"] = "Maintainer authorized bounded rework."
+        before = _snapshot(conn, evidence["task_id"])
+
+        ok, reason = _recover(conn, evidence, expected_block_kind="capability")
+
+        assert ok is False and isinstance(reason, str)
+        assert _snapshot(conn, evidence["task_id"]) == before
+
+
+def test_capability_triage_refuses_needs_input_resolution_field(kanban_home):
+    with kbc.connect_closing(board="default") as conn:
+        evidence = _looped_task(conn)
+        before = _snapshot(conn, evidence["task_id"])
+
+        ok, reason = _recover(conn, evidence, resolution="not a capability resolution")
+
+        assert ok is False and "resolution" in reason
+        assert _snapshot(conn, evidence["task_id"]) == before
 
 
 def test_triage_cas_rejects_stale_event_and_run_ids_without_mutation(kanban_home):
@@ -305,36 +407,75 @@ def test_recovery_cli_requires_explicit_board_and_event_bound_arguments():
         "kanban", "--board", "re-bound", "recover-triage", "t_fdec8e64",
         "--expected-board", "re-bound",
         "--expected-status", "triage",
+        "--expected-block-kind", "needs_input",
         "--expected-block-loop-event-id", "17413",
         "--expected-latest-event-id", "17413",
         "--expected-run-id", "786",
         "--expected-parent-ids", '["t_b396726d","t_dc1cee4b"]',
         "--expected-landing-status", "ready",
         "--reason", "verified exact event and ended run",
+        "--resolution", "maintainer supplied bounded rework direction",
     ])
     assert args.kanban_action == "recover-triage"
     assert args.board == args.expected_board == "re-bound"
     assert args.task_id == "t_fdec8e64"
     assert args.expected_status == "triage"
+    assert args.expected_block_kind == "needs_input"
     assert args.expected_block_loop_event_id == 17413
     assert args.expected_latest_event_id == 17413
     assert args.expected_run_id == 786
+    assert args.resolution == "maintainer supplied bounded rework direction"
 
 
-def test_recovery_cli_rejects_worker_context_before_cas(kanban_home, monkeypatch):
+@pytest.mark.parametrize("block_kind", ["capability", "needs_input"])
+def test_recovery_cli_rejects_worker_context_before_cas(kanban_home, monkeypatch, block_kind):
     with kbc.connect_closing() as conn:
-        evidence = _looped_task(conn)
+        evidence = _looped_task(conn, block_kind=block_kind)
         before = _snapshot(conn, evidence["task_id"])
+    resolution = "Maintainer authorized bounded rework." if block_kind == "needs_input" else None
     args = argparse.Namespace(
         board=evidence["board"], task_id=evidence["task_id"],
         expected_board=evidence["board"], expected_status="triage",
+        expected_block_kind=block_kind,
         expected_block_loop_event_id=evidence["event_id"],
         expected_latest_event_id=evidence["latest_event_id"],
         expected_run_id=evidence["run_id"],
         expected_parent_ids_json=json.dumps(evidence["parent_ids"]),
-        expected_landing_status="ready", reason="operator approved", json=True,
+        expected_landing_status="ready", reason="operator approved",
+        resolution=resolution, json=True,
     )
     monkeypatch.setenv("HERMES_KANBAN_TASK", evidence["task_id"])
     assert kanban_cli._cmd_recover_triage(args) != 0
     with kbc.connect_closing() as conn:
         assert _snapshot(conn, evidence["task_id"]) == before
+
+
+def test_recovery_cli_records_needs_input_resolution(kanban_home, capsys):
+    with kbc.connect_closing(board="default") as conn:
+        evidence = _looped_task(conn, block_kind="needs_input")
+    resolution = "Maintainer authorized bounded rework; visual approval remains pending."
+    args = argparse.Namespace(
+        board=evidence["board"], task_id=evidence["task_id"],
+        expected_board=evidence["board"], expected_status="triage",
+        expected_block_kind="needs_input",
+        expected_block_loop_event_id=evidence["event_id"],
+        expected_latest_event_id=evidence["latest_event_id"],
+        expected_run_id=evidence["run_id"],
+        expected_parent_ids_json=json.dumps(evidence["parent_ids"]),
+        expected_landing_status="ready", reason="operator reviewed the hold",
+        resolution=resolution, json=True,
+    )
+
+    assert kanban_cli._cmd_recover_triage(args) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ready"
+    assert payload["block_kind"] == "needs_input"
+    assert payload["resolution"] == resolution
+    with kbc.connect_closing(board="default") as conn:
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='triage_recovered'",
+            (evidence["task_id"],),
+        ).fetchone()
+        assert json.loads(event["payload"])["resolution"] == resolution

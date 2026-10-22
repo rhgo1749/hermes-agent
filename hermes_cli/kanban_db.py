@@ -3572,33 +3572,12 @@ def unblock_task(
 def recover_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
-    *,
-    expected_board: str,
-    expected_status: str,
-    expected_block_loop_event_id: int,
-    expected_latest_event_id: int,
-    expected_run_id: int,
-    expected_parent_ids: list[str],
-    expected_landing_status: str,
-    reason: str,
-    actor: str,
+    **kwargs: Any,
 ) -> tuple[bool, dict[str, Any] | str]:
     """CAS one explicit operator decision to recover a matching triage hold."""
     from hermes_cli.kanban_db_triage_recovery import recover_triage_task as _recover_triage_task
 
-    return _recover_triage_task(
-        conn,
-        task_id,
-        expected_board=expected_board,
-        expected_status=expected_status,
-        expected_block_loop_event_id=expected_block_loop_event_id,
-        expected_latest_event_id=expected_latest_event_id,
-        expected_run_id=expected_run_id,
-        expected_parent_ids=expected_parent_ids,
-        expected_landing_status=expected_landing_status,
-        reason=reason,
-        actor=actor,
-    )
+    return _recover_triage_task(conn, task_id, **kwargs)
 
 
 def reopen_review_task(
