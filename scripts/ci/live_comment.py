@@ -9,7 +9,10 @@ as each job finishes.
 
 The comment is identified by the ``<!-- hermes-ci-review-bot -->`` marker
 — the same one ``assemble_review_comment.py`` uses — so it replaces any
-previous comment from an earlier run.
+previous comment from an earlier run. Only a comment that carries the
+marker, was authored by the CI bot identity (``CI_BOT_COMMENT_LOGIN``,
+default ``github-actions[bot]``), and targets this repo/PR is replaced;
+the same marker pasted by another user is never modified.
 
 This runs from ``.github/workflows/ci-review-comment.yml``, a separate
 ``workflow_run`` workflow. Thus ``CI_RUN_ID`` names the CI run to report
@@ -56,7 +59,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -64,6 +69,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
+from typing import Any, cast
 
 API_BASE = "https://api.github.com"
 
@@ -293,27 +299,84 @@ def collect_run_jobs(
     return all_jobs, runs_all_completed(relevant_runs)
 
 
-def find_comment_id(token: str, repo: str, pr_number: str) -> int | None:
-    """Find our existing review comment by marker prefix."""
+COMMENT_MARKER = "<!-- hermes-ci-review-bot -->"
+
+# The login the ``GITHUB_TOKEN`` of a Actions run posts issue comments
+# under. Overridable only for self-hosted setups that use a different
+# bot account; an unset/empty value falls back to this default.
+DEFAULT_BOT_LOGIN = "github-actions[bot]"
+
+
+def _verified_bot_comment(c: object, expected_login: str, repo: str, pr_number: str) -> bool:
+    """True only for a comment this poller may PATCH.
+
+    Three independent conditions must hold, fail-closed:
+
+    - the body carries our review marker;
+    - the author's login is the CI bot's identity — a comment by any
+      other user that pastes the marker is never modified, and a comment
+      whose ``user`` identity cannot be established at all is not
+      patchable either;
+    - the comment's ``issue_url`` points at this exact repo and PR
+      number, so a mis-resolved target can never redirect the write.
+      Issue Comments API objects carry ``issue_url`` (they have no
+      ``pull_request`` key), and a pull request's issue number equals
+      its PR number.
+    """
+    if not isinstance(c, dict):
+        return False
+    comment = cast("dict[str, Any]", c)
+    if not str(comment.get("body") or "").startswith(COMMENT_MARKER):
+        return False
+    user = comment.get("user")
+    if not isinstance(user, dict):
+        return False
+    if cast("dict[str, Any]", user).get("login") != expected_login:
+        return False
+    if not str(pr_number).isdigit():
+        return False
+    if str(comment.get("issue_url") or "") != f"{API_BASE}/repos/{repo}/issues/{pr_number}":
+        return False
+    return isinstance(comment.get("id"), int)
+
+
+def find_comment_id(
+    token: str, repo: str, pr_number: str, expected_login: str = DEFAULT_BOT_LOGIN,
+) -> int | None:
+    """Find our existing review comment: marker, bot authorship, and
+    repo/PR target must all match (see :func:`_verified_bot_comment`).
+    Foreign-marker comments by other users are left untouched."""
+    if not pr_number.isdigit():
+        return None
     owner, repo_name = repo.split("/")
     comments = _api_get_paginated(
         f"{API_BASE}/repos/{owner}/{repo_name}/issues/{pr_number}/comments",
         token,
     )
     for c in comments:
-        body = c.get("body", "") if isinstance(c, dict) else ""
-        if body.startswith("<!-- hermes-ci-review-bot -->"):
-            return c.get("id") if isinstance(c, dict) else None
+        if _verified_bot_comment(c, expected_login, repo, pr_number):
+            return c["id"]
     return None
 
 
 def upsert_comment(
-    token: str, repo: str, pr_number: str, body: str, comment_id: int | None = None
+    token: str,
+    repo: str,
+    pr_number: str,
+    body: str,
+    comment_id: int | None = None,
+    expected_login: str = DEFAULT_BOT_LOGIN,
 ) -> int | None:
-    """Create or update the review comment. Returns the comment ID."""
+    """Create or update the review comment. Returns the comment ID.
+
+    An update (PATCH) targets only an ID that :func:`find_comment_id`
+    verified as ours; with no verified comment the poller POSTs its own
+    new comment instead — it never edits someone else's."""
+    if not pr_number.isdigit():
+        return None
     owner, repo_name = repo.split("/")
     if comment_id is None:
-        comment_id = find_comment_id(token, repo, pr_number)
+        comment_id = find_comment_id(token, repo, pr_number, expected_login)
 
     if comment_id:
         url = f"{API_BASE}/repos/{owner}/{repo_name}/issues/comments/{comment_id}"
@@ -349,6 +412,52 @@ def upsert_comment(
 #   review_status=<json array of {source, results: [...]} objects>
 _REVIEW_STATUS_ARTIFACT_PREFIX = "review-status-"
 
+# Allowed artifact-name shape, enforced before a name ever becomes a
+# path: the literal prefix plus one lowercase slug. Every producer in
+# .github/workflows uses this form. The character class excludes every
+# path separator, dot, colon (drive paths), space, control byte, and
+# non-ASCII codepoint, so none of them can reach ``dest_dir / name``.
+_REVIEW_STATUS_ARTIFACT_RE = re.compile(r"\Areview-status-[a-z][a-z0-9_-]{0,63}\Z")
+
+# The single entry the poller consumes from each artifact zip. Nothing
+# else in an artifact ever touches disk.
+_STATUS_ENTRY = "review-status.json"
+
+
+def validate_artifact_name(name: object) -> str | None:
+    """Return the artifact name if it matches the allowed form, else None."""
+    if not isinstance(name, str) or not _REVIEW_STATUS_ARTIFACT_RE.match(name):
+        return None
+    return name
+
+
+def _extract_status_file(zip_path: Path, extract_dir: Path) -> Path | None:
+    """Extract only a regular top-level ``review-status.json`` from the zip.
+
+    Entries escaping the extract dir (``..``, absolute or drive paths) can
+    never match the exact top-level entry name, and symlink, directory,
+    device, socket or otherwise abnormal entry types for that name are
+    rejected by their mode bits instead of being written. Fail-closed:
+    any abnormality returns None and writes nothing.
+    """
+    extract_dir = extract_dir.resolve()
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            for info in zf.infolist():
+                if info.filename != _STATUS_ENTRY:
+                    continue
+                mode = (info.external_attr >> 16) & 0o170000
+                if info.is_dir() or mode not in (0, stat.S_IFREG):
+                    return None
+                target = extract_dir / _STATUS_ENTRY
+                if not target.is_relative_to(extract_dir):
+                    return None
+                target.write_bytes(zf.read(info))
+                return target
+    except (OSError, zipfile.BadZipFile):
+        return None
+    return None
+
 
 def _list_artifacts(token: str, repo: str, run_id: str) -> list[dict]:
     """List artifacts for a given run (paginated)."""
@@ -375,6 +484,17 @@ def _download_artifact(
     or ``None`` if the download or extraction failed.
     """
     _owner, _repo_name = repo.split("/")
+    # The artifact name comes from the API and becomes a file path here:
+    # validate it first, then pin every derived path inside dest_dir.
+    name = validate_artifact_name(artifact.get("name"))
+    if name is None:
+        return None
+    dest_dir = dest_dir.resolve()
+    zip_path = dest_dir / f"{name}.zip"
+    extract_dir = dest_dir / name
+    if not zip_path.is_relative_to(dest_dir) or not extract_dir.is_relative_to(dest_dir):
+        return None
+
     archive_download_url = artifact.get("archive_download_url", "")
     if not archive_download_url:
         return None
@@ -399,7 +519,6 @@ def _download_artifact(
     if not location:
         return None
 
-    zip_path = dest_dir / f"{artifact['name']}.zip"
     try:
         # No auth headers here; further redirects are safe to follow.
         with urllib.request.urlopen(
@@ -410,18 +529,9 @@ def _download_artifact(
     except Exception:
         return None
 
-    extract_dir = dest_dir / artifact["name"]
     extract_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        with zipfile.ZipFile(zip_path) as zf:
-            if any(".." in name or name.startswith("/") for name in zf.namelist()):
-                return None
-            zf.extractall(extract_dir)
-    except Exception:
-        return None
-
-    status_file = extract_dir / "review-status.json"
-    return status_file if status_file.exists() else None
+    status_file = _extract_status_file(zip_path, extract_dir)
+    return status_file if status_file is not None and status_file.exists() else None
 
 
 def _parse_status_file(status_file: Path) -> list[dict]:
@@ -452,6 +562,14 @@ def fetch_all_review_statuses(
     Artifacts that don't exist yet or fail to parse are silently skipped.
     """
     all_statuses: list[dict] = []
+
+    # The run id names a directory under the shared temp base; keep it a
+    # bare number so nothing can steer the download dir outside it.
+    run_key = str(run_id)
+    if not run_key.isdigit():
+        print("Ignoring run with non-numeric id for artifact download", file=sys.stderr)
+        return all_statuses
+
     temp_base = Path(tempfile.gettempdir()) / "review-status-artifacts"
 
     try:
@@ -467,7 +585,9 @@ def fetch_all_review_statuses(
         return all_statuses
 
     # Clean temp dir for this run's artifacts.
-    run_dl_dir = temp_base / str(run_id)
+    run_dl_dir = temp_base / run_key
+    if not run_dl_dir.is_relative_to(temp_base):
+        return all_statuses
     if run_dl_dir.exists():
         shutil.rmtree(run_dl_dir)
     run_dl_dir.mkdir(parents=True, exist_ok=True)
@@ -554,6 +674,7 @@ def run(
     timeout: int = 1800,
     dry_run: bool = False,
     watch_workflows: list[str] | None = None,
+    expected_bot_login: str = DEFAULT_BOT_LOGIN,
 ) -> int:
     """Poll for job statuses and update the PR comment until all done.
 
@@ -643,7 +764,8 @@ def run(
                 print(body)
                 print("--- END ---")
             else:
-                cid = upsert_comment(token, repo, pr_number, body)
+                cid = upsert_comment(token, repo, pr_number, body,
+                                     expected_login=expected_bot_login)
                 if cid:
                     print(f"  Updated comment {cid} ({reason})")
                 else:
@@ -730,6 +852,9 @@ def main() -> int:
     run_id = os.environ.get("CI_RUN_ID", "")
     pr_number = os.environ.get("PR_NUMBER", "")
     run_url = os.environ.get("RUN_URL", "")
+    # The login that owns our review comment. Only comments authored by
+    # this identity are ever PATCHed (see _verified_bot_comment).
+    expected_bot_login = os.environ.get("CI_BOT_COMMENT_LOGIN", "").strip() or DEFAULT_BOT_LOGIN
 
     # Sibling workflows to merge into the comment, one name per line. Their
     # runs are separate from the CI run, so the poller resolves them by name.
@@ -746,6 +871,18 @@ def main() -> int:
             print("CI_RUN_ID is required", file=sys.stderr)
             return 1
 
+    # These values reach API URLs and temp paths: reject anything that is
+    # not its documented shape instead of interpolating it.
+    if repo and (repo.count("/") != 1 or not all(part.strip() for part in repo.split("/"))):
+        print("GITHUB_REPOSITORY must be 'owner/name'", file=sys.stderr)
+        return 1
+    if pr_number and not pr_number.isdigit():
+        print("PR_NUMBER must be a positive integer", file=sys.stderr)
+        return 1
+    if run_id and not run_id.isdigit():
+        print("CI_RUN_ID must be a positive integer", file=sys.stderr)
+        return 1
+
     # Build commit info line from env vars (set by ci-review-comment.yml).
     commit_sha = os.environ.get("COMMIT_SHA", "")
     commit_msg = os.environ.get("COMMIT_MESSAGE", "")
@@ -755,6 +892,9 @@ def main() -> int:
         if not pr_number:
             print("No PR number found — nothing to comment on.", file=sys.stderr)
             return 0
+        if not pr_number.isdigit():
+            print(f"Resolved PR number {pr_number!r} is not a positive integer", file=sys.stderr)
+            return 1
         print(f"Resolved PR #{pr_number} from commit {commit_sha[:7]}")
 
     commit_url = os.environ.get("COMMIT_URL", "")
@@ -788,6 +928,7 @@ def main() -> int:
         timeout=args.timeout,
         dry_run=args.dry_run,
         watch_workflows=watch_workflows,
+        expected_bot_login=expected_bot_login,
     )
 
 
