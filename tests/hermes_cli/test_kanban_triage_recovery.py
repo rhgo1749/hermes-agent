@@ -236,6 +236,30 @@ def test_needs_input_cas_rejects_active_claim_without_mutation(kanban_home):
         assert _snapshot(conn, evidence["task_id"]) == before
 
 
+@pytest.mark.parametrize("block_kind", ["capability", "needs_input"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("claim_expires", 2_000_000_000), ("worker_pid", 4242)],
+)
+def test_triage_cas_rejects_unreaped_run_ownership_without_mutation(
+    kanban_home, block_kind, field, value,
+):
+    with kbc.connect_closing(board="default") as conn:
+        evidence = _looped_task(conn, block_kind=block_kind)
+        if block_kind == "needs_input":
+            evidence["resolution"] = "Maintainer authorized bounded rework."
+        conn.execute(
+            f"UPDATE task_runs SET {field}=? WHERE id=?",
+            (value, evidence["run_id"]),
+        )
+        before = _snapshot(conn, evidence["task_id"])
+
+        ok, reason = _recover(conn, evidence)
+
+        assert ok is False and isinstance(reason, str)
+        assert _snapshot(conn, evidence["task_id"]) == before
+
+
 def test_triage_cas_rejects_block_kind_mismatch_without_mutation(kanban_home):
     with kbc.connect_closing(board="default") as conn:
         evidence = _looped_task(conn, block_kind="needs_input")
@@ -428,7 +452,13 @@ def test_recovery_cli_requires_explicit_board_and_event_bound_arguments():
 
 
 @pytest.mark.parametrize("block_kind", ["capability", "needs_input"])
-def test_recovery_cli_rejects_worker_context_before_cas(kanban_home, monkeypatch, block_kind):
+@pytest.mark.parametrize(
+    "context_env",
+    ["HERMES_KANBAN_TASK", "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_CRON_SESSION"],
+)
+def test_recovery_cli_rejects_non_operator_context_before_cas(
+    kanban_home, monkeypatch, block_kind, context_env,
+):
     with kbc.connect_closing() as conn:
         evidence = _looped_task(conn, block_kind=block_kind)
         before = _snapshot(conn, evidence["task_id"])
@@ -444,7 +474,7 @@ def test_recovery_cli_rejects_worker_context_before_cas(kanban_home, monkeypatch
         expected_landing_status="ready", reason="operator approved",
         resolution=resolution, json=True,
     )
-    monkeypatch.setenv("HERMES_KANBAN_TASK", evidence["task_id"])
+    monkeypatch.setenv(context_env, "1")
     assert kanban_cli._cmd_recover_triage(args) != 0
     with kbc.connect_closing() as conn:
         assert _snapshot(conn, evidence["task_id"]) == before

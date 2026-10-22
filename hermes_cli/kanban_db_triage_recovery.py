@@ -196,13 +196,16 @@ def recover_triage_task(
                 or latest_run["status"] != "blocked"
                 or latest_run["outcome"] != "blocked"):
             return False, "latest_ended_run_changed"
+        # Ended runs retain claim_lock for provenance; a lease expiry or PID
+        # still present means Core's terminal-worker reaper has not finished.
         active_run = conn.execute(
-            "SELECT 1 FROM task_runs WHERE task_id = ? "
-            "AND (ended_at IS NULL OR status = 'running') LIMIT 1",
+            "SELECT 1 FROM task_runs WHERE task_id = ? AND ("
+            "ended_at IS NULL OR status = 'running' OR claim_expires IS NOT NULL "
+            "OR worker_pid IS NOT NULL) LIMIT 1",
             (task_id,),
         ).fetchone()
         if active_run is not None:
-            return False, "active_run_present"
+            return False, "active_run_or_unreaped_worker_present"
 
         landing_status = kb._landing_status_after_parents(conn, task_id)
         if landing_status != expected_landing_status:
