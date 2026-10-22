@@ -188,6 +188,10 @@ def test_needs_input_triage_requires_and_audits_explicit_resolution(kanban_home)
         assert after["comments"] == before["comments"]
         assert after["links"] == before["links"]
 
+        ok, reason = _recover(conn, evidence)
+        assert ok is False and isinstance(reason, str)
+        assert _snapshot(conn, evidence["task_id"]) == after
+
 
 @pytest.mark.parametrize("resolution", [None, "", "   "])
 def test_needs_input_triage_refuses_missing_resolution_without_mutation(kanban_home, resolution):
