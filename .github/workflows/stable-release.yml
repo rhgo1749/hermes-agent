@@ -70,11 +70,11 @@ jobs:
     name: Full CI pipeline
     needs: admit
     if: fromJSON(needs.admit.outputs.jobs)['ci']
+    # The CI call reads repository contents and Actions run metadata only.
+    # No comment, code-scanning, or deployment write permission crosses this boundary.
     permissions:
       contents: read
-      pull-requests: write
       actions: read
-      security-events: write
     uses: ./.github/workflows/ci.yaml
     with:
       commit: ${{ needs.admit.outputs.commit }}
