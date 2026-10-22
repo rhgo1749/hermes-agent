@@ -47,8 +47,9 @@ on:
         description: JSON array of review status objects for the review comment assembler.
         value: ${{ jobs.aggregate.outputs.review_status }}
 
+# This workflow emits review-status artifacts. The trusted
+# ci-review-comment.yml workflow owns the PR comment write.
 permissions:
-  pull-requests: write
   contents: read
 
 jobs:
@@ -65,11 +66,10 @@ jobs:
         with:
           ref: ${{ inputs.commit }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Scan diff for critical patterns
         id: scan
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -169,6 +169,7 @@ jobs:
         with:
           ref: ${{ inputs.commit }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Check for unbounded PyPI deps
         id: bounds
