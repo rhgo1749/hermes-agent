@@ -119,6 +119,74 @@ def test_server_declaration_joins_mcp_and_preserves_liveness(tmp_path: Path) -> 
     assert server.liveness == {"kind": "static"}
 
 
+def test_server_declaration_accepts_upstream_cost_keys(tmp_path: Path) -> None:
+    # Upstream contract (4baddd2606): costs/spend_limit/cost_unit are server
+    # declaration keys, translated into native tool-cost config on load.
+    _write_json(
+        tmp_path / "plugin.json",
+        _manifest(extensions={
+            "com.nousresearch.hermes": {"servers": {"worker": {
+                "requires": {"app": False},
+                "costs": {"fetch": [1, 4]},
+                "spend_limit": 100,
+                "cost_unit": "credits",
+            }}}
+        }),
+    )
+    _write_json(
+        tmp_path / "mcp.json",
+        {"$schema": MCP_SCHEMA_V1, "mcpServers": {"worker": {"type": "stdio", "command": "python"}}},
+    )
+
+    package = load_agent_plugin(tmp_path, tmp_path / "data")
+
+    server = package.mcp_servers["worker"]
+    assert server["spend_limit"] == 100
+    assert server["cost_unit"] == "credits"
+    assert "fetch" in server["tool_costs"]
+
+
+def test_policy_only_cost_declaration_needs_no_application(tmp_path: Path) -> None:
+    _write_json(
+        tmp_path / "plugin.json",
+        _manifest(extensions={
+            "com.nousresearch.hermes": {"servers": {"worker": {
+                "trust": "full",
+                "costs": {"fetch": 2},
+                "cost_unit": "credits",
+            }}}
+        }),
+    )
+    _write_json(
+        tmp_path / "mcp.json",
+        {"$schema": MCP_SCHEMA_V1, "mcpServers": {"worker": {"type": "stdio", "command": "python"}}},
+    )
+
+    package = load_agent_plugin(tmp_path, tmp_path / "data")
+
+    assert "worker" not in package.server_declarations
+    assert package.mcp_servers["worker"]["cost_unit"] == "credits"
+
+
+def test_malformed_costs_disables_package(tmp_path: Path) -> None:
+    _write_json(
+        tmp_path / "plugin.json",
+        _manifest(extensions={
+            "com.nousresearch.hermes": {"servers": {"worker": {
+                "requires": {"app": False},
+                "costs": {"fetch": "two dollars"},
+            }}}
+        }),
+    )
+    _write_json(
+        tmp_path / "mcp.json",
+        {"$schema": MCP_SCHEMA_V1, "mcpServers": {"worker": {"type": "stdio", "command": "python"}}},
+    )
+
+    with pytest.raises(AgentPluginError, match="cost of 'fetch'"):
+        load_agent_plugin(tmp_path, tmp_path / "data")
+
+
 def test_orphan_server_declaration_disables_package(tmp_path: Path) -> None:
     _write_json(
         tmp_path / "plugin.json",
