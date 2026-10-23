@@ -12,9 +12,13 @@ from tools.process_registry_notifications import (
 from tui_gateway import server
 
 def _registry(events):
+    by_session = {event.get("session_id"): event for event in events}
     return SimpleNamespace(
         drain_notifications=lambda **kw: [(e, format_process_notification(e)) for e in events],
-        completion_queue=queue.Queue(), is_completion_consumed=lambda sid: False)
+        completion_queue=queue.Queue(), is_completion_consumed=lambda sid: False,
+        get=lambda sid: SimpleNamespace(
+            _lock=threading.RLock(), exited=False,
+            started_at=by_session.get(sid, {}).get("started_at")))
 
 def _event(sid, exit_code, command="cd /tmp && bash long-build.sh"):
     return {"type": "completion", "session_id": sid, "session_key": "display-session", "command": command,
@@ -64,7 +68,8 @@ def test_heartbeat_wake_paints_one_line_and_persists_hidden(monkeypatch):
     """The model gets the output delta; the human gets a one-line receipt, and the persisted row is
     typed ``hidden`` so Desktop/TUI never paint the wake as a user bubble."""
     from tools.process_registry_notifications import HEARTBEAT_DISPLAY_KIND, heartbeat_display_text
-    beat = {**_event("proc_hb", None), "type": "heartbeat", "seq": 3, "elapsed": 422, "interval": 60,
+    beat = {**_event("proc_hb", None), "type": "heartbeat", "started_at": 61.0,
+            "seq": 3, "elapsed": 422, "interval": 60,
             "output": "web tsc=0\nSECRET_OUTPUT_LINE"}
     cli = HermesCLI.__new__(HermesCLI)
     cli.session_id = "display-session"
@@ -78,6 +83,46 @@ def test_heartbeat_wake_paints_one_line_and_persists_hidden(monkeypatch):
     assert queued.display_kind == HEARTBEAT_DISPLAY_KIND == "hidden"
     assert queued.display_text == heartbeat_display_text(beat)
     assert "SECRET_OUTPUT_LINE" not in queued.display_text and "long-build.sh" in queued.display_text
+
+
+def test_cli_drops_stale_heartbeat_for_finished_process(monkeypatch):
+    from tools.process_registry import ProcessRegistry, ProcessSession
+
+    registry = ProcessRegistry()
+    process = ProcessSession(
+        id="proc_cli_finished",
+        command="build-and-verify",
+        task_id="session-task",
+        started_at=60.0,
+        exited=True,
+        exit_code=0,
+    )
+    registry._finished[process.id] = process
+    event = {
+        "type": "heartbeat",
+        "session_id": process.id,
+        "session_key": "display-session",
+        "started_at": process.started_at,
+        "seq": 1,
+        "command": process.command,
+        "output": "verified\n",
+    }
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = "display-session"
+    cli._pending_input = queue.Queue()
+    monkeypatch.setattr("tools.process_registry.process_registry", registry)
+    monkeypatch.setattr("tools.async_delegation.claim_event_delivery", lambda *args: "claimed")
+    monkeypatch.setattr("tools.async_delegation.complete_event_delivery", lambda *args: None)
+    monkeypatch.setattr("cli.CLI_CONFIG", {"display": {"background_process_notifications": "concise"}})
+    monkeypatch.setattr(
+        registry,
+        "drain_notifications",
+        lambda **_kwargs: [(event, format_process_notification(event))],
+    )
+
+    cli._drain_process_notifications("cli-idle")
+
+    assert cli._pending_input.empty()
 
 def test_process_completion_display_keeps_payload_separate_across_surfaces(monkeypatch, capsys, tmp_path):
     events = [_event("proc_1", 0)]

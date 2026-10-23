@@ -38,12 +38,14 @@ class CLIProcessNotificationsMixin:
         from tools.async_delegation import claim_event_delivery, complete_event_delivery
         from tools.process_registry_notifications import (
             HEARTBEAT_DISPLAY_KIND, ProcessNotificationBatch, TimelineNotification, group_process_notifications,
-            heartbeat_display_text)
+            heartbeat_display_text, heartbeat_process_is_current)
 
         claimed = []
         for event, text in process_registry.drain_notifications(
             session_key=getattr(self, "session_id", "") or "", owns_event=self._owns_process_notification,
         ):
+            if not heartbeat_process_is_current(event, process_registry):
+                continue
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
