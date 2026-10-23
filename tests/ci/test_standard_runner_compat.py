@@ -143,7 +143,7 @@ def test_javascript_and_rust_jobs_select_standard_runners_for_the_fork() -> None
     assert upstream_check["if"] == "github.repository == 'NousResearch/hermes-agent'"
     assert upstream_check["run"] == "node .github/scripts/run-workspace-checks.mjs"
     assert fork_check["if"] == "github.repository != 'NousResearch/hermes-agent'"
-    assert fork_check["run"] == "node .github/scripts/run-workspace-checks.mjs --concurrency 2"
+    assert fork_check["run"] == "node .github/scripts/run-workspace-checks.mjs --concurrency 1"
 
     rust = _workflow("rust-tests.yml")["jobs"]["bootstrap-installer"]
     assert _runner(rust["runs-on"], fork) == "ubuntu-latest"

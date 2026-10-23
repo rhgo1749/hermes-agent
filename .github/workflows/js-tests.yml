@@ -95,14 +95,15 @@ jobs:
       # ``check:*`` script needs no change here. An empty list is an error and
       # not an empty run, because an empty run reports green after it checks
       # nothing.
-      # Keep upstream's detected parallelism; the standard-runner fork caps
-      # concurrent checks at 2 after a nested bundle smoke test exceeded 15s at 4.
+      # Keep upstream's detected parallelism; on standard runners, serialize
+      # checks because the 15s bundle smoke and 5s Git probe still timed out at
+      # concurrency 2 while the Desktop UI suite occupied the same 4-core runner.
       - name: Run all workspace checks (upstream)
         if: github.repository == 'NousResearch/hermes-agent'
         run: node .github/scripts/run-workspace-checks.mjs
       - name: Run all workspace checks (standard runner)
         if: github.repository != 'NousResearch/hermes-agent'
-        run: node .github/scripts/run-workspace-checks.mjs --concurrency 2
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency 1
       - name: Check the checkout is clean
         # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
         # leaves an untracked or modified file in the checkout is reported here. Runs only when
