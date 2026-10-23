@@ -30,6 +30,7 @@ from hermes_cli.update_receipt import COMMAND_BOUNDARY_STOP_REASON
 from hermes_constants import get_hermes_home
 import hermes_cli.update_host_obligation as host_obligation
 from gateway import host_rendezvous
+from tests.hermes_cli.test_update_target_identity import _mock_completed_process
 
 pytestmark = pytest.mark.usefixtures("isolated_source_completion")
 
@@ -41,15 +42,15 @@ def _make_up_to_date_side_effect(sha="abc123"):
         joined = " ".join(str(c) for c in cmd)
 
         if "rev-parse" in joined and "--abbrev-ref" in joined:
-            return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+            return _mock_completed_process(cmd, stdout="main\n", **kwargs)
 
         if "rev-list" in joined:
-            return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
+            return _mock_completed_process(cmd, stdout="0\n", **kwargs)
 
         if joined.endswith("rev-parse HEAD"):
-            return SimpleNamespace(returncode=0, stdout=f"{sha}\n", stderr="")
+            return _mock_completed_process(cmd, stdout=f"{sha}\n", **kwargs)
 
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return _mock_completed_process(cmd, **kwargs)
 
     return side_effect
 
@@ -69,18 +70,18 @@ def _make_head_moved_side_effect(pre_sha=PRE_SHA, post_sha=POST_SHA):
         if "merge --ff-only" in joined:
             advanced = True
         if "rev-parse" in joined and "--abbrev-ref" in joined:
-            return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+            return _mock_completed_process(cmd, stdout="main\n", **kwargs)
 
         if "rev-list" in joined:
-            return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
+            return _mock_completed_process(cmd, stdout="3\n", **kwargs)
 
         if "rev-parse -q --verify" in joined:  # the pull's resolved target
-            return SimpleNamespace(returncode=0, stdout=f"{post_sha}\n", stderr="")
+            return _mock_completed_process(cmd, stdout=f"{post_sha}\n", **kwargs)
 
         if joined.endswith("rev-parse HEAD"):
-            return SimpleNamespace(returncode=0, stdout=f"{post_sha if advanced else pre_sha}\n", stderr="")
+            return _mock_completed_process(cmd, stdout=f"{post_sha if advanced else pre_sha}\n", **kwargs)
 
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return _mock_completed_process(cmd, **kwargs)
 
     return side_effect
 
