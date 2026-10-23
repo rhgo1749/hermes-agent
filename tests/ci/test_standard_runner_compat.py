@@ -123,10 +123,27 @@ def test_os_standard_runners_preserve_markers_arm64_and_zero_test_guard() -> Non
     }
 
 
+def test_javascript_and_rust_jobs_select_standard_runners_for_the_fork() -> None:
+    upstream = "NousResearch/hermes-agent"
+    fork = "rhgo1749/hermes-agent"
+
+    js = _workflow("js-tests.yml")["jobs"]["check"]
+    assert _runner(js["runs-on"], fork) == "ubuntu-latest"
+    assert _runner(js["runs-on"], upstream) == "ubuntu-latest-32-core"
+    assert gha.render(js["timeout-minutes"], {"github": {"repository": fork}}) == 45
+    assert gha.render(js["timeout-minutes"], {"github": {"repository": upstream}}) == 30
+
+    rust = _workflow("rust-tests.yml")["jobs"]["bootstrap-installer"]
+    assert _runner(rust["runs-on"], fork) == "ubuntu-latest"
+    assert _runner(rust["runs-on"], upstream) == "ubuntu-latest-32-core"
+
+
 def test_ci_aggregate_name_and_permission_contract_are_unchanged() -> None:
     ci = _workflow("ci.yaml")
     aggregate = ci["jobs"]["all-checks-pass"]
 
     assert aggregate["name"] == "All required checks pass (v2)"
+    assert "js-tests" in aggregate["needs"]
+    assert "rust-tests" in aggregate["needs"]
     assert ci["permissions"] == {"contents": "read"}
     assert aggregate["permissions"] == {"contents": "read"}
