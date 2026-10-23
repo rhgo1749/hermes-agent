@@ -12,7 +12,8 @@ name: OS-specific tests
 # is where those markers actually execute:
 #
 #   macos    → ``-m platforms``    on macos-latest
-#   windows  → ``-m platforms``    on windows-latest-32-core and windows-latest-32-arm-core
+#   windows  → ``-m platforms``    on standard labels in this fork;
+#                                      upstream retains its larger-runner labels
 #
 # (tests/conftest.py's ``pytest_collection_modifyitems`` hook skips
 # foreign-OS ``platforms(...)`` markers on each host, so one shared ``-m
@@ -93,10 +94,10 @@ jobs:
             marker: macos
             slice: 2/2
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-core' || 'windows-latest' }}
             marker: windows
           - name: Windows-only tests (arm64)
-            runner: windows-latest-32-arm-core
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-arm-core' || 'windows-11-arm' }}
             marker: windows
             timeout: 60
     steps:
@@ -191,9 +192,9 @@ jobs:
             -m "platforms and not integration" \
             -v --tb=short
         env:
-          # These files spawn nested PowerShell trees. CPU-count parallelism
-          # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '16' || '16') || '' }}
+          # These files spawn nested PowerShell trees; cap concurrency at the
+          # standard runner's four CPUs to protect cold child startup deadlines.
+          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (github.repository == 'NousResearch/hermes-agent' && '16' || '4') || '' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
@@ -235,10 +236,9 @@ jobs:
     # xfails (per-file KNOWN tables), so a fix turns this job red until the entry goes.
     name: Windows E2E (real processes)
     if: inputs.e2e
-    # 32-core like os-tests' Windows row: seven files run in parallel and each spawns
-    # process trees; on the 4-vCPU image the suite step took 153-171 s (job 4.7-5.6 min),
-    # here 124 s (job 3.1 min), with headroom against scheduling-starved timeouts.
-    runs-on: windows-latest-32-core
+    # Use the standard 4-vCPU Windows runner; retain the complete real-process suite
+    # and bound its worker count to available CPU resources.
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-core' || 'windows-latest' }}
     timeout-minutes: 25
     steps:
       - name: Checkout code
@@ -261,7 +261,7 @@ jobs:
             -m "platforms and integration" -v --tb=short -rA
         env:
           HERMES_E2E_STRICT_ACCEPTANCE: ${{ inputs.strict_acceptance }}
-          HERMES_TEST_WORKERS: '6'
+          HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && '6' || '4' }}
           HERMES_TEST_FILE_TIMEOUT: '900'
           HERMES_TEST_FILE_RETRIES: '0'
           OPENROUTER_API_KEY: ''
