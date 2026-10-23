@@ -132,6 +132,19 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     return (evt.get("session_id", ""), evt_type, *(evt.get(f, 0 if f == "suppressed" else "") for f in extra))
 
 
+def _notification_turn_key(evt: dict) -> tuple | None:
+    """Stable process-event identity; watch matches may legitimately repeat identical output."""
+    evt_type = evt.get("type", "completion")
+    session_id = str(evt.get("session_id") or "")
+    if not session_id:
+        return None
+    if evt_type == "completion":
+        return evt_type, session_id, evt.get("started_at")
+    if evt_type == "heartbeat" and evt.get("seq") is not None:
+        return evt_type, session_id, evt.get("started_at"), evt["seq"]
+    return None
+
+
 # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds (archived/unblocked) too so the cursor advances
 # past them and they can't wedge a later completed/blocked event behind an unclaimed row.
 _KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
@@ -489,7 +502,7 @@ def _background_notifications_off(session: dict) -> bool:
     return raw is False or str(raw or "").strip().lower() == "off"
 
 
-def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None:
+def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool:
     """Run the claimed (running=True) agent turn for one notification event."""
     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
     try:
@@ -502,7 +515,7 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
         # the target. No turn will run, and nothing else clears ``running``: a busy session is exempt
         # from the reaper, keeps its lease, and never reaches its bot mailbox again.
         _notif_release_turn(session)
-        return
+        return False
     evt_type = evt.get("type")
     kwargs: dict = {}
     if evt_type == "async_delegation":
@@ -520,8 +533,9 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
         _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
     except Exception:
         release_event_delivery(evt, claim)
-        return
+        return False
     complete_event_delivery(evt, claim)
+    return True
 
 
 def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, completions=None, *, owned=False) -> bool:
@@ -556,6 +570,14 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
         else:
             logger.debug("Dropping unowned %s notification during shutdown drain (origin=%r key=%r)", evt_type, origin, key)
         return True
+    if evt_type == "heartbeat" and callable(getattr(registry, "get", None)):
+        from tools.process_registry_notifications import heartbeat_process_is_current
+        if not heartbeat_process_is_current(evt, registry):
+            return True
+    turn_key = _notification_turn_key(evt)
+    turn_delivered = session.setdefault("_notification_turn_delivered", set())
+    if turn_key is not None and turn_key in turn_delivered:
+        return True
     if evt_type == "completion" and registry.is_completion_consumed(evt.get("session_id", "")):
         return True
     text = fmt(evt)
@@ -586,7 +608,8 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
             return False
         time.sleep(0.25)  # back off: the re-queued event keeps the queue non-empty, else this loop spins at 100% CPU
         return True
-    _notif_dispatch_event(sid, session, evt, text)
+    if _notif_dispatch_event(sid, session, evt, text) and turn_key is not None:
+        turn_delivered.add(turn_key)
     return True
 
 
@@ -594,6 +617,19 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
     from tools.process_registry_notifications import PROCESS_COMPLETE_DISPLAY_KIND, ProcessNotificationBatch
     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
 
+    if not notifications:
+        return
+    turn_delivered = session.setdefault("_notification_turn_delivered", set())
+    unique_notifications = []
+    seen = set()
+    for event, event_text in notifications:
+        turn_key = _notification_turn_key(event)
+        if turn_key is not None and (turn_key in turn_delivered or turn_key in seen):
+            continue
+        if turn_key is not None:
+            seen.add(turn_key)
+        unique_notifications.append((event, event_text))
+    notifications = unique_notifications
     if not notifications:
         return
     if not _notif_claim_turn(session):
@@ -626,6 +662,10 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
         for event, _text, claim in claimed:
             release_event_delivery(event, claim)
         return
+    if text is not None:
+        turn_delivered.update(
+            key for event, _text, _claim in claimed if (key := _notification_turn_key(event)) is not None
+        )
     for event, _text, claim in claimed:
         complete_event_delivery(event, claim)
 

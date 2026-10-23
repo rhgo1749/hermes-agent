@@ -997,16 +997,14 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
         The queue is ALWAYS drained (so watch events don't rot or requeue-spin) but injection is
         skipped when the OWNING profile's ``display.background_process_notifications`` is ``off``
         — one shared queue carries every served profile's events, so the gate is evaluated per
-        event inside its profile scope, never once for the ambient (launch) profile.
-
-        See #9290.
+        event inside its profile scope, never once for the ambient (launch) profile; stale heartbeats are dropped (#9290).
         """
         from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
         watch_events = _drain_gateway_watch_events(completion_queue)
         for evt in watch_events:
             async with self._completion_event_scope(evt):
-                from tools.process_registry_notifications import should_surface_notification
-                if not should_surface_notification(evt):
+                from tools.process_registry_notifications import heartbeat_process_is_current, should_surface_notification
+                if not should_surface_notification(evt) or not heartbeat_process_is_current(evt):
                     continue
                 if self._load_background_notifications_mode() == "off":
                     continue
