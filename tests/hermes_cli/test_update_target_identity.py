@@ -23,6 +23,22 @@ def git(root, *args):
                           text=True, encoding='utf-8').stdout.strip()
 
 
+def _effective_git_cwd(command, kwargs):
+    cwd = kwargs.get('cwd')
+    if cwd is None and len(command) >= 3 and str(command[1]) == '-C':
+        cwd = command[2]
+    return Path(cwd or Path.cwd()).resolve()
+
+
+def _mock_completed_process(command, *, returncode=0, stdout='', stderr='', **kwargs):
+    text_mode = (kwargs.get('text') or kwargs.get('universal_newlines')
+                 or kwargs.get('encoding') is not None or kwargs.get('errors') is not None)
+    if not text_mode:
+        stdout = stdout.encode('utf-8') if isinstance(stdout, str) else stdout
+        stderr = stderr.encode('utf-8') if isinstance(stderr, str) else stderr
+    return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+
 @pytest.fixture
 def update_tree(tmp_path, monkeypatch):
     monkeypatch.setenv('GIT_CONFIG_GLOBAL', str(tmp_path / 'git-config'))
@@ -139,7 +155,7 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
 
     def fault(command, *args, **kwargs):
         assert Path(command[0]).name.lower() in {'git', 'git.exe'} or command[0] == sys.executable, command
-        assert Path(kwargs['cwd']).resolve() in {t.clone, t.origin}, command
+        assert _effective_git_cwd(command, kwargs) in {t.clone, t.origin}, (command, kwargs.get('cwd'))
         # The upstream sync's tree move (`pull upstream main` on older updaters, a local merge of
         # the commit resolved from `refs/remotes/upstream/main` now, m2) vs the origin fast-forward.
         upstream_move = ('pull' in command or 'merge' in command) and (
@@ -233,8 +249,8 @@ def test_stable_git_uses_remote_identity_without_moving_local_tags(update_tree, 
     def guarded_run(command, *args, **kwargs):
         command = list(map(str, command))
         assert Path(command[0]).name.lower() in {'git', 'git.exe'}, command
-        cwd = Path(kwargs.get('cwd', os.getcwd())).resolve()
-        assert cwd in {t.clone, t.origin}, (command, cwd)
+        cwd = _effective_git_cwd(command, kwargs)
+        assert cwd in {t.clone, t.origin}, (command, kwargs.get('cwd'))
         assert 'push' not in command and 'pull' not in command and 'ls-remote' not in command, command
         calls.append(command)
         if 'fetch' in command and t.wanted in command and server == 'fetch-refused':
@@ -326,8 +342,8 @@ def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, 
         nonlocal fetched, failed
         command = list(map(str, command))
         assert Path(command[0]).name.lower() in {'git', 'git.exe'}, command
-        cwd = Path(kwargs.get('cwd', os.getcwd())).resolve()
-        assert cwd in {t.clone, t.origin}, (command, cwd)
+        cwd = _effective_git_cwd(command, kwargs)
+        assert cwd in {t.clone, t.origin}, (command, kwargs.get('cwd'))
         assert 'push' not in command and 'pull' not in command, command
         git_calls.append(command)
         if transport == 'no-git':

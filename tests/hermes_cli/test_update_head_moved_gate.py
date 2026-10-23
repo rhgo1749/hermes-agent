@@ -17,6 +17,7 @@ from hermes_cli import main as hermes_main
 from hermes_cli import main_web_build
 from hermes_cli import main_install_repair
 from hermes_cli import update_cmd
+from tests.hermes_cli.test_update_target_identity import _mock_completed_process
 
 def _make_head_pinned_side_effect(sha="abc123"):
     """Simulate a detached checkout pinned to ``sha``: HEAD never moves."""
@@ -25,15 +26,15 @@ def _make_head_pinned_side_effect(sha="abc123"):
         joined = " ".join(str(c) for c in cmd)
 
         if "rev-parse" in joined and "--abbrev-ref" in joined:
-            return SimpleNamespace(returncode=0, stdout="HEAD\n", stderr="")
+            return _mock_completed_process(cmd, stdout="HEAD\n", **kwargs)
 
         if "rev-list" in joined:
-            return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
+            return _mock_completed_process(cmd, stdout="3\n", **kwargs)
 
         if joined.endswith("rev-parse HEAD"):
-            return SimpleNamespace(returncode=0, stdout=f"{sha}\n", stderr="")
+            return _mock_completed_process(cmd, stdout=f"{sha}\n", **kwargs)
 
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return _mock_completed_process(cmd, **kwargs)
 
     return side_effect
 
