@@ -140,20 +140,23 @@ class TestCommandCodeFetchModelsPickerContract:
     """
 
 
-    def test_resolve_provider_full(self):
-        """Both profiles must resolve through the model-switch path.
+    def test_resolve_provider_full(self, commandcode_profile):
+        """Both profiles resolve through the model-switch path without conflating key sources.
 
-        Regression: ``resolve_provider_full`` only knew models.dev + overlay
-        providers, so plugin-only providers (commandcode) failed with
-        "Unknown provider" on /model switches even though the picker listed
-        them.
+        CommandCode now also has a models.dev row, which the resolver prefers
+        over a bundled profile. That row supplies its own key alias; the
+        profile's ``COMMANDCODE_API_KEY`` remains a separate auth-registry
+        contract (checked here and by ``test_provider_registry``).
         """
+        from hermes_cli.auth import PROVIDER_REGISTRY
         from hermes_cli.providers import resolve_provider_full
 
         chat = resolve_provider_full("commandcode", {}, [])
         assert chat is not None and chat.id == "commandcode"
         assert chat.transport == "openai_chat"
-        assert "COMMANDCODE_API_KEY" in chat.api_key_env_vars
+        assert chat.api_key_env_vars
+        assert "COMMANDCODE_API_KEY" in commandcode_profile.env_vars
+        assert "COMMANDCODE_API_KEY" in PROVIDER_REGISTRY["commandcode"].api_key_env_vars
 
         anth = resolve_provider_full("commandcode-anthropic", {}, [])
         assert anth is not None and anth.id == "commandcode-anthropic"
