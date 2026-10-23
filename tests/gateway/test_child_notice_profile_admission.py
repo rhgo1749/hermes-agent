@@ -156,11 +156,14 @@ async def _for_each_leg(rig, owner, surface_a, path, consume):
 def _consumer_event(rig, leg, owner, path):
     if owner == "live_handoff":
         _transfer_to_parent(rig, leg)
-    return {
+    event = {
         **leg.watcher, "type": path, "owner_task_id": leg.proc.owner_task_id, "task_id": leg.proc.task_id,
         "pattern": "READY", "command": "build", "output": "READY\n",
-        "elapsed_seconds": 10, "heartbeat_seq": 1,
+        "elapsed_seconds": 10,
     }
+    if path == "heartbeat":
+        event.update(started_at=leg.proc.started_at, seq=1, interval=60, elapsed=10)
+    return event
 
 
 @pytest.mark.asyncio
