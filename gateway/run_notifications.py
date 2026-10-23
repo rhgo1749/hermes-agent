@@ -25,6 +25,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
 from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin
+from gateway.run_notifications_process_admission import GatewayProcessNotificationAdmissionMixin
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -123,7 +124,7 @@ def _raw_process_event_session_id(evt: dict) -> str:
     return str(evt.get("origin_session_id") or session_key or "").strip()
 
 
-class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
+class GatewayNotificationsMixin(GatewayProcessNotificationAdmissionMixin, GatewayNotificationOwnershipMixin):
     """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner."""
 
     # Coalescing keys: process completions (short-window fan-in) and async delegations (+ parent session).
@@ -991,34 +992,6 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             user_id=_opt("user_id"), user_name=_opt("user_name"), scope_id=scope_id, profile=profile,
         )
 
-    async def _drain_watch_notifications(self, completion_queue) -> None:
-        """Consume queued watch events and inject them when notifications are enabled.
-
-        The queue is ALWAYS drained (so watch events don't rot or requeue-spin) but injection is
-        skipped when the OWNING profile's ``display.background_process_notifications`` is ``off``
-        — one shared queue carries every served profile's events, so the gate is evaluated per
-        event inside its profile scope, never once for the ambient (launch) profile; stale heartbeats are dropped (#9290).
-        """
-        from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
-        watch_events = _drain_gateway_watch_events(completion_queue)
-        for evt in watch_events:
-            async with self._completion_event_scope(evt):
-                from tools.process_registry_notifications import heartbeat_process_is_current, should_surface_notification
-                if not should_surface_notification(evt) or not heartbeat_process_is_current(evt):
-                    continue
-                if self._load_background_notifications_mode() == "off":
-                    continue
-                synth_text = _format_gateway_process_notification(evt)
-                if not synth_text:
-                    continue
-                try:
-                    delivered = await self._inject_watch_notification(synth_text, evt)
-                except Exception:
-                    logger.exception("Watch notification injection error")
-                    delivered = False
-            if delivered is False:
-                completion_queue.put(evt)
-
     def _adapter_by_platform_value(self, platform_name: str):
         """Literal ``p.value == platform_name`` scan over connected adapters (native adapters only)."""
         for p, a in self.adapters.items():
@@ -1026,7 +999,7 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                 return a
         return None
 
-    async def _self_post_api_server(self, adapter, synth_text: str, raw_sid: str, evt: dict) -> bool:
+    async def _self_post_api_server(self, adapter, synth_text: str, raw_sid: str, evt: dict) -> Optional[bool]:
         """Deliver to a non-push (api_server) session by raw session id.
 
         Async-delegation completions are persisted as a durable delivery row — after the parent
@@ -1048,6 +1021,10 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             except LookupError as e:
                 logger.warning(fail, raw_sid, e)
                 return False
+            if evt.get("type") == "heartbeat":
+                from tools.process_registry_notifications import heartbeat_process_is_current
+                if not heartbeat_process_is_current(evt):
+                    return None
             if served:
                 # The wake runs in the OWNING profile's scope, in-process (see ``deliver_wake``):
                 # the raw event carries no profile, so a completion scope was never installed.
@@ -1121,6 +1098,10 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
         """
         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
         source = await asyncio.to_thread(self._build_process_event_source, evt)
+        if evt.get("type") == "heartbeat":
+            from tools.process_registry_notifications import heartbeat_process_is_current
+            if not heartbeat_process_is_current(evt):
+                return None
         if not source:
             # API-server sessions bind the RAW X-Hermes-Session-Id key, not a structured ``agent:...`` key.
             raw_sid = _raw_process_event_session_id(evt)
@@ -1478,7 +1459,7 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             completion_ids = [claim.delegation_id] if claim.claim_id else []
             completion_ids += [sibling["delegation_id"] for sibling, claim_id in sibling_claims if claim_id]
             evt = {**evt, "completion_ids": completion_ids}
-            injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
+            injection_result = await self._admit_process_notification(synth_text, evt, raise_not_accepted=True)
             if injection_result is not True:
                 return injection_result
             accepted = True
