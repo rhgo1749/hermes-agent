@@ -93,13 +93,19 @@ def test_os_standard_runners_preserve_markers_arm64_and_zero_test_guard() -> Non
     assert _runner(arm64["runner"], fork) == "windows-11-arm"
     assert _runner(arm64["runner"], upstream) == "windows-latest-32-arm-core"
     assert x64["marker"] == arm64["marker"] == "windows"
+    os_timeout = jobs["os-tests"]["timeout-minutes"]
+    assert gha.render(os_timeout, {"github": {"repository": fork}, "matrix": {"name": "Windows-only tests"}}) == 60
+    assert gha.render(os_timeout, {"github": {"repository": upstream}, "matrix": {"name": "Windows-only tests"}}) == 30
     assert arm64["timeout"] == 60
 
     os_step = _step(jobs["os-tests"], "Run ${{ matrix.marker }} tests")
     workers = os_step["env"]["HERMES_TEST_WORKERS"]
     matrix_ctx = {"matrix": {"marker": "windows"}}
-    assert gha.render(workers, {**matrix_ctx, "github": {"repository": fork}}) == "4"
+    assert gha.render(workers, {**matrix_ctx, "github": {"repository": fork}}) == "2"
     assert gha.render(workers, {**matrix_ctx, "github": {"repository": upstream}}) == "16"
+    file_timeout = os_step["env"]["HERMES_TEST_FILE_TIMEOUT"]
+    assert gha.render(file_timeout, {**matrix_ctx, "github": {"repository": fork}}) == "600"
+    assert gha.render(file_timeout, {**matrix_ctx, "github": {"repository": upstream}}) == "300"
     command = os_step["run"]
     assert "scripts/ci/list_os_marked_tests.py" in command
     assert 'if [ ! -s "$LIST" ]; then' in command
@@ -132,6 +138,12 @@ def test_javascript_and_rust_jobs_select_standard_runners_for_the_fork() -> None
     assert _runner(js["runs-on"], upstream) == "ubuntu-latest-32-core"
     assert gha.render(js["timeout-minutes"], {"github": {"repository": fork}}) == 45
     assert gha.render(js["timeout-minutes"], {"github": {"repository": upstream}}) == 30
+    upstream_check = _step(js, "Run all workspace checks (upstream)")
+    fork_check = _step(js, "Run all workspace checks (standard runner)")
+    assert upstream_check["if"] == "github.repository == 'NousResearch/hermes-agent'"
+    assert upstream_check["run"] == "node .github/scripts/run-workspace-checks.mjs"
+    assert fork_check["if"] == "github.repository != 'NousResearch/hermes-agent'"
+    assert fork_check["run"] == "node .github/scripts/run-workspace-checks.mjs --concurrency 2"
 
     rust = _workflow("rust-tests.yml")["jobs"]["bootstrap-installer"]
     assert _runner(rust["runs-on"], fork) == "ubuntu-latest"

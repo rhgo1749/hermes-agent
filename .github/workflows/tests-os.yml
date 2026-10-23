@@ -78,7 +78,9 @@ jobs:
   os-tests:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.timeout || 30 }}
+    # The standard-runner Windows unit lane needs bounded headroom for the full
+    # process-heavy suite; upstream keeps its existing 30m x64 limit.
+    timeout-minutes: ${{ matrix.name == 'Windows-only tests' && github.repository != 'NousResearch/hermes-agent' && 60 || matrix.timeout || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -93,6 +95,8 @@ jobs:
             runner: macos-latest
             marker: macos
             slice: 2/2
+          # Standard Windows hit the default 300s per-file cap and a child-process
+          # probe exceeded its 90s deadline under load in run 39902321711.
           - name: Windows-only tests
             runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-core' || 'windows-latest' }}
             marker: windows
@@ -192,9 +196,11 @@ jobs:
             -m "platforms and not integration" \
             -v --tb=short
         env:
-          # These files spawn nested PowerShell trees; cap concurrency at the
-          # standard runner's four CPUs to protect cold child startup deadlines.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (github.repository == 'NousResearch/hermes-agent' && '16' || '4') || '' }}
+          # These files spawn nested PowerShell trees. Standard-runner evidence
+          # showed contention at 4 workers; use 2 and raise only that fork lane's
+          # per-file cap so slow process tests still run to completion.
+          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (github.repository == 'NousResearch/hermes-agent' && '16' || '2') || '' }}
+          HERMES_TEST_FILE_TIMEOUT: ${{ matrix.marker == 'windows' && github.repository != 'NousResearch/hermes-agent' && '600' || '300' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
