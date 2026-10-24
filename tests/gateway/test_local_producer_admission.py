@@ -29,6 +29,30 @@ AUTHOR = {'id': 'bot:alpha', 'name': 'alpha', 'is_bot': True}
 LEGACY_DESKTOP_ID = '20261015_112020_548787'
 
 
+def _install_fake_process_registry(monkeypatch):
+    """Give queued heartbeat fixtures a live process incarnation, as the real producer does."""
+    from tools.process_registry import ProcessSession, process_registry
+
+    sessions = {}
+    monkeypatch.setattr(process_registry, 'get', lambda session_id: sessions.get(session_id))
+
+    def observe(event):
+        session_id = str(event.get('session_id') or '')
+        started_at = event.get('started_at')
+        if not session_id or started_at is None:
+            return
+        session = sessions.get(session_id)
+        if session is None:
+            session = ProcessSession(id=session_id, command=str(event.get('command') or 'test'),
+                                     started_at=started_at)
+            sessions[session_id] = session
+        if event.get('type') == 'completion':
+            with session._lock:
+                session.exited = True
+
+    return observe
+
+
 class _Gateway:
     """Two profiles on one multiplexed gateway, each with its own model; restartable over its homes."""
 
@@ -46,6 +70,7 @@ class _Gateway:
         import hermes_state
         monkeypatch.setattr(hermes_state, 'DEFAULT_DB_PATH', hermes_state._IMPORT_DEFAULT_DB_PATH)
         self.turns, self.gate = [], None
+        self._observe_process = _install_fake_process_registry(monkeypatch)
         self.runner, self.connections = None, []
 
         async def model(runner, message, context_prompt, history, source, session_id, **_kwargs):
@@ -116,8 +141,10 @@ class _Gateway:
     def process_event(self, authority, session_id, kind, process='proc_job', **fields):
         live = authority.sessions[session_id]
         target = self.runner.session_store.lookup_by_session_key(live.route).session_id
-        return {'type': kind, 'session_id': process, 'started_at': 1.0, 'session_key': live.route,
-                'parent_session_id': target, 'command': 'make test', 'output': 'tick', **fields}
+        event = {'type': kind, 'session_id': process, 'started_at': 1.0, 'session_key': live.route,
+                 'parent_session_id': target, 'command': 'make test', 'output': 'tick', **fields}
+        self._observe_process(event)
+        return event
 
     def tick(self, authority, session_id, seq, process='proc_job', output=None):
         return self.process_event(authority, session_id, 'heartbeat', process=process,
@@ -218,6 +245,7 @@ async def messaging(tmp_path, monkeypatch):
     from gateway.session_ingress_context import native_callback, register_transport_home
     from hermes_state import SessionDB
     from plugins.platforms.discord.adapter import DiscordAdapter
+    observe_process = _install_fake_process_registry(monkeypatch)
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setenv('DISCORD_ALLOWED_USERS', '42')
     monkeypatch.setattr(SessionAuthority, '_schedule', lambda self, ref: None)
@@ -236,9 +264,13 @@ async def messaging(tmp_path, monkeypatch):
     route = runner.session_store._generate_session_key(adapter.build_source(**chat))
     owner = authority.logical_owner(runner.session_store.peek_session_id(route))
     try:
-        yield SimpleNamespace(runner=runner, authority=authority, route=route, owner=owner, event=lambda kind, **fields: {
-            'type': kind, 'session_id': 'proc_job', 'started_at': 1.0, 'session_key': route, 'parent_session_id': owner,
-            'platform': 'discord', 'command': 'make test', **chat, **fields})
+        def event(kind, **fields):
+            result = {'type': kind, 'session_id': 'proc_job', 'started_at': 1.0, 'session_key': route,
+                      'parent_session_id': owner, 'platform': 'discord', 'command': 'make test', **chat, **fields}
+            observe_process(result)
+            return result
+
+        yield SimpleNamespace(runner=runner, authority=authority, route=route, owner=owner, event=event)
     finally:
         db.close()
 

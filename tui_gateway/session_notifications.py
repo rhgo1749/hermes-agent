@@ -7,6 +7,8 @@ from __future__ import annotations
 import contextlib
 
 from .method_ctx import bind_module
+from .notification_turns import dedupe_notification_turns as _dedupe_notification_turns
+from .notification_turns import notification_turn_key as _notification_turn_key
 
 
 def _notif_locked_sessions(fn, default):
@@ -551,7 +553,7 @@ def _background_notifications_off(session: dict) -> bool:
     return raw is False or str(raw or "").strip().lower() == "off"
 
 
-def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None:
+def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool:
     """Run the claimed (running=True) agent turn for one notification event."""
     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
     try:
@@ -564,7 +566,7 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
         # the target. No turn will run, and nothing else clears ``running``: a busy session is exempt
         # from the reaper, keeps its lease, and never reaches its bot mailbox again.
         _notif_release_turn(session)
-        return
+        return False
     evt_type = evt.get("type")
     kwargs: dict = {}
     if evt_type == "async_delegation":
@@ -583,11 +585,12 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
                              "notification poller dispatch failed", report_ownership_refusal=False, **kwargs):
             _notif_defer_event(evt, claim)
             _notif_refusal_backoff(session)  # requeued: queue.get(timeout=...) would never wait
-            return
+            return False
     except Exception:
         release_event_delivery(evt, claim)
-        return
+        return False
     complete_event_delivery(evt, claim)
+    return True
 
 
 def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, completions=None, *, owned=False) -> bool:
@@ -622,6 +625,14 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
         else:
             logger.debug("Dropping unowned %s notification during shutdown drain (origin=%r key=%r)", evt_type, origin, key)
         return True
+    if evt_type == "heartbeat" and callable(getattr(registry, "get", None)):
+        from tools.process_registry_notifications import heartbeat_process_is_current
+        if not heartbeat_process_is_current(evt, registry):
+            return True
+    turn_key = _notification_turn_key(evt)
+    turn_delivered = session.setdefault("_notification_turn_delivered", set())
+    if turn_key is not None and turn_key in turn_delivered:
+        return True
     if evt_type == "completion" and registry.is_completion_consumed(evt.get("session_id", "")):
         return True
     text = fmt(evt)
@@ -652,7 +663,8 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
             return False
         time.sleep(0.25)  # back off: the re-queued event keeps the queue non-empty, else this loop spins at 100% CPU
         return True
-    _notif_dispatch_event(sid, session, evt, text)
+    if _notif_dispatch_event(sid, session, evt, text) and turn_key is not None:
+        turn_delivered.add(turn_key)
     return True
 
 
@@ -660,6 +672,7 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
     from tools.process_registry_notifications import PROCESS_COMPLETE_DISPLAY_KIND, ProcessNotificationBatch
     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
 
+    turn_delivered, notifications = _dedupe_notification_turns(session, notifications)
     if not notifications:
         return
     if not _notif_claim_turn(session):
@@ -699,6 +712,10 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
         for event, _text, claim in claimed:
             release_event_delivery(event, claim)
         return
+    if text is not None:
+        turn_delivered.update(
+            key for event, _text, _claim in claimed if (key := _notification_turn_key(event)) is not None
+        )
     for event, _text, claim in claimed:
         complete_event_delivery(event, claim)
 

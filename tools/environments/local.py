@@ -31,6 +31,7 @@ from tools.environments.local_pythonpath import (
 
 
 _IS_WINDOWS = platform.system() == "Windows"
+_SESSION_TOOLCHAIN_PATH_SEED_ENV = "_HERMES_SESSION_TOOLCHAIN_PATH_SEED"
 
 logger = logging.getLogger(__name__)
 
@@ -765,6 +766,15 @@ def _path_env_key(run_env: dict) -> str | None:
     return next((k for k in run_env if k.upper() == "PATH"), None) if _IS_WINDOWS else "PATH"
 
 
+def _restore_session_toolchain_path(command: str) -> str:
+    """Restore the scrubbed session PATH after login startup files have run."""
+    return (
+        f'if [ -n "${{{_SESSION_TOOLCHAIN_PATH_SEED_ENV}-}}" ]; then '
+        f'PATH="${{{_SESSION_TOOLCHAIN_PATH_SEED_ENV}}}${{PATH:+:$PATH}}"; export PATH; fi; '
+        f'unset {_SESSION_TOOLCHAIN_PATH_SEED_ENV}; {command}'
+    )
+
+
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping. The process env is
     the LAUNCH profile's; under a routed home override its ``.env`` residue is dropped first
@@ -1098,14 +1108,19 @@ class LocalEnvironment(BaseEnvironment):
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
+        run_env = _make_run_env(self.env)
         # Login invocations (init_session's env snapshot) source the user's rc /
         # custom init files so nvm/asdf/pyenv land on PATH in the snapshot.
         if login:
+            path_key = _path_env_key(run_env)
+            if path_key is not None and not _IS_WINDOWS:
+                run_env[_SESSION_TOOLCHAIN_PATH_SEED_ENV] = run_env[path_key]
+                cmd_string = _restore_session_toolchain_path(cmd_string)
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
         proc = subprocess.Popen(
-            args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
+            args, text=True, env=run_env, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             start_new_session=True, cwd=self.cwd,

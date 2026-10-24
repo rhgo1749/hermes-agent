@@ -197,6 +197,7 @@ export function ClarifyToolPending({
       clearClarifyRequest(request.requestId, request.sessionId)
     } catch (error) {
       notifyError(error, copy.sendFailed)
+    } finally {
       setSubmitting(false)
     }
   }, [copy, gateway, onAnswered, questions, request, stagedAnswer])

@@ -281,6 +281,10 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
             if policy.model == GUEST_MODEL:
                 # Follows its profile, so the provider the user connects later replaces the trial model.
                 marks[FOLLOW_ADOPTED] = True
+        if not isinstance(policy.model, str) or not policy.model.strip():
+            raise RuntimeStoreError(
+                'invalid_params', field='model',
+                detail='the profile names no model and free inference is available only on local Desktop')
         if marks:
             import json
             policy = replace(policy, config_json=json.dumps({**json.loads(policy.config_json), **marks}))

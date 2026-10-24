@@ -69,6 +69,26 @@ def should_surface_notification(evt: dict, *, surface_child: bool | None = None)
     return surface_child
 
 
+def heartbeat_process_is_current(evt: dict, registry=None) -> bool:
+    """A queued heartbeat is useful only while its exact process incarnation is live."""
+    if evt.get("type") != "heartbeat":
+        return True
+    if registry is None:
+        from tools.process_registry import process_registry
+        registry = process_registry
+    session_id = str(evt.get("session_id") or "")
+    event_started_at = evt.get("started_at")
+    if not session_id or event_started_at is None or evt.get("seq") is None:
+        return False
+    session = registry.get(session_id)
+    if session is None:
+        return False
+    with session._lock:
+        if session.exited:
+            return False
+        return session.started_at is not None and event_started_at == session.started_at
+
+
 def _format_age(seconds: float) -> str:
     """Human-friendly elapsed string ('18m', '2h3m', '45s')."""
     try:

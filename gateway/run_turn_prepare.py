@@ -122,7 +122,7 @@ class GatewayTurnPrepareMixin:
             override_runtime = {
                 k: override.get(k) for k in (
                     "provider", "requested_provider", "api_key", "base_url", "api_mode",
-                    "max_tokens", "credential_pool", "request_overrides", "capabilities",
+                    "command", "args", "max_tokens", "credential_pool", "request_overrides", "capabilities",
                 )
             }
             override_runtime["capabilities"] = dict(override_runtime["capabilities"] or {})

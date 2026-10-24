@@ -25,6 +25,7 @@ from gateway.session import SessionEntry, SessionSource, SessionStore
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
 from gateway.run_notifications_update import GatewayUpdateNotificationsMixin
 from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin
+from gateway.run_notifications_process_admission import GatewayProcessNotificationAdmissionMixin
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -169,7 +170,9 @@ def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
     return metadata
 
 
-class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotificationOwnershipMixin):
+class GatewayNotificationsMixin(
+    GatewayUpdateNotificationsMixin, GatewayNotificationOwnershipMixin, GatewayProcessNotificationAdmissionMixin,
+):
     """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner."""
 
     # Coalescing keys: process completions (short-window fan-in) and async delegations (+ parent session).
@@ -727,20 +730,23 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 completion_queue.put(evt)
                 continue
             async with self._completion_event_scope(evt):
-                from tools.process_registry_notifications import should_surface_notification
-                if not should_surface_notification(evt):
+                from tools.process_registry_notifications import heartbeat_process_is_current, should_surface_notification
+                if not should_surface_notification(evt) or not heartbeat_process_is_current(evt):
                     continue
                 if self._load_background_notifications_mode() == "off":
                     continue
                 if evt.get("type") == "heartbeat":
                     from gateway.session_automation import deliver_heartbeat
-                    delivered = await deliver_heartbeat(self, evt)
+                    async with self._process_notification_admission_lock(evt):
+                        if not heartbeat_process_is_current(evt):
+                            continue
+                        delivered = await deliver_heartbeat(self, evt)
                 else:
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:
                         continue
                     try:
-                        delivered = await self._inject_watch_notification(synth_text, evt)
+                        delivered = await self._admit_process_notification(synth_text, evt)
                     except Exception:
                         logger.exception("Watch notification injection error")
                         delivered = False
@@ -781,7 +787,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 return a
         return None
 
-    async def _self_post_api_server(self, adapter, synth_text: str, raw_sid: str, evt: dict) -> bool:
+    async def _self_post_api_server(self, adapter, synth_text: str, raw_sid: str, evt: dict) -> Optional[bool]:
         """Deliver to a non-push (api_server) session by raw session id.
 
         Async-delegation completions are persisted as a durable delivery row — after the parent
@@ -803,6 +809,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             except LookupError as e:
                 logger.warning(fail, raw_sid, e)
                 return False
+            if evt.get("type") == "heartbeat":
+                from tools.process_registry_notifications import heartbeat_process_is_current
+                if not heartbeat_process_is_current(evt):
+                    return None
             if served:
                 # The wake runs in the OWNING profile's scope, in-process (see ``deliver_wake``):
                 # the raw event carries no profile, so a completion scope was never installed.
@@ -877,6 +887,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         """
         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
         source = await asyncio.to_thread(self._build_process_event_source, evt)
+        if evt.get("type") == "heartbeat":
+            from tools.process_registry_notifications import heartbeat_process_is_current
+            if not heartbeat_process_is_current(evt):
+                return None
         if not source:
             # API-server sessions bind the RAW X-Hermes-Session-Id key, not a structured ``agent:...`` key.
             raw_sid = _raw_process_event_session_id(evt)
@@ -1254,7 +1268,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             completion_ids = [claim.delegation_id] if claim.claim_id else []
             completion_ids += [sibling["delegation_id"] for sibling, claim_id in sibling_claims if claim_id]
             evt = {**evt, "completion_ids": completion_ids}
-            injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
+            injection_result = await self._admit_process_notification(synth_text, evt, raise_not_accepted=True)
             if injection_result is not True:
                 return injection_result
             accepted = True

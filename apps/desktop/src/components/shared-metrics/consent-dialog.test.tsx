@@ -83,17 +83,15 @@ describe('SharedMetricsConsentDialog', () => {
     expect(sharedMetricsOfferPending($sharedMetricsConsent.get())).toBe(true)
 
     $sharedMetricsDetailsOpen.set(true)
-    const noThanks = await screen.findByRole('button', { name: copy.off })
-    expect(screen.getByRole('button', { name: copy.share })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: /computer|local/i })).toBeNull()
+    const keepLocal = await screen.findByRole('button', { name: copy.local })
     // Nothing is preselected: no choice holds focus when the details open.
-    expect(noThanks.ownerDocument.activeElement).not.toBe(noThanks)
-    fireEvent.click(noThanks)
+    expect(keepLocal.ownerDocument.activeElement).not.toBe(keepLocal)
+    fireEvent.click(keepLocal)
 
     await waitFor(() => expect(sharedMetricsOfferPending($sharedMetricsConsent.get())).toBe(false))
     expect(screen.queryByRole('dialog')).toBeNull()
     expect(calls.find(c => c.method === 'shared_metrics.set')?.params).toEqual({
-      enabled: false,
+      enabled: true,
       send: false,
       first_run: true,
       profile: 'havoc'

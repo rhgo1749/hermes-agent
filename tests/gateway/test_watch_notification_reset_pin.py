@@ -19,9 +19,12 @@ async def _gateway(monkeypatch):
     from gateway.session_results import execution_result
     from gateway.session_authority import SessionAuthority, initialize_session_authority
     from plugins.platforms.discord.adapter import DiscordAdapter
+    from tools.process_registry import ProcessSession, process_registry
 
     monkeypatch.setenv('DISCORD_ALLOWED_USERS', '42')
     runner = GatewayRunner(GatewayConfig())
+    process = ProcessSession(id='proc_watch', command='tail -f build.log', started_at=1.0)
+    monkeypatch.setattr(process_registry, 'get', lambda session_id: process if session_id == process.id else None)
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token='fixture-token', typing_indicator=False))
     adapter.gateway_runner = runner
     runner.adapters = {Platform.DISCORD: adapter}

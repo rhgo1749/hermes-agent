@@ -209,8 +209,8 @@ def test_gated_tick_stamps_the_window(store, tmp_path, monkeypatch):
         ("_maybe_run_worktree_maintenance", lambda: None),
     ]:
         monkeypatch.setattr(_sched, name, value)
-    import cron.bot_chat_delivery as bcd
-    monkeypatch.setattr(bcd, "drain", lambda: None)
+    import cron.bot_chat_legacy as legacy_bot_chat
+    monkeypatch.setattr(legacy_bot_chat, "drain_legacy_pending", lambda: None)
     assert scheduler_tick._tick_admitted(verbose=False, adapters=None, loop=None, sync=True,
                                          can_dispatch=lambda: False) == 0
     windows = _windows(tmp_path)

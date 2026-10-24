@@ -8,7 +8,7 @@ import { type SessionView, SessionViewProvider } from '@/app/chat/session-view'
 import { hiddenPaneProps } from '@/components/pane-shell/pane-visibility'
 import { $activeTreeGroup, $hoveredTreeGroup } from '@/components/pane-shell/tree/store'
 import { I18nProvider } from '@/i18n'
-import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
+import { clearClarifyRequest, sessionClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { $profiles } from '@/store/profile'
 import { hasOpenServerRequest, rememberServerRequest, resetServerRequestsForTests } from '@/store/server-requests'
@@ -222,7 +222,8 @@ describe('ClarifyTool live card stays mounted across settle', () => {
     // The same tool row stays mounted from question 1 to question 2; the first
     // confirm's submitting latch must not carry over and disable the second card.
     $activeSessionId.set('session-1')
-    $gateway.set({ request: vi.fn().mockResolvedValue({ ok: true }) } as never)
+    const request = vi.fn().mockResolvedValue({ ok: true })
+    $gateway.set({ request } as never)
     setClarifyRequest({
       questions: [{ choices: ['staging', 'production'], multiSelect: false, qid: 'request-1', question: 'Which deployment target?' }],
       requestId: 'request-1',
@@ -239,7 +240,8 @@ describe('ClarifyTool live card stays mounted across settle', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /staging/ }))
     fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
-    await waitFor(() => expect(gatewayMocks.requestGatewayForAgent.mock.calls.length + 0).toBeGreaterThanOrEqual(0))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(sessionClarifyRequest('session-1').get()).toBeNull())
     await act(async () => {
       setClarifyRequest({
         questions: [{ choices: ['us', 'eu'], multiSelect: false, qid: 'request-2', question: 'Which region?' }],

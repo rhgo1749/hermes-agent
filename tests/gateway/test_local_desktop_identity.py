@@ -137,9 +137,8 @@ async def test_a_desktop_chat_runs_its_turns_as_work_for_the_local_desktop(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_a_trial_users_desktop_chat_runs_on_the_free_model(tmp_path, monkeypatch):
-    """A claimed welcome trial and no configured model: the chat freezes the free model instead of
-    no model at all (a launch policy with no model can never be restored)."""
+async def test_a_claimed_trial_is_only_available_to_local_desktop(tmp_path, monkeypatch):
+    """The local Desktop freezes the welcome model; the same guest cannot use it from another surface."""
     from hermes_cli import anon_auth
     guest = {"auth_method": anon_auth.ANON_AUTH_METHOD, anon_auth.WELCOME_CLAIM_FLAG: True}
     monkeypatch.setattr(anon_auth, "current_nous_state", lambda *a, **k: guest)
@@ -154,8 +153,13 @@ async def test_a_trial_users_desktop_chat_runs_on_the_free_model(tmp_path, monke
 
         conn.transport.desktop_local = False
         other = await _request(conn, 3, "session.create", {"source": "gui", "request_id": "b"})
-        assert "result" in other, other
-        assert local_receipt(conn.authority.db, other["result"]["stored_session_id"])["policy"]["model"] == anon_auth.GUEST_MODEL
+        assert isinstance(other, dict) and "error" in other, other
+        error = other["error"]
+        assert isinstance(error, dict) and error.get("message") == "invalid_params", other
+        assert isinstance(error.get("data"), dict) and error["data"].get("field") == "model", other
+        from gateway.session_local_recovery import local_identity
+        refused_id = local_identity(conn.authority.profile_id, conn.connection.actor.subject, "b")
+        assert conn.authority.db.get_session(refused_id) is None
     finally:
         await conn.connection.close()
 

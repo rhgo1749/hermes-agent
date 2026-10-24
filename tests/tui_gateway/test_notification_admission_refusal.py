@@ -4,6 +4,7 @@ import queue
 import threading
 import time
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -22,16 +23,20 @@ def test_refused_notification_retains_result_without_spending_attempts(tmp_path,
         'type': 'completion', 'session_id': 'owned-process', 'session_key': 'owned'}
     session = {'history_lock': threading.RLock(), '_closing': True, 'running': True}
     emitted = []
-    namespace = dict(time=time, logger=logging.getLogger(__name__),
+    namespace: dict[str, Any] = dict(time=time, logger=logging.getLogger(__name__),
         _emit=lambda *args: emitted.append(args),
         _session_turn_admission=_session_turn_admission,
         _ensure_active_session_slot=lambda *args: None,
         _notif_log_failure=lambda *args: None)
     for module, names in [(prompt_turn, ('_admit_prompt_turn', '_run_prompt_submit')),
                           (session_notifications, ('_notif_submit', '_notif_claim_turn', '_notif_release_turn',
-                           '_notif_dispatch_event', '_notif_dispatch_completions', '_async_delegation_display_metadata'))]:
+                           '_notif_dispatch_event', '_notif_dispatch_completions',
+                           '_notification_turn_key',
+                           '_async_delegation_display_metadata'))]:
         for name in names:
             namespace[name] = rebind(getattr(module, name), namespace)
+    # This pure sibling helper retains its own module globals; do not rebind its implementation into the test namespace.
+    namespace['_dedupe_notification_turns'] = session_notifications._dedupe_notification_turns
     # Also bind the retry helper when present; old code must fail on the receipt, not an absent test import.
     if hasattr(session_notifications, '_notif_defer_event'):
         namespace['_notif_defer_event'] = rebind(session_notifications._notif_defer_event, namespace)
@@ -43,7 +48,7 @@ def test_refused_notification_retains_result_without_spending_attempts(tmp_path,
         for _ in range(10):
             session['running'] = kind == 'async_delegation'
             if kind == 'async_delegation':
-                namespace['_notif_dispatch_event']('live', session, event, 'nonhuman summary')
+                assert namespace['_notif_dispatch_event']('live', session, event, 'nonhuman summary') is False
                 record = delegation.get_durable_delegation(event['delegation_id'])
                 assert (record['delivery_state'], record['delivery_attempts']) == ('pending', 0), record
             else:
@@ -70,3 +75,24 @@ def test_refused_notification_retains_result_without_spending_attempts(tmp_path,
         assert len(accepted) == 1 and process_registry.completion_queue.empty()
     finally:
         process_registry.completion_queue = original_queue
+
+
+def test_refused_submit_returns_false(monkeypatch):
+    from tools import async_delegation as delegation
+
+    deferred = []
+    namespace = {
+        "time": time,
+        "_notif_submit": lambda *args, **kwargs: False,
+        "_notif_defer_event": lambda evt, claim: deferred.append((evt, claim)),
+        "_notif_refusal_backoff": lambda *_args: None,
+    }
+    dispatch = rebind(session_notifications._notif_dispatch_event, namespace)
+    claim = object()
+    monkeypatch.setattr(delegation, "claim_event_delivery", lambda *_args: claim)
+    monkeypatch.setattr(delegation, "complete_event_delivery", lambda *_args: pytest.fail("refused delivery completed"))
+    monkeypatch.setattr(delegation, "release_event_delivery", lambda *_args: pytest.fail("refused delivery released"))
+
+    event = {"type": "completion", "session_id": "owned-process"}
+    assert dispatch("live", {"running": True}, event, "result") is False
+    assert deferred == [(event, claim)]

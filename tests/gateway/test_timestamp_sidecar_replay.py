@@ -1,8 +1,7 @@
 """Timestamp rendering must not discard the exact sent user-message prefix."""
 
 from copy import deepcopy
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import UTC, datetime
 import json
 
 import pytest
@@ -11,7 +10,7 @@ from gateway.message_timestamps import render_user_content_with_timestamp
 from gateway.run import _build_gateway_agent_history, _select_cached_agent_history
 
 
-STAMP = datetime(2026, 8, 20, 12, 0, tzinfo=ZoneInfo("UTC")).timestamp()
+STAMP = datetime(2026, 8, 20, 12, 0, tzinfo=UTC).timestamp()
 POLICY = "## Recall policy\nUse the retrieval tool when earlier details are needed."
 NOTE = "[System note: Your previous turn was interrupted. Continue the old task.]"
 
@@ -26,7 +25,9 @@ def _render(text, timestamp=STAMP):
 @pytest.mark.parametrize("timestamps", [False, True])
 @pytest.mark.parametrize("embedded", [False, True])
 @pytest.mark.parametrize("real_text", ["", "please check the result"])
-def test_recovery_cleanup_never_restores_a_sidecar(timestamps, embedded, real_text):
+def test_recovery_cleanup_never_restores_a_sidecar(timestamps, embedded, real_text, monkeypatch):
+    import hermes_time
+    monkeypatch.setattr(hermes_time, "get_timezone", lambda: UTC)
     original = NOTE + (" " + real_text if real_text else "")
     if embedded:
         original = "[2026-08-20T12:00:00+00:00] " + original
