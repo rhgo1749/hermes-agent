@@ -222,12 +222,14 @@ def test_anonymous_attempt_fails_fast_under_inherited_askpass(tmp_path, monkeypa
 
 @pytest.mark.platforms("posix")  # POSIX shell stub credential helper
 def test_credential_fill_uses_stored_helper_and_never_prompts(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # keep the checkout's local credential helper out of this fixture
     helper = tmp_path / "helper.sh"
     helper.write_text("#!/bin/sh\n[ \"$1\" = get ] && printf 'username=bob\\npassword=pw-from-helper\\n'\n", encoding="utf-8")
     helper.chmod(0o755)
     gitconfig = tmp_path / "gitconfig"
     gitconfig.write_text(f'[credential "https://git.example.test"]\n\thelper = !{helper}\n', encoding="utf-8")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.setenv("GIT_ASKPASS", "/nonexistent/askpass-must-not-run")
 
     assert git_credentials.resolve_git_basic_auth("https://git.example.test/acme/x.git") == ("bob", "pw-from-helper")
