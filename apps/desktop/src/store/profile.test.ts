@@ -27,8 +27,7 @@ vi.mock('@/store/gateway', () => ({
   openGatewayForProfile,
   openSecondaryCount
 }))
-// The pool-limits atom is profile.ts's live saturation signal — keep the real
-// one so tests can move the cap via the store, but stub its IPC bridge.
+// Keep the live saturation signal controllable without wiring the Electron IPC.
 vi.mock('@/store/pool-limits', async () => {
   const { atom } = await import('nanostores')
 
@@ -39,7 +38,7 @@ vi.mock('@/hermes', () => ({
   setApiRequestProfile: vi.fn()
 }))
 vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
-vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
+vi.mock('@/store/starmap', () => ({ reloadOpenStarmapGraph: vi.fn(), resetStarmapGraph }))
 
 const {
   $activeGatewayProfile,
@@ -83,9 +82,10 @@ const getConnection = vi.fn<(profile?: string | null) => Promise<HermesConnectio
 
 beforeEach(() => {
   getConnection.mockReset()
+  openSecondaryCount.mockReturnValue(0)
+  $poolLimits.set({ idleMs: 600_000, maxBackends: 3 })
   ensureGatewayForProfile.mockClear()
   openGatewayForProfile.mockClear()
-  openSecondaryCount.mockReturnValue(0)
   $gateway.set({ id: 'live-socket', connectionState: 'open' })
   $activeGatewayProfile.set('default')
   $connection.set(localConn())
@@ -223,9 +223,6 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
   })
 
   it('skips pre-warm when the pool is saturated (#91545 evict/respawn cascade)', () => {
-    // Every pool slot occupied: a speculative spawn would LRU-evict a warm
-    // backend — often the one the user is about to click. Default limit 3,
-    // 3 open secondaries → the next spawn would exceed the cap.
     openSecondaryCount.mockReturnValue(3)
 
     prewarmProfileBackend('warm-saturated')
@@ -234,8 +231,6 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
   })
 
   it('follows the live pool-limit atom, not a hard-coded cap', () => {
-    // User raises Warm Bot Backends to 8 in Settings: prewarming must keep
-    // working well past the old default of 3.
     openSecondaryCount.mockReturnValue(5)
     $poolLimits.set({ idleMs: 600_000, maxBackends: 8 })
 
@@ -243,7 +238,6 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
 
     expect(openGatewayForProfile).toHaveBeenCalledWith('warm-raised-cap')
 
-    // And lowering the cap re-engages the guard at the new boundary.
     $poolLimits.set({ idleMs: 600_000, maxBackends: 2 })
 
     prewarmProfileBackend('warm-lowered-cap')

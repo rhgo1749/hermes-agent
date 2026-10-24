@@ -128,6 +128,8 @@ class TestFreeTierBeatsImplicitHostCredentials:
 
     def test_on_the_cli_surface_a_claimed_guest_never_resolves_to_nous(self, portal, monkeypatch):
         _claimed_trial_with_aws(monkeypatch)
+        from tests.hermes_cli.anon_portal import off_local_desktop
+        off_local_desktop(monkeypatch)
         monkeypatch.delenv("HERMES_DESKTOP", raising=False)
         monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
         assert resolve_provider("auto") == "bedrock"

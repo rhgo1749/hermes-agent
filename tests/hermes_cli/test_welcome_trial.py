@@ -6,7 +6,7 @@ import contextlib
 import pytest
 
 from hermes_cli import anon_auth, install_state, welcome_trial
-from tests.hermes_cli.anon_portal import as_local_desktop_backend, claimed_trial, install_portal
+from tests.hermes_cli.anon_portal import as_local_desktop_backend, claimed_trial, install_portal, off_local_desktop
 
 
 @pytest.fixture
@@ -68,9 +68,9 @@ def test_a_connector_guest_neither_claims_nor_carries_inference(portal, monkeypa
     assert [r["body"]["purpose"] for r in portal.token_requests] == ["connectors"]
 
 
-def test_a_claimed_guest_carries_inference_only_on_the_local_desktop_backend(portal, monkeypatch):
+def test_a_claimed_guest_carries_inference_only_on_the_local_desktop_activity(portal, monkeypatch):
     state = claimed_trial(monkeypatch)
-    monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN")  # the same home, read by a CLI process
+    off_local_desktop(monkeypatch)  # the same home, read by a CLI process
 
     assert not anon_auth.free_inference_active()
     assert anon_auth.guest_without_free_tier(state)
@@ -96,7 +96,7 @@ def _legacy_guest() -> None:
     state.pop(anon_auth.WELCOME_CLAIM_FLAG, None)
     _store_provider_state(store, "nous", state, set_active=False)
     _save_auth_store(store)
-    _write_shared_nous_state(state)
+    _write_shared_nous_state(state, renewal=False)
 
 
 @pytest.mark.parametrize(("model", "kept"), [(anon_auth.GUEST_MODEL, True), ("anthropic/claude", False)])
@@ -120,12 +120,11 @@ def test_grandfathering_never_overwrites_a_sign_in_from_another_profile(portal, 
     _legacy_guest()                                    # this profile still holds the old guest
     _chat(get_hermes_home() / "state.db", anon_auth.GUEST_MODEL)
     _write_shared_nous_state({"auth_method": "oauth_device_code", "portal_base_url": PORTAL,
-                              "access_token": "at-signed-in", "refresh_token": "rt-signed-in"})
+                              "access_token": "at-signed-in", "refresh_token": "rt-signed-in"}, renewal=False)
 
     assert welcome_trial.grandfather_existing_guest() is False
     assert _read_shared_nous_state()["refresh_token"] == "rt-signed-in"
     assert anon_auth.WELCOME_CLAIM_FLAG not in anon_auth.current_nous_state()
-
 
 def test_a_lost_claim_is_not_replaced(portal, monkeypatch):
     claimed_trial(monkeypatch)
@@ -162,6 +161,7 @@ def test_a_connector_guest_adopted_from_the_shared_store_is_not_grandfathered(po
 
     assert adopted[anon_auth.WELCOME_CLAIM_FLAG] is False
     assert welcome_trial.grandfather_existing_guest() is False
+    assert not anon_auth.free_inference_active()
     assert portal.creates() == 1
 
 
@@ -357,3 +357,79 @@ def test_one_due_answer_walks_the_provider_ladder_once(portal, monkeypatch):
 
     assert welcome_trial.inference_available() is True  # fresh: the trial is claimable
     assert len(calls) == 1
+
+
+def _cron_model() -> str:
+    from cron.scheduler import _load_cron_job_config
+
+    return _load_cron_job_config({"id": "j", "name": "j", "prompt": "x"}, "j", "j").model
+
+
+def _kanban_worker_model(monkeypatch, tmp_path) -> str:
+    from dataclasses import asdict
+    from types import SimpleNamespace
+    from contextlib import closing
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.config import load_config
+    from hermes_cli.kanban_db_connect import connect
+    from hermes_constants import get_hermes_home
+    from gateway.session_contract import Principal
+    from gateway.session_kanban import build_kanban_policy
+    from gateway.session_policy import restore_policy
+
+    home = str(get_hermes_home())
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda name: home)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    kb.create_board("trial")
+    with closing(connect(board="trial")) as conn:
+        task_id = kb.create_task(conn, title="t", assignee="default", workspace_kind="dir", workspace_path=str(workspace))
+        kb.recompute_ready(conn)
+        task = kb.claim_task(conn, task_id)
+    connection = SimpleNamespace(authority=SimpleNamespace(profile_id=home), native_owner=True,
+                                 actor=Principal("owner", home, frozenset({"session:create"}), "transport"))
+    params = dict(board="trial", task_id=task.id, run_id=task.current_run_id, claim_lock=task.claim_lock)
+    policy, _ = build_kanban_policy(connection, params, load_config())
+    return restore_policy(asdict(policy)).model
+
+
+@pytest.fixture
+def unconfigured_trial(portal, monkeypatch):
+    """A fresh install whose Desktop claimed the trial, read by the scheduler or the Kanban
+    dispatcher (not Desktop work), with no model configured anywhere."""
+    monkeypatch.delenv("HERMES_MODEL", raising=False)
+    claimed_trial(monkeypatch)
+    off_local_desktop(monkeypatch)
+    assert not anon_auth.free_inference_active()
+    yield
+    from hermes_cli.config import load_config
+    assert not (load_config().get("model") or {}).get("default")  # never persisted: a later provider wins
+
+
+def test_a_claimed_trial_does_not_route_a_cron_job_to_free_inference_when_off_local(unconfigured_trial):
+    with pytest.raises(RuntimeError, match="has no model configured"):
+        _cron_model()
+
+
+def test_a_claimed_trial_does_not_route_a_kanban_worker_to_free_inference_when_off_local(
+    unconfigured_trial, monkeypatch, tmp_path,
+):
+    from hermes_state_runtime import RuntimeStoreError
+
+    with pytest.raises(RuntimeStoreError, match="storage_unavailable"):
+        _kanban_worker_model(monkeypatch, tmp_path)
+
+
+def test_a_configured_model_beats_the_trial_for_cron_jobs_and_kanban_workers(portal, monkeypatch, tmp_path):
+    from hermes_constants import get_hermes_home
+
+    monkeypatch.delenv("HERMES_MODEL", raising=False)
+    claimed_trial(monkeypatch)
+    off_local_desktop(monkeypatch)
+    (get_hermes_home() / "config.yaml").write_text(
+        "model:\n  provider: openrouter\n  default: anthropic/claude-sonnet-4\n", encoding="utf-8")
+
+    assert _cron_model() == "anthropic/claude-sonnet-4"
+    assert _kanban_worker_model(monkeypatch, tmp_path) == "anthropic/claude-sonnet-4"

@@ -292,9 +292,8 @@ function useRecoveryRequestToasts(): void {
     }
   }, [billingSettingsRequest, navigate])
 
-  // Pool-cap recovery is fired by the notification action, which has no router
-  // context. Keep navigation user-initiated: the counter changes only when the
-  // user clicks "Open Advanced Settings" on a pool-slot failure.
+  // Pool-cap recovery is user-initiated by the toast action; it only requests
+  // navigation and never redirects on an automatic backend failure.
   // eslint-disable-next-line no-restricted-syntax -- one-shot request-seen sentinel, not an atom mirror
   useEffect(() => {
     if (poolLimitsSettingsRequest === poolLimitsSettingsSeenRef.current) {

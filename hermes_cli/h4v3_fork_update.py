@@ -24,6 +24,7 @@ CANDIDATE_DIR = ".worktrees/h4v3-upstream-squash"
 MARKER = "h4v3-fork-update.json"
 TRAILER = "H4V3-Upstream-SHA: "
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+GIT_COMMAND_TIMEOUT_SECONDS = 300
 
 
 class ForkUpdateError(RuntimeError):
@@ -31,21 +32,25 @@ class ForkUpdateError(RuntimeError):
 
 
 def _git(root: Path, *args: str, cwd: Path | None = None, input_bytes: bytes | None = None,
-         check: bool = True) -> subprocess.CompletedProcess:
-    proc = subprocess.run(["git", "-C", str(cwd or root), *args],
-                          input=input_bytes, capture_output=True, check=False)
+         check: bool = True, git: str = "git") -> subprocess.CompletedProcess:
+    try:
+        proc = subprocess.run([git, "-C", str(cwd or root), *args], input=input_bytes,
+                              capture_output=True, check=False, timeout=GIT_COMMAND_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        command = args[0] if args else "command"
+        raise ForkUpdateError(f"git {command} timed out after {GIT_COMMAND_TIMEOUT_SECONDS}s") from exc
     if check and proc.returncode:
         message = proc.stderr.decode("utf-8", "replace").strip()
         raise ForkUpdateError(f"git {args[0]} failed: {message[-800:]}")
     return proc
 
 
-def _out(root: Path, *args: str, cwd: Path | None = None) -> str:
-    return _git(root, *args, cwd=cwd).stdout.decode("utf-8", "replace").strip()
+def _out(root: Path, *args: str, cwd: Path | None = None, git: str = "git") -> str:
+    return _git(root, *args, cwd=cwd, git=git).stdout.decode("utf-8", "replace").strip()
 
 
-def _sha(root: Path, ref: str) -> str:
-    return _out(root, "rev-parse", "--verify", f"{ref}^{{commit}}")
+def _sha(root: Path, ref: str, *, git: str = "git") -> str:
+    return _out(root, "rev-parse", "--verify", f"{ref}^{{commit}}", git=git)
 
 
 def _marker(root: Path) -> Path:
@@ -61,12 +66,12 @@ def _url(url: str) -> str:
     return url.removesuffix(".git").rstrip("/")
 
 
-def _enabled(root: Path) -> bool:
+def _enabled(root: Path, *, git: str = "git") -> bool:
     # Source status also probes Nix/embedded installs without a Git checkout.
     # Those are ordinary upstream installations, not opted-in fork deployments.
     if not (root / ".git").exists():
         return False
-    result = _git(root, "rev-parse", "--absolute-git-dir", check=False)
+    result = _git(root, "rev-parse", "--absolute-git-dir", check=False, git=git)
     if result.returncode:
         return False
     return (Path(result.stdout.decode("utf-8", "replace").strip()) / MARKER).is_file()
@@ -83,9 +88,9 @@ def _verify(root: Path) -> None:
         raise ForkUpdateError("main has uncommitted changes; commit them before updating")
 
 
-def _last_synced(root: Path, main_sha: str) -> str | None:
+def _last_synced(root: Path, main_sha: str, *, git: str = "git") -> str | None:
     message = _out(root, "log", "-1", "--format=%B", "--grep=H4V3-Upstream-SHA:",
-                   main_sha)
+                   main_sha, git=git)
     rows = re.findall(r"^H4V3-Upstream-SHA:\s*([0-9a-f]{40})$", message, re.MULTILINE)
     return rows[-1] if rows else None
 
@@ -237,21 +242,23 @@ def prepare_update(root: Path) -> bool:
     return True
 
 
-def check_fork_updates(root: Path) -> dict | None:
+def check_fork_updates(root: Path, *, git: str = "git") -> dict | None:
     """Report only changes the native updater can install from origin/main.
 
     Upstream drift is informational until an explicit reviewed sync publishes
     it to the fork. An unknown commit distance must not be called 1 commit.
+    ``git`` is the exact executable selected by the owning updater; a packaged
+    installation may keep it outside PATH.
     """
-    if not _enabled(root):
+    if not _enabled(root, git=git):
         return None
-    if (_url(_out(root, "remote", "get-url", "origin")) != _url(FORK_URL)
-            or _url(_out(root, "remote", "get-url", "upstream")) != _url(UPSTREAM_URL)
-            or _out(root, "branch", "--show-current") != FORK_BRANCH):
+    if (_url(_out(root, "remote", "get-url", "origin", git=git)) != _url(FORK_URL)
+            or _url(_out(root, "remote", "get-url", "upstream", git=git)) != _url(UPSTREAM_URL)
+            or _out(root, "branch", "--show-current", git=git) != FORK_BRANCH):
         raise ForkUpdateError("fork update check requires the configured main checkout")
 
     def remote_head(remote: str, branch: str) -> str:
-        lines = _out(root, "ls-remote", "--heads", remote, branch).splitlines()
+        lines = _out(root, "ls-remote", "--heads", remote, branch, git=git).splitlines()
         if len(lines) != 1:
             raise ForkUpdateError(f"cannot verify {remote}/{branch} against remote")
         rev, ref = lines[0].split()
@@ -259,10 +266,10 @@ def check_fork_updates(root: Path) -> dict | None:
             raise ForkUpdateError(f"invalid {remote}/{branch} revision")
         return rev
 
-    local = _sha(root, FORK_BRANCH)
+    local = _sha(root, FORK_BRANCH, git=git)
     remote_main = remote_head("origin", FORK_BRANCH)
     upstream = remote_head("upstream", "main")
-    previous = _last_synced(root, local)
+    previous = _last_synced(root, local, git=git)
     upstream_pending = previous != upstream if previous else True
     # SOURCE_CHECK.UPDATE_AVAILABLE_NO_COUNT = -1; remote SHA alone does not
     # prove the number of reachable commits without fetching.

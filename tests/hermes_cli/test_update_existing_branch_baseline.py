@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import update_cmd
-from tests.hermes_cli.test_update_target_identity import _effective_git_cwd, git, update_tree
+from tests.hermes_cli.test_update_target_identity import git, update_tree
 
 
 def init_repo(root, monkeypatch):
@@ -228,7 +228,14 @@ def test_command_hands_off_after_existing_main_switch(update_tree, monkeypatch, 
 
     def local_git_only(command, *args, **kwargs):
         assert Path(command[0]).name.lower() in {"git", "git.exe"}, command
-        assert _effective_git_cwd(command, kwargs) in {t.clone, t.origin}, (command, kwargs.get("cwd"))
+        cwd = kwargs.get("cwd")
+        if cwd is None:
+            try:
+                cwd = command[command.index("-C") + 1]
+            except (ValueError, IndexError):
+                pytest.fail(f"git invocation is not pinned to a fixture repository: {command!r}")
+        assert isinstance(cwd, (str, Path)), command
+        assert Path(cwd).resolve() in {t.clone, t.origin}, command
         return run(command, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", local_git_only)

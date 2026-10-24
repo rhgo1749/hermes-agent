@@ -12,21 +12,21 @@ on:
 jobs:
   check:
     name: JS & TS checks
-    # Upstream keeps the 32-core runner; the public personal fork resolves to
-    # ubuntu-latest. This single job replaces a 14-leg matrix. The matrix spread
-    # about 612s of check payload over 4-core runners and paid about 371s of
-    # repeated setup (14 checkouts, Node installs and node_modules restores).
+    # One 32-core job replaces a 14-leg matrix. The matrix spread about 612s
+    # of check payload over 4-core runners. It paid about 371s of repeated
+    # setup to do it: 14 checkouts, 14 node installs, 14 node_modules
+    # restores.
     #
-    # One upstream larger runner installs once; vitest, tsc and eslint size
-    # their own worker pools from the core count.
+    # One larger runner installs one time. vitest, tsc and eslint each size
+    # their own worker pool from the core count.
     runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
-    # The fork's previous standard-runner receipt took 29m14s (run 37610629360);
-    # 45m leaves measured 15m46s headroom. Upstream retains its existing 30m cap.
+    # The fork's standard-runner receipt took 29m14s; retain measured headroom.
     timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 30 || 45 }}
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
           ref: ${{ inputs.commit }}
+          persist-credentials: false
       - name: Set up the locked JS build toolchain
         id: node
         uses: ./.github/actions/setup-pm
@@ -47,15 +47,14 @@ jobs:
 
       # setup-pm caches npm downloads, not the installed workspace tree.
       # The job then extracts the full workspace node_modules
-      # again and runs the postinstalls again, which includes the Electron
-      # binary fetch. This caches the installed tree itself, keyed on the
+      # again and runs the native postinstalls again. Electron's binary is
+      # prepared explicitly below. This caches the installed tree itself, keyed on the
       # lockfile, and skips ``npm ci`` on an exact hit. There are no
       # restore-keys: a partial hit leaves a stale tree, so anything other
       # than an exact lockfile match reinstalls from the start.
       #
-      # This install runs WITH scripts, so the tree holds the postinstall
-      # artifacts. The postinstall of electron unpacks its binary into
-      # node_modules/electron/dist, which is inside the cached tree.
+      # This install runs WITH scripts, so the tree holds native lifecycle
+      # artifacts and the explicitly prepared Electron dist, both inside the cached tree.
       #
       # The ~/.cache/electron download cache stays out of the key on purpose.
       # ``npm ci`` is skipped on a hit, so nothing reads that cache. It only
@@ -78,6 +77,9 @@ jobs:
         with:
           command: npm ci
 
+      - name: Prepare locked Electron runtime before parallel checks
+        run: node scripts/build/electron-runtime.mjs --source .
+
       # Every check runs at the same time. The step fails only after all of
       # them finish. There are two reasons this is not ``npm run --ws check``.
       #
@@ -95,9 +97,6 @@ jobs:
       # ``check:*`` script needs no change here. An empty list is an error and
       # not an empty run, because an empty run reports green after it checks
       # nothing.
-      # Keep upstream's detected parallelism; on standard runners, serialize
-      # checks because the 15s bundle smoke and 5s Git probe still timed out at
-      # concurrency 2 while the Desktop UI suite occupied the same 4-core runner.
       - name: Run all workspace checks (upstream)
         if: github.repository == 'NousResearch/hermes-agent'
         run: node .github/scripts/run-workspace-checks.mjs

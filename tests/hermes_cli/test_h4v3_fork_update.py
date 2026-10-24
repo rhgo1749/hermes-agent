@@ -361,3 +361,13 @@ def test_explicit_other_update_channel_is_rejected_in_fork_mode(forks):
     args = SimpleNamespace(branch=None, channel="stable")
     with pytest.raises(SystemExit, match="main"):
         flow.maybe_prepare_update(args, forks.root)
+
+
+def test_git_command_timeout_is_reported_as_fork_update_error(tmp_path, monkeypatch):
+    def timed_out(command, **kwargs):
+        assert kwargs["timeout"] == flow.GIT_COMMAND_TIMEOUT_SECONDS
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(flow.subprocess, "run", timed_out)
+    with pytest.raises(flow.ForkUpdateError, match="git ls-remote timed out"):
+        flow._git(tmp_path, "ls-remote", "origin", "main")

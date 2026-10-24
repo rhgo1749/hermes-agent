@@ -42,11 +42,35 @@ afterEach(() => {
 })
 
 describe('SharedMetricsConsentStrip', () => {
-  it('records the chosen answer on the focused profile', async () => {
+  it('offers three answers, and sharing sets both opt-ins on the focused profile', async () => {
     installGatewayMock({ enabled: false, send: false, decided: false })
 
     render(<SharedMetricsConsentStrip />)
 
+    expect(screen.getAllByRole('button').map(button => button.textContent)).toEqual([
+      copy.stripChoices.share,
+      copy.stripChoices.local,
+      copy.stripChoices.off,
+      copy.stripDetails
+    ])
+    expect(screen.getByText(copy.stripBody)).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: copy.stripChoices.share }))
+
+    await waitFor(() =>
+      expect(requestGateway).toHaveBeenCalledWith('shared_metrics.set', {
+        enabled: true,
+        send: true,
+        first_run: true,
+        profile: 'havoc'
+      })
+    )
+  })
+
+  it('keeps collection local without sending when the local-only answer is chosen', async () => {
+    installGatewayMock({ enabled: false, send: false, decided: false })
+
+    render(<SharedMetricsConsentStrip />)
     fireEvent.click(screen.getByRole('button', { name: copy.stripChoices.local }))
 
     await waitFor(() =>

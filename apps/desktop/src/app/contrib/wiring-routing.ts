@@ -9,7 +9,6 @@ import type { SessionOwnerRoute, SessionOwnerScope } from '@/store/session-reque
 
 import { SETTINGS_ROUTE } from '../routes'
 
-/** The in-app destination for pool-cap recovery. */
 export const POOL_LIMITS_SETTINGS_ROUTE = `${SETTINGS_ROUTE}?tab=config:advanced`
 
 /**

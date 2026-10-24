@@ -55,22 +55,20 @@ def _deliver_platform_and_mirror(job: dict, content: str) -> tuple[str, str]:
 
 
 def _deliver_bot_chat(job: dict, content: str) -> str:
-    """Drive ``_deliver_to_bot_chat`` down to the CLI lane and capture the inbound turn."""
+    """Drive ``_deliver_to_bot_chat`` down to the live-owner admission and capture the inbound turn."""
     from cron.scheduler_delivery import _deliver_to_bot_chat
 
     captured = {}
 
-    def _fake_run(argv, *args, **kwargs):
-        with open(argv[argv.index("--query-file") + 1], encoding="utf-8") as fh:
-            captured["message"] = fh.read()
-        return MagicMock(returncode=0, stdout="", stderr="")
+    def _fake_deliver(home, owner, message, *, delivery_id, notification_category="result"):
+        captured["message"] = message
+        return {"status": "settled", "message": message, "delivery_id": delivery_id}
 
-    # The CLI lane is seamed at whichever spawn helper the tree has: ``subprocess.run`` or the
-    # report-driven ``_run_bot_chat_turn(argv, env, report_path, timeout)`` (#113608); ``create``
-    # keeps the second patch a no-op where the helper does not exist, so no real child is spawned.
-    with patch("cron.scheduler_delivery.subprocess.run", side_effect=_fake_run), \
-            patch("cron.scheduler_delivery._run_bot_chat_turn", create=True, side_effect=_fake_run):
-        err = _deliver_to_bot_chat(job, content, "")
+    # The canonical lane admits the turn to the target profile's live Bot Chat owner; the
+    # admission record is the outward seam (no local CLI child is ever spawned).
+    with patch("tools.bot_live_delivery.find_canonical_live_owner", return_value={"session_id": "bot"}), \
+            patch("tools.bot_live_delivery.deliver_to_live_owner", side_effect=_fake_deliver):
+        err = _deliver_to_bot_chat(dict(job, execution_id="r1"), content, "")
     assert err is None, err
     return captured["message"]
 
@@ -91,6 +89,26 @@ def test_every_outward_lane_masks_secret_in_payload_and_job_name(lane):
             assert "[Cron delivery:" in out, "mirror prefix missing — assembly path not exercised"
     assert "3 tasks done" in out, "payload mangled or empty — secret assertion would be vacuous"
     assert FAKE_SECRET not in out, f"secret reached the {lane} lane"
+
+
+def test_deferred_bot_chat_payload_is_scrubbed_before_persistence(tmp_path, monkeypatch):
+    """The legacy handoff file is a persistence boundary, not only an eventual message boundary."""
+    import json
+
+    from cron.scheduler_delivery import _deliver_to_bot_chat
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    content = f"{BODY} Token was {FAKE_SECRET} (oops)."
+    with patch("tools.bot_live_delivery.find_canonical_live_owner",
+               side_effect=ValueError("profile authority is not ready")):
+        result = _deliver_to_bot_chat(dict(_job(), execution_id="deferred-run"), content, "")
+
+    assert result and "queued" in result
+    (record_path,) = (tmp_path / "cron" / "bot_chat_pending").glob("*.json")
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record["status"] == "queued"
+    assert "3 tasks done" in record["content"]
+    assert FAKE_SECRET not in record["content"]
 
 
 @pytest.mark.parametrize("mode", ["redact_secrets_off", "redactor_raises"])
