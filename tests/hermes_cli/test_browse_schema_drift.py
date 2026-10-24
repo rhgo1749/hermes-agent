@@ -528,7 +528,7 @@ class SlowConnection:
         return getattr(self._conn, name)
     def set_progress_handler(self, handler, n):
         def slow():
-            time.sleep(0.01)
+            time.sleep(0.005)
             return handler() if handler is not None else 0
         return self._conn.set_progress_handler(slow, 5)
     def close(self):
@@ -599,6 +599,8 @@ def test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out(
     assert status == "503", out
     assert float(elapsed) < budget_s + 2, out
     detail = " ".join(detail)
+    assert "too large to verify and update within" in detail, out
+    assert f"within {budget_s:.0f}s while browsing" in detail, out
     assert "nothing was changed" in detail
     assert "`hermes -p scribe sessions repair`" in detail and "gateway" not in detail.lower()
     assert _file_state(path) == before
