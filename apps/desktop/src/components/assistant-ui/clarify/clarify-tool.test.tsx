@@ -8,7 +8,7 @@ import { type SessionView, SessionViewProvider } from '@/app/chat/session-view'
 import { hiddenPaneProps } from '@/components/pane-shell/pane-visibility'
 import { $activeTreeGroup, $hoveredTreeGroup } from '@/components/pane-shell/tree/store'
 import { I18nProvider } from '@/i18n'
-import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
+import { clearClarifyRequest, sessionClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { $profiles } from '@/store/profile'
 import { hasOpenServerRequest, rememberServerRequest, resetServerRequestsForTests } from '@/store/server-requests'
@@ -191,6 +191,66 @@ describe('ClarifyTool live card stays mounted across settle', () => {
     expect(screen.getByText('Which deployment target?')).toBeTruthy()
     expect(screen.queryByRole('status', { name: /loading question/i })).toBeNull()
     expect(screen.getByRole('button', { name: /Confirm and continue/ }).hasAttribute('disabled')).toBe(true)
+  })
+
+  it('a batch tool call answered one card at a time by the shared gateway gets a live single card', () => {
+    // `gateway/run_turn_runner.py::_clarify_batch_sync` sends one single-question request per
+    // entry; the batch preview built from the tool args must not shadow it as a disabled form.
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn().mockResolvedValue({ ok: true }) } as never)
+    setClarifyRequest({
+      questions: [{ choices: ['staging', 'production'], multiSelect: false, qid: 'request-1', question: 'Which deployment target?' }],
+      requestId: 'request-1',
+      sessionId: 'session-1'
+    })
+    const props = liveClarifyProps()
+
+    const args = {
+      questions: [
+        { question: 'Which deployment target?', choices: ['staging', 'production'] },
+        { question: 'Which region?', choices: ['us', 'eu'] }
+      ]
+    }
+
+    renderClarify(<ClarifyTool {...props} args={args} argsText={JSON.stringify(args)} />)
+
+    expect(screen.getByRole('button', { name: /staging/ }).hasAttribute('disabled')).toBe(false)
+    expect(screen.queryByText('Which region?')).toBeNull()
+  })
+
+  it('the next card of a one-at-a-time batch is answerable after the first was confirmed', async () => {
+    // The same tool row stays mounted from question 1 to question 2; the first
+    // confirm's submitting latch must not carry over and disable the second card.
+    $activeSessionId.set('session-1')
+    const request = vi.fn().mockResolvedValue({ ok: true })
+    $gateway.set({ request } as never)
+    setClarifyRequest({
+      questions: [{ choices: ['staging', 'production'], multiSelect: false, qid: 'request-1', question: 'Which deployment target?' }],
+      requestId: 'request-1',
+      sessionId: 'session-1'
+    })
+    const args = {
+      questions: [
+        { question: 'Which deployment target?', choices: ['staging', 'production'] },
+        { question: 'Which region?', choices: ['us', 'eu'] }
+      ]
+    }
+    const props = { ...liveClarifyProps(), args, argsText: JSON.stringify(args) }
+    renderClarify(<ClarifyTool {...props} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(sessionClarifyRequest('session-1').get()).toBeNull())
+    await act(async () => {
+      setClarifyRequest({
+        questions: [{ choices: ['us', 'eu'], multiSelect: false, qid: 'request-2', question: 'Which region?' }],
+        requestId: 'request-2',
+        sessionId: 'session-1'
+      })
+    })
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /^.*eu/ }).hasAttribute('disabled')).toBe(false))
   })
 })
 

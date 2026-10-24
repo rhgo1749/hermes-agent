@@ -87,16 +87,20 @@ def test_os_standard_runners_preserve_markers_arm64_and_zero_test_guard() -> Non
         row = rows[name]
         assert row == {"name": name, "runner": "macos-latest", "marker": "macos", "slice": slice_name}
 
-    x64, arm64 = rows["Windows-only tests"], rows["Windows-only tests (arm64)"]
+    x64 = rows["Windows-only tests"]
+    arm64 = [rows[f"Windows-only tests (arm64, {part}/2)"] for part in (1, 2)]
     assert _runner(x64["runner"], fork) == "windows-latest"
     assert _runner(x64["runner"], upstream) == "windows-latest-32-core"
-    assert _runner(arm64["runner"], fork) == "windows-11-arm"
-    assert _runner(arm64["runner"], upstream) == "windows-latest-32-arm-core"
-    assert x64["marker"] == arm64["marker"] == "windows"
+    for row in arm64:
+        assert _runner(row["runner"], fork) == "windows-11-arm"
+        assert _runner(row["runner"], upstream) == "windows-latest-32-arm-core"
+        assert row["marker"] == "windows" and row["timeout"] == 60
+    assert [row["slice"] for row in arm64] == ["1/2", "2/2"]
+    assert x64["marker"] == "windows"
     os_timeout = jobs["os-tests"]["timeout-minutes"]
     assert gha.render(os_timeout, {"github": {"repository": fork}, "matrix": {"name": "Windows-only tests"}}) == 60
     assert gha.render(os_timeout, {"github": {"repository": upstream}, "matrix": {"name": "Windows-only tests"}}) == 30
-    assert arm64["timeout"] == 60
+
 
     os_step = _step(jobs["os-tests"], "Run ${{ matrix.marker }} tests")
     workers = os_step["env"]["HERMES_TEST_WORKERS"]

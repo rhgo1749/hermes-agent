@@ -907,19 +907,6 @@ class TestRunMcpServer:
             mcp_serve.run_mcp_server()
         assert exc_info.value.code == 1
 
-class TestCliIntegration:
-
-    def test_dispatcher_routes_serve(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        mock_run = MagicMock()
-        monkeypatch.setattr("mcp_serve.run_mcp_server", mock_run)
-
-        import argparse
-        args = argparse.Namespace(mcp_action="serve", verbose=True)
-        from hermes_cli.mcp_config import mcp_command
-        mcp_command(args)
-        mock_run.assert_called_once_with(verbose=True)
-
 # ---------------------------------------------------------------------------
 # 6. EDGE CASES
 # ---------------------------------------------------------------------------

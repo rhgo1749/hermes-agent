@@ -67,7 +67,7 @@ vi.mock('@/store/session-states', () => reconnectStateMocks)
 
 const {
   activeGateway,
-  touchSecondaryGateways,
+  parkSecondariesForRetiredBackend,
   closeLegacySecondaryGateways,
   closeSecondaryGateways,
   configureGatewayRegistry,
@@ -77,7 +77,6 @@ const {
   ensureGatewayForProfile,
   openGatewayForAgent,
   openGatewayForProfile,
-  parkSecondariesForRetiredBackend,
   pruneSecondaryGateways,
   reconnectSecondaryGateways,
   requestGatewayForAgent,
@@ -85,6 +84,7 @@ const {
   retainGatewayForSessionTurn,
   retireLocalProfileGateways,
   setPrimaryGateway,
+  touchSecondaryGateways,
   SECONDARY_MIN_LIFETIME_MS
 } = await import('./gateway')
 
@@ -753,8 +753,7 @@ describe('touchSecondaryGateways', () => {
     touchSecondaryGateways()
     expect(touchBackend).toHaveBeenCalledTimes(2)
 
-    // The office socket drops and sits in reconnect backoff: still wantOpen,
-    // but nothing on this window uses that backend until it reopens.
+    // A closed socket in reconnect backoff is not a pool consumer.
     const office = gatewayMocks.instances[1] as unknown as { connectionState: string }
     office.connectionState = 'closed'
     touchBackend.mockClear()
@@ -807,6 +806,38 @@ describe('secondary stalled-dial budget', () => {
     getConnectionFor.mockResolvedValue(descriptorFor('homelab', 'bot-a'))
     await ensureGatewayForAgent('homelab', 'bot-a')
     expect(getConnectionFor.mock.calls.length).toBe(dialsAfterParking + 1)
+  })
+
+  it('parks a scope at once when its local gateway ensure fails permanently, and an explicit open re-arms it', async () => {
+    vi.useFakeTimers()
+
+    // What main's ensureLocalGateway / parseGatewayEnsureOutput / assertLocalGatewayEndpoint throw,
+    // as they cross the IPC boundary. Each re-dial spawns another `hermes gateway ensure`.
+    for (const permanent of [
+      "Error invoking remote method 'hermes:connection:get-for': Error: Gateway incompatible (runtime_protocol). Use hermes gateway status for recovery.",
+      'hermes gateway ensure produced no result (exit 2): invalid choice. Update Hermes or check the profile, then retry.',
+      'Invalid local gateway endpoint'
+    ]) {
+      closeSecondaryGateways()
+      gatewayMocks.instances.length = 0
+      const getConnectionFor = vi.fn().mockResolvedValueOnce(descriptorFor('homelab', 'bot-a')).mockRejectedValue(new Error(permanent))
+      installDesktop({ getConnectionFor })
+
+      await ensureGatewayForAgent('homelab', 'bot-a')
+      const socket = gatewayMocks.instances[0] as unknown as { connectionState: string }
+      socket.connectionState = 'closed'
+      reconnectSecondaryGateways()
+
+      for (let index = 0; index < 20; index += 1) {
+        await vi.advanceTimersByTimeAsync(20_000)
+      }
+
+      expect(getConnectionFor.mock.calls.length, permanent).toBe(2)
+
+      getConnectionFor.mockResolvedValue(descriptorFor('homelab', 'bot-a'))
+      await ensureGatewayForAgent('homelab', 'bot-a')
+      expect(getConnectionFor.mock.calls.length, permanent).toBe(3)
+    }
   })
 
   it('does not let an interleaved fast failure refill the stall budget', async () => {
@@ -1009,22 +1040,20 @@ describe('cooperative pool retirement (supersedes #104871)', () => {
 
     installDesktop({ getConnectionFor })
 
-    // A bot tile pinned this local child under the registry-local scope; main
+    // A bot tile pins this local child under the registry-local scope; main
     // pools that child under the bare profile key.
     await ensureGatewayForAgent('local', 'bot-a')
     await ensureGatewayForAgent('homelab', 'bot-b')
     expect(gatewayMocks.instances).toHaveLength(2)
     const dialsBefore = getConnectionFor.mock.calls.length
 
-    // Main announces the retirement BEFORE it SIGTERMs the child.
+    // Main announces retirement before it terminates the child.
     expect(parkSecondariesForRetiredBackend('bot-a')).toEqual(['conn:local::bot-a'])
 
-    // Then the child exits and the socket drops.
     const socket = gatewayMocks.instances[0] as unknown as { connectionState: string }
     socket.connectionState = 'closed'
 
-    // Neither the recovery nudge (focus / online / wake) nor time redials the
-    // retired scope; the unrelated remote scope is untouched.
+    // Wake/focus and time must not redial the retired scope; the remote one is untouched.
     reconnectSecondaryGateways()
     await vi.advanceTimersByTimeAsync(0)
 
@@ -1036,7 +1065,7 @@ describe('cooperative pool retirement (supersedes #104871)', () => {
       getConnectionFor.mock.calls.slice(0, dialsBefore).filter(([args]) => args.profile === 'bot-a').length
     )
 
-    // Ambient hydration and relay/status RPCs must not undo the park either.
+    // RPCs cannot undo the park. An explicit click is the only re-arm path.
     const { requestGatewayForAgent } = await import('./gateway')
     const parkedDials = getConnectionFor.mock.calls.length
     await expect(openGatewayForAgent('local', 'bot-a')).rejects.toThrow(/retired/i)
@@ -1044,14 +1073,11 @@ describe('cooperative pool retirement (supersedes #104871)', () => {
     await expect(retainGatewayForAgent('local', 'bot-a')).rejects.toThrow(/retired/i)
     expect(getConnectionFor.mock.calls.length).toBe(parkedDials)
 
-    // Parked ≠ evicted: the entry survives for its tile, and an explicit open
-    // (a click on the bot) is the one thing that re-arms and redials it.
     const before = getConnectionFor.mock.calls.length
     await ensureGatewayForAgent('local', 'bot-a')
     expect(getConnectionFor.mock.calls.length).toBe(before + 1)
     expect(getConnectionFor.mock.calls.at(-1)?.[0]).toMatchObject({ connectionId: 'local', profile: 'bot-a' })
 
-    // Once re-armed, the nudge treats it like any other scope again.
     ;(gatewayMocks.instances.at(-1) as unknown as { connectionState: string }).connectionState = 'closed'
     reconnectSecondaryGateways()
     await vi.advanceTimersByTimeAsync(0)

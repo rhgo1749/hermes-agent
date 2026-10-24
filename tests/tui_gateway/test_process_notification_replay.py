@@ -22,6 +22,7 @@ def notification_rig(monkeypatch, tmp_path):
         turns.append((text, kwargs))
         with session["history_lock"]:
             session["running"] = False
+        return True
 
     monkeypatch.setattr(server, "_run_prompt_submit", submit)
     session = {"history_lock": threading.RLock(), "running": False, "history": []}
@@ -261,10 +262,11 @@ def test_completion_winning_after_liveness_read_prevents_second_tui_turn(monkeyp
     )
 
     # Model submission keeps the completion turn active until the test releases it.
-    monkeypatch.setattr(
-        server, "_run_prompt_submit",
-        lambda _rid, _sid, _session, text, **kwargs: turns.append((text, kwargs)),
-    )
+    def submit(_rid, _sid, _session, text, **kwargs):
+        turns.append((text, kwargs))
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
     emitted = set()
 
     def drain_heartbeat():

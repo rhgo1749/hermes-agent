@@ -87,7 +87,7 @@ export function SharedMetricsSettings() {
     }
   }
 
-  // An older backend has no shared_metrics.* methods: keep the controls, disabled and explained.
+  // An older backend has no shared_metrics.* methods: keep the control, disabled and explained.
   const unavailable = loaded && consent === null
   const enabled = consent?.enabled ?? false
   const send = consent?.send ?? false

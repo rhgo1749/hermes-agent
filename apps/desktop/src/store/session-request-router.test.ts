@@ -92,8 +92,7 @@ function installDesktop(): void {
       port: connectionId === 'source-a' ? 6161 : 6262,
       profile,
       token: `${connectionId}-token`
-    })),
-    touchBackend: vi.fn(async () => undefined)
+    }))
   }
 }
 
@@ -302,8 +301,16 @@ describe('requestForSessionProfile', () => {
 
     await Promise.all([fromA, fromB])
 
-    expect(desktop.getConnectionFor).toHaveBeenCalledWith({ connectionId: 'source-a', profile: 'default' })
-    expect(desktop.getConnectionFor).toHaveBeenCalledWith({ connectionId: 'source-b', profile: 'default' })
+    expect(desktop.getConnectionFor).toHaveBeenCalledWith({
+      connectionId: 'source-a',
+      profile: 'default',
+      priority: 'background'
+    })
+    expect(desktop.getConnectionFor).toHaveBeenCalledWith({
+      connectionId: 'source-b',
+      profile: 'default',
+      priority: 'background'
+    })
     expect(secondaryGateways).toHaveLength(3)
     expect(secondaryGateways[1].request).toHaveBeenCalledWith('session.resume', {
       profile: 'backend-a',
