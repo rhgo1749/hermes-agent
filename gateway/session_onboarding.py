@@ -126,6 +126,12 @@ def _choose_run(authority, request):
         except _NoModelForTheRun as exc:
             logger.info('onboarding.start: no chat opened: %s', exc)
             raise OnboardingRefusal(5080, str(exc)) from exc
+    else:
+        # A rerun skips trial claiming, but must still refuse before creating a chat if
+        # neither the configured route nor an already-claimed local Desktop trial can run it.
+        from gateway.run import _resolve_gateway_model
+        if not _resolve_gateway_model():
+            raise OnboardingRefusal(5080, 'No model is set up to run onboarding on.')
     return plan
 
 

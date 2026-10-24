@@ -12,6 +12,10 @@ import time
 import pytest
 from unittest.mock import MagicMock, patch
 
+from tools.environments.local import (
+    _SESSION_TOOLCHAIN_PATH_SEED_ENV,
+    _restore_session_toolchain_path,
+)
 from tools.environments.local_env_policy import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 from tools.process_registry import (
     ProcessRegistry,
@@ -912,6 +916,7 @@ class TestSpawnEnvSanitization:
         assert "FIRECRAWL_API_KEY" not in env
         assert f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}TELEGRAM_BOT_TOKEN" not in env
         assert env["PYTHONUNBUFFERED"] == "1"
+        assert env[_SESSION_TOOLCHAIN_PATH_SEED_ENV] == env["PATH"]
 
     def test_spawn_via_env_checks_returncode_when_wrapper_fails(self, registry):
         class FakeEnv:
@@ -2157,6 +2162,10 @@ class TestSystemdCgroupIsolation:
 
         return fake_popen, captured
 
+    @staticmethod
+    def _expected_shell_argv(command):
+        return ["/bin/bash", "-lic", f"set +m; {_restore_session_toolchain_path(command)}"]
+
     @pytest.mark.platforms("linux")
     def test_wraps_in_systemd_scope_when_supervisor_and_available(
         self, registry, monkeypatch, _gateway_identity
@@ -2214,7 +2223,7 @@ class TestSystemdCgroupIsolation:
         assert "--" in argv, "systemd-run argv must use -- to separate command"
         sep_idx = argv.index("--")
         assert "/bin/bash" in argv[sep_idx:]
-        assert "set +m; echo hello" in argv[sep_idx:]
+        assert self._expected_shell_argv("echo hello")[2] in argv[sep_idx:]
         # systemd-run --scope gives the worker a new cgroup but NOT a new
         # session (#70716 regression: start_new_session was False, so the
         # worker kept the parent's session + controlling terminal → SIGTTIN/
@@ -2249,7 +2258,7 @@ class TestSystemdCgroupIsolation:
 
         argv = captured["argv"]
         # No systemd-run wrapping — direct shell invocation.
-        assert argv == ["/bin/bash", "-lic", "set +m; echo hello"], argv
+        assert argv == self._expected_shell_argv("echo hello"), argv
         assert captured["start_new_session"] is True
 
     def test_falls_back_when_not_under_supervisor(self, registry, monkeypatch):
@@ -2275,7 +2284,7 @@ class TestSystemdCgroupIsolation:
             registry.spawn_local("echo hello", cwd="/tmp")
 
         argv = captured["argv"]
-        assert argv == ["/bin/bash", "-lic", "set +m; echo hello"], argv
+        assert argv == self._expected_shell_argv("echo hello"), argv
         assert captured["start_new_session"] is True
 
     @pytest.mark.parametrize("use_pty", [False, True])
@@ -2306,9 +2315,7 @@ class TestSystemdCgroupIsolation:
                 patch.object(registry, "_write_checkpoint"),
             ):
                 session = registry.spawn_local("codex", cwd="/tmp", use_pty=True)
-            assert pty_spawn.call_args.args[0] == [
-                "/bin/bash", "-lic", "set +m; codex",
-            ]
+            assert pty_spawn.call_args.args[0] == self._expected_shell_argv("codex")
         else:
             fake_popen, captured = self._fake_popen_capture()
             with (
@@ -2317,9 +2324,7 @@ class TestSystemdCgroupIsolation:
                 patch.object(registry, "_write_checkpoint"),
             ):
                 session = registry.spawn_local("echo hello", cwd="/tmp")
-            assert captured["argv"] == [
-                "/bin/bash", "-lic", "set +m; echo hello",
-            ]
+            assert captured["argv"] == self._expected_shell_argv("echo hello")
             assert captured["start_new_session"] is True
 
         assert session.systemd_unit == ""
@@ -2357,9 +2362,7 @@ class TestSystemdCgroupIsolation:
                 patch.object(registry, "_write_checkpoint"),
             ):
                 session = registry.spawn_local("codex", cwd="/tmp", use_pty=True)
-            assert pty_spawn.call_args.args[0] == [
-                "/bin/bash", "-lic", "set +m; codex",
-            ]
+            assert pty_spawn.call_args.args[0] == self._expected_shell_argv("codex")
         else:
             fake_popen, captured = self._fake_popen_capture()
             with (
@@ -2368,9 +2371,7 @@ class TestSystemdCgroupIsolation:
                 patch.object(registry, "_write_checkpoint"),
             ):
                 session = registry.spawn_local("echo hello", cwd="/tmp")
-            assert captured["argv"] == [
-                "/bin/bash", "-lic", "set +m; echo hello",
-            ]
+            assert captured["argv"] == self._expected_shell_argv("echo hello")
             assert captured["start_new_session"] is True
 
         assert session.systemd_unit == ""
@@ -2439,7 +2440,7 @@ class TestSystemdCgroupIsolation:
         assert "--scope" in argv
         assert "--unit" in argv
         assert "--" in argv
-        assert argv[-3:] == ["/bin/bash", "-lic", "set +m; codex"]
+        assert argv[-3:] == self._expected_shell_argv("codex")
         assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
 
     @pytest.mark.platforms("linux")
