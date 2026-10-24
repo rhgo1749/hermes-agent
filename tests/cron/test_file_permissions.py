@@ -23,6 +23,9 @@ class TestCronFilePermissions(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
+        detector = patch("hermes_constants._detect_container", return_value=False)
+        detector.start()
+        self.addCleanup(detector.stop)
         self.cron_dir = Path(self.tmpdir) / "cron"
         self.output_dir = self.cron_dir / "output"
 
@@ -89,6 +92,9 @@ class TestConfigFilePermissions(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
+        detector = patch("hermes_constants._detect_container", return_value=False)
+        detector.start()
+        self.addCleanup(detector.stop)
 
     def tearDown(self):
         import shutil

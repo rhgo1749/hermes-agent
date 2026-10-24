@@ -29,6 +29,7 @@ def _stage(tmp_path, monkeypatch, vue_version: str, *, js_sdk: bool):
     staged = tmp_path / "lsp" / "bin" / "vue-language-server"
     staged.write_text(launcher.read_text(encoding="utf-8"), encoding="utf-8")  # copied like the Windows path, not symlinked
     staged.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join((str(staged.parent), os.environ.get("PATH", ""))))
     if js_sdk:
         (node_modules / "typescript" / "lib").mkdir(parents=True)
         (node_modules / "typescript" / "lib" / "typescript.js").write_text("", encoding="utf-8")
